@@ -21,8 +21,9 @@ marks reasoning, not a sourced fact.
 - `localStorage` exists but lives in memory. `MutationObserver` and
   `IntersectionObserver` exist in a reduced form.
 - There is no sandbox. Pages run in the browser process.
-- The HTTP `User-Agent` says `Huginn/0.1`, while `navigator.userAgent` says
-  Chrome 131. The two do not agree.
+- The `User-Agent` header, `navigator.userAgent` and the client hints come from
+  one place (`huginn-net/src/ua.rs`). The string has the WebKit and Safari
+  tokens and names Huginn, but does not claim `Chrome/`.
 
 Two failures on real sites led to this research (traced on 2026-11-12):
 
@@ -34,7 +35,9 @@ Two failures on real sites led to this research (traced on 2026-11-12):
   `document.referrer`, which is empty.
 - **Google search returns HTTP 429.** Google serves its JavaScript bot check.
   The script throws (`Lk is not a function`), and the follow-up request is
-  refused. Google also serves Huginn its old basic HTML home page.
+  refused. Google also served Huginn its old basic HTML home page. This was
+  seen before the User-Agent change in pull request #3; it has not been tried
+  again since.
 
 ## 1. Networking
 
@@ -318,8 +321,11 @@ Ordered by compatibility and safety gained for the work (judgement).
 5. **The HTML event loop as written.** A microtask checkpoint per task, the
    4 ms timer clamp, `requestAnimationFrame` and observers tied to frames,
    `requestIdleCallback`.
-6. **One User-Agent story.** A Chrome-compatible string with a Huginn token,
-   the same in HTTP and in `navigator`.
+6. **Revisit the User-Agent once the network layer looks like a browser's.**
+   Huginn already has one string for HTTP and `navigator`. It leaves out
+   `Chrome/` because, over Huginn's TLS stack, a Chrome claim gets hard 403s
+   from bot filters (ARCHITECTURE.md, "User agent"). Ladybird gained a lot by
+   adding the Chrome token, so test it again after cookies and Fetch land.
 7. **V8 settings.** Measure default V8 with Sparkplug against `--lite-mode`,
    keep `--jitless` as a hardened mode, and move the JS platform layer into a
    startup snapshot.
