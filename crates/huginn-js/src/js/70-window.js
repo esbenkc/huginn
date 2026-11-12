@@ -240,11 +240,18 @@ const history = new History();
 
 // ------------------------------------------------------------- navigator --
 
-// N.os: the system this build runs on (`install_ops`).
+// N.os: the system this build runs on; N.ua, N.secChUa: the User-Agent and
+// Sec-CH-UA headers the network sends (`install_ops`), so script and headers agree.
 const OS = N.os === 'macos'
-  ? { ua: 'Macintosh; Intel Mac OS X 10_15_7', platform: 'MacIntel', name: 'macOS', version: '14.0.0', arch: 'arm' }
-  : { ua: 'X11; Linux x86_64', platform: 'Linux x86_64', name: 'Linux', version: '6.8.0', arch: 'x86' };
-const UA = `Mozilla/5.0 (${OS.ua}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36`;
+  ? { platform: 'MacIntel', name: 'macOS', version: '14.0.0', arch: 'arm' }
+  : { platform: 'Linux x86_64', name: 'Linux', version: '6.8.0', arch: 'x86' };
+const UA = N.ua;
+const BRANDS = Object.freeze(Array.from(N.secChUa.matchAll(/"([^"]*)";v="([^"]*)"/g),
+  m => Object.freeze({ brand: m[1], version: m[2] })));
+// Full versions: Chrome's reduced `<major>.0.0.0`, and Huginn's own.
+const FULL_VERSIONS = Object.freeze(BRANDS.map(b => Object.freeze({
+  brand: b.brand, version: b.brand === 'Huginn' ? N.huginnVersion : b.version + '.0.0.0' })));
+const CHROME_FULL = FULL_VERSIONS.find(b => b.brand === 'Chromium').version;
 class Navigator {}
 const navigatorProps = {
   userAgent: UA, appVersion: UA.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko',
@@ -253,10 +260,13 @@ const navigatorProps = {
   deviceMemory: 8, maxTouchPoints: 0, webdriver: false, doNotTrack: null, pdfViewerEnabled: true,
   plugins: Object.freeze([]), mimeTypes: Object.freeze([]),
   userAgentData: {
-    brands: [{ brand: 'Chromium', version: '131' }, { brand: 'Not_A Brand', version: '24' }],
-    mobile: false, platform: OS.name,
-    getHighEntropyValues() { return Promise.resolve({ brands: this.brands, mobile: false, platform: OS.name, platformVersion: OS.version, architecture: OS.arch, model: '', uaFullVersion: '131.0.0.0' }); },
-    toJSON() { return { brands: this.brands, mobile: false, platform: OS.name }; },
+    brands: BRANDS, mobile: false, platform: OS.name,
+    getHighEntropyValues() {
+      return Promise.resolve({ brands: BRANDS, mobile: false, platform: OS.name, platformVersion: OS.version,
+        architecture: OS.arch, bitness: '64', model: '', wow64: false, formFactors: ['Desktop'],
+        uaFullVersion: CHROME_FULL, fullVersionList: FULL_VERSIONS });
+    },
+    toJSON() { return { brands: BRANDS, mobile: false, platform: OS.name }; },
   },
   connection: Object.assign(new EventTarget(), { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'wifi' }),
   permissions: { query() { return Promise.resolve({ state: 'prompt', onchange: null, addEventListener() {}, removeEventListener() {} }); } },

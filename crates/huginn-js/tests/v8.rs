@@ -347,3 +347,51 @@ fn location_url_and_storage() {
         "http://127.0.0.1:9/x.js?a=1&b=two+words#h|/other|v|true|BODY|aGk=|é"
     );
 }
+
+#[test]
+fn navigator_reports_the_user_agent_and_brands_the_network_sends() {
+    let mut p = Page::new("<body></body>");
+    p.run(
+        r#"
+        const b = document.body, d = navigator.userAgentData;
+        b.setAttribute('data-ua', navigator.userAgent);
+        b.setAttribute('data-brands', d.brands.map(x => `"${x.brand}";v="${x.version}"`).join(', '));
+        d.getHighEntropyValues(['fullVersionList', 'uaFullVersion']).then(v => {
+          b.setAttribute('data-full', v.uaFullVersion + '|' +
+            v.fullVersionList.map(x => x.brand + ' ' + x.version).join(', '));
+        });
+        "#,
+    )
+    .unwrap();
+    let attr = |name: &str| {
+        p.doc
+            .attribute(p.doc.body().unwrap(), &huginn_dom::LocalName::from(name))
+            .map(str::to_owned)
+    };
+    let ua = huginn_net::ua::USER_AGENT;
+    assert_eq!(attr("data-ua").as_deref(), Some(ua));
+    assert_eq!(
+        attr("data-brands").as_deref(),
+        Some(huginn_net::ua::SEC_CH_UA)
+    );
+    let chrome = huginn_net::ua::CHROME_MAJOR;
+    assert_eq!(
+        attr("data-full").as_deref(),
+        Some(
+            format!(
+                "{chrome}.0.0.0|Chromium {chrome}.0.0.0, Huginn {}, Not_A Brand 24.0.0.0",
+                huginn_net::ua::HUGINN_FULL_VERSION
+            )
+            .as_str()
+        )
+    );
+    // The Chromium brand version is the Chrome release whose V8 runs the
+    // page's scripts (V8 15.2 ships in Chrome 152).
+    let mut v8 = v8::V8::get_version().split('.');
+    let (major, minor) = (v8.next().unwrap(), v8.next().unwrap());
+    assert_eq!(
+        format!("{major}{minor}"),
+        chrome,
+        "bump CHROME_MAJOR with the v8 crate"
+    );
+}
