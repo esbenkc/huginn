@@ -21,8 +21,7 @@ real sites still work.
   its source before you quote it elsewhere.
 - Numbers from other browsers describe those browsers. Measure Huginn before
   and after each change (`bench/`, and the timing JSON of `huginn render`).
-- The "Where Huginn is today" sections describe commit `8cca1e8`, the Linux
-  port (pull request #1).
+- The "Where Huginn is today" sections describe `main` at commit `e28cdc3`.
 
 ## What the research says, in one page
 
@@ -52,9 +51,10 @@ and seccomp on Linux, Seatbelt on macOS) and to enforce origin checks in Rust.
   interactive pages, and most of its memory savings later shipped in default
   V8. A startup snapshot of the JS platform layer would cut context creation
   from tens of milliseconds to under two.
-- The two User-Agent strings (HTTP and `navigator`) disagree. Ladybird found
-  that a Chrome-compatible string with its own token unlocked the modern
-  versions of large sites.
+- The User-Agent leaves out the `Chrome/` token, because bot filters refused
+  it over Huginn's TLS stack. Ladybird found that a Chrome-compatible string
+  with its own token unlocked the modern versions of large sites. Test it
+  again once cookies and Fetch exist.
 
 **5. Things to keep.** The arena DOM, the single process, sequential Stylo,
 CPU raster with kept strips, tab discarding, and the rule "fix the browser,
@@ -67,8 +67,8 @@ Each step makes the next one cheaper or safer to do.
 1. **Measurement.** Tracing spans per phase, a memory reporter per subsystem,
    and a WPT runner that prints a diff. Without these, later steps cannot be
    judged.
-2. **Network correctness.** Cookie jar, Fetch with CORS, referrer, one
-   User-Agent story. See [platform.md](platform.md), items 1-3 and 6.
+2. **Network correctness.** Cookie jar, Fetch with CORS, referrer. See
+   [platform.md](platform.md), items 1-3.
 3. **Incremental style and layout.** Stylo invalidation, damage classes, kept
    Taffy caches, differential tests against a fresh layout. See
    [rendering.md](rendering.md), items 2-4, and [engines.md](engines.md).
