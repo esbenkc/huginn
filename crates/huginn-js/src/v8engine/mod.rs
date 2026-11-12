@@ -321,6 +321,7 @@ impl Runtime {
         let mut isolate = v8::Isolate::new(params);
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         isolate.set_host_import_module_dynamically_callback(modules::dynamic_import);
+        isolate.set_host_initialize_import_meta_object_callback(modules::import_meta);
         isolate.set_promise_reject_callback(promise_reject);
         let handle = isolate.thread_safe_handle();
         let near_limit = Box::new(isolate.thread_safe_handle());

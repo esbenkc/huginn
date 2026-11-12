@@ -576,7 +576,7 @@ fn import_maps_remap_static_and_dynamic_imports() {
     p.call(|e, cx| {
         e.execute(
             cx,
-            "import v from 'lib'; import d from 'dup'; document.body.setAttribute('data-static', v + d);",
+            "import v from 'lib'; import d from 'dup'; document.body.setAttribute('data-static', v + d); document.body.setAttribute('data-meta', import.meta.url + ' ' + import.meta.resolve('lib').slice(0, 20));",
             "http://127.0.0.1:9/dir/page.html",
             ScriptKind::Module,
         )
@@ -593,6 +593,31 @@ fn import_maps_remap_static_and_dynamic_imports() {
     p.load(1000.0);
     // The first map's "dup" wins: later maps cannot redefine a specifier.
     assert_eq!(p.body_attr("data-static").as_deref(), Some("mapped1"));
+    assert_eq!(
+        p.body_attr("data-meta").as_deref(),
+        Some("http://127.0.0.1:9/dir/page.html data:text/javascript")
+    );
     assert_eq!(p.body_attr("data-late").as_deref(), Some("late"));
     assert_eq!(p.body_attr("data-unmapped").as_deref(), Some("TypeError"));
+}
+
+#[test]
+fn custom_element_upgrade_only_upgrades_new_elements() {
+    let mut p = Page::new("<body><x-a></x-a></body>");
+    p.run(
+        r#"
+        let connected = 0;
+        customElements.define('x-a', class extends HTMLElement {
+            // Libraries call upgrade() from connectedCallback; it must not
+            // connect the element again.
+            connectedCallback() { connected++; customElements.upgrade(this); }
+        });
+        const loose = document.createElement('div');
+        loose.innerHTML = '<x-a></x-a>';
+        customElements.upgrade(loose);
+        document.body.setAttribute('data-out', [connected, loose.firstChild.connectedCallback !== undefined].join());
+        "#,
+    )
+    .unwrap();
+    assert_eq!(p.body_attr("data-out").as_deref(), Some("1,true"));
 }

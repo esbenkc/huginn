@@ -35,6 +35,60 @@ fn resolve(state: &SharedState, base: &str, spec: &str) -> Result<Url, String> {
     state.borrow_mut().modules.resolver.resolve(spec, &base)
 }
 
+/// `import.meta` for a module: `url` (its URL; the document URL for inline
+/// modules) and `resolve(specifier)`, which resolves like an import would.
+pub(super) unsafe extern "C" fn import_meta(
+    context: v8::Local<'_, v8::Context>,
+    module: v8::Local<'_, v8::Module>,
+    meta: v8::Local<'_, v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    let st = ops::state(scope);
+    let url = st
+        .borrow()
+        .modules
+        .bases
+        .get(&module.get_identity_hash().get())
+        .cloned();
+    let Some(url) = url.and_then(|u| v8::String::new(scope, &u)) else {
+        return;
+    };
+    if let Some(key) = v8::String::new(scope, "url") {
+        meta.create_data_property(scope, key.into(), url.into());
+    }
+    if let (Some(key), Some(f)) = (
+        v8::String::new(scope, "resolve"),
+        v8::Function::builder(meta_resolve)
+            .data(url.into())
+            .build(scope),
+    ) {
+        meta.create_data_property(scope, key.into(), f.into());
+    }
+}
+
+fn meta_resolve(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let base = args.data().to_rust_string_lossy(scope);
+    let spec = args.get(0).to_rust_string_lossy(scope);
+    let result = resolve(&ops::state(scope), &base, &spec);
+    match result {
+        Ok(u) => {
+            if let Some(s) = v8::String::new(scope, u.as_str()) {
+                rv.set(s.into());
+            }
+        }
+        Err(e) => {
+            if let Some(m) = v8::String::new(scope, &e) {
+                let e = v8::Exception::type_error(scope, m);
+                scope.throw_exception(e);
+            }
+        }
+    }
+}
+
 /// `<script type="importmap">`: parse the JSON (relative URLs in it resolve
 /// against the document's base URL) and merge it into the page's import map.
 pub(super) fn register_import_map(

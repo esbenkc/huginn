@@ -688,9 +688,12 @@ class CustomElementRegistry {
     }
     return w.promise;
   }
+  // Upgrades only elements that are not custom yet; elements already
+  // upgraded get no second connectedCallback (scripts call this from
+  // connectedCallback itself).
   upgrade(root) {
-    if (!root) return;
-    connectCustom(N.customIn(root[ID]));
+    if (!root || root[ID] === undefined) throw new TypeError("Failed to execute 'upgrade' on 'CustomElementRegistry': parameter 1 is not of type 'Node'.");
+    connectCustom(N.customIn(root[ID]).filter(id => { const el = wrappers.get(id); return !(el && el[CE]); }));
   }
 }
 expose(CustomElementRegistry);
