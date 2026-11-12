@@ -349,6 +349,7 @@ impl LivePage {
             images,
             base,
             url,
+            referrer,
             js,
             ..
         } = page;
@@ -357,6 +358,7 @@ impl LivePage {
             document: doc,
             loader: &loader,
             document_url: url,
+            referrer,
             base_url: base,
             viewport: (viewport.width, viewport.height),
             now_ms,

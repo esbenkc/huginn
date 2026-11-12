@@ -8,11 +8,11 @@
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, NodeId, local_name, ns};
 use huginn_layout::{LayoutEngine, LayoutTree};
-use huginn_net::{Loader, Url};
+use huginn_net::{Client, CookieJar, Loader, ReferrerPolicy, Url};
 use huginn_style::Viewport;
 
 use crate::input::Modifiers;
@@ -31,6 +31,7 @@ pub type PostData = huginn_js::forms::PostBody;
 pub enum Command {
     /// Load `url` and lay it out for `viewport`. `generation` tags the answer.
     /// `html`: the document itself (internal `huginn:` pages), shown at `url`.
+    /// `initiator`: the page that started the navigation (`None`: the user).
     Load {
         seq: u64,
         generation: u64,
@@ -38,6 +39,7 @@ pub enum Command {
         viewport: Viewport,
         post: Option<PostData>,
         html: Option<String>,
+        initiator: Option<Client>,
     },
     /// Restyle and lay out the current page for a new viewport.
     Resize {
@@ -137,6 +139,8 @@ pub struct Loaded {
     /// Why loading failed; the tree then shows an error page.
     pub error: Option<String>,
     pub load_ms: f64,
+    /// The document's referrer policy, for the links it starts.
+    pub referrer_policy: ReferrerPolicy,
 }
 
 /// Which link, if any, each DOM node is inside.
@@ -190,15 +194,16 @@ pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
 /// Start one tab's engine thread. It ends when the returned sender is
 /// dropped (the tab closed or was discarded), freeing the page.
-/// `js`: run page scripts (when built with the `v8` feature).
-pub fn spawn(js: bool, notify: Notify) -> Sender<Command> {
+/// `js`: run page scripts (when built with the `v8` feature). `cookies`:
+/// the jar of the tab's profile (the private one in private windows).
+pub fn spawn(js: bool, cookies: Arc<CookieJar>, notify: Notify) -> Sender<Command> {
     let (tx, rx) = channel();
     // Style and layout recurse on deep DOMs: same big stack as `render`. Only
     // touched stack pages are committed, so idle tabs cost no stack memory.
     std::thread::Builder::new()
         .name("engine".into())
         .stack_size(256 << 20)
-        .spawn(move || run(&rx, js, &*notify))
+        .spawn(move || run(&rx, js, &cookies, &*notify))
         .expect("spawn engine thread");
     tx
 }
@@ -215,7 +220,7 @@ pub(crate) struct Current {
     pub live: LivePage,
 }
 
-fn run(rx: &Receiver<Command>, js: bool, notify: &dyn Fn(EngineEvent)) {
+fn run(rx: &Receiver<Command>, js: bool, cookies: &Arc<CookieJar>, notify: &dyn Fn(EngineEvent)) {
     let mut current: Option<Current> = None;
     // Whether the tab is the active one in its window.
     let mut visible = true;
@@ -267,6 +272,7 @@ fn run(rx: &Receiver<Command>, js: bool, notify: &dyn Fn(EngineEvent)) {
                     viewport,
                     post,
                     html,
+                    initiator,
                     ..
                 } => {
                     // Drop the old page first: lower peak memory.
@@ -278,6 +284,8 @@ fn run(rx: &Receiver<Command>, js: bool, notify: &dyn Fn(EngineEvent)) {
                         js,
                         post,
                         html,
+                        initiator.as_ref(),
+                        cookies,
                     );
                     notify(EngineEvent::Loaded(Box::new(loaded)));
                     cur.live.set_visible(&mut cur.page, visible);
@@ -289,6 +297,11 @@ fn run(rx: &Receiver<Command>, js: bool, notify: &dyn Fn(EngineEvent)) {
                         notify,
                     );
                     current = Some(cur);
+                    // Off the UI thread, at most every 30 s; the session
+                    // saves the rest when it ends.
+                    if let Err(e) = cookies.save_unless_saved_within(Duration::from_secs(30)) {
+                        eprintln!("huginn: cannot save cookies: {e}");
+                    }
                 }
                 Command::Resize { .. } => {
                     let viewport = last_viewport.expect("batch has a resize");
@@ -357,6 +370,7 @@ fn run(rx: &Receiver<Command>, js: bool, notify: &dyn Fn(EngineEvent)) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load(
     generation: u64,
     url: &Url,
@@ -364,11 +378,13 @@ fn load(
     js: bool,
     post: Option<PostData>,
     html: Option<String>,
+    initiator: Option<&Client>,
+    cookies: &Arc<CookieJar>,
 ) -> (Current, Loaded) {
     let t = Instant::now();
     // One loader per page: its cache dies after the load; scripts keep
     // fetching through it (XMLHttpRequest, fetch) while the page lives.
-    let loader = Loader::new();
+    let loader = Loader::with_cookies(cookies.clone());
     let internal;
     let (mut page, error) = {
         // Internal schemes: `huginn:` pages come with their HTML;
@@ -391,7 +407,16 @@ fn load(
             None => url.clone(),
         };
         let post = post.as_ref().filter(|_| !internal);
-        match pipeline::load_document(&loader, &target, post, viewport, js && !internal, true, t) {
+        match pipeline::load_document(
+            &loader,
+            &target,
+            post,
+            initiator.filter(|_| !internal),
+            viewport,
+            js && !internal,
+            true,
+            t,
+        ) {
             Ok(mut page) => {
                 page.load_all_lazy(&loader);
                 (page, failed)
@@ -437,6 +462,10 @@ fn load(
             .map_or_else(Vec::new, |f| fragment_targets(&page.doc, f)),
         error,
         load_ms: t.elapsed().as_secs_f64() * 1e3,
+        referrer_policy: loader
+            .client()
+            .map(|c| c.referrer_policy)
+            .unwrap_or_default(),
     };
     (
         Current {

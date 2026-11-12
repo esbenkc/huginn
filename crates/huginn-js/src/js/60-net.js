@@ -282,13 +282,49 @@ class FormData {
 expose(FormData);
 
 // ---------------------------------------------------------- fetch and XHR --
-// Requests are served synchronously by the shell's loader (same origin only;
-// anything else fails like a network error), and the result is delivered in
-// a later task, like a fast network.
+// Requests are served synchronously by the shell's loader with the Fetch
+// standard's rules: another origin must allow a `cors` request (a failed
+// CORS check is a network error) and answers `no-cors` with an opaque
+// response. The result is delivered in a later task, like a fast network.
 
-function nativeFetch(url, method) {
-  const r = N.fetch(String(url), String(method || 'GET').toUpperCase());
-  return r ? { status: +r[0], url: r[1], type: r[2], body: r[3] } : null;
+// A request body as [string or Uint8Array, its default Content-Type].
+function requestBody(b) {
+  if (b === undefined || b === null) return [null, null];
+  if (typeof b === 'string') return [b, 'text/plain;charset=UTF-8'];
+  if (b instanceof URLSearchParams) return [String(b), 'application/x-www-form-urlencoded;charset=UTF-8'];
+  if (b instanceof FormData) {
+    const boundary = '----HuginnFormBoundary' + Math.random().toString(36).slice(2);
+    const q = s => String(s).replace(/"/g, '%22').replace(/\r?\n|\r/g, '%0A');
+    let s = '';
+    for (const [k, v] of b) {
+      s += '--' + boundary + '\r\nContent-Disposition: form-data; name="' + q(k) + '"';
+      if (v instanceof Blob) {
+        s += '; filename="' + q(v.name || 'blob') + '"\r\nContent-Type: ' + (v.type || 'application/octet-stream') + '\r\n\r\n' + new TextDecoder().decode(v._bytes) + '\r\n';
+      } else s += '\r\n\r\n' + v + '\r\n';
+    }
+    return [s + '--' + boundary + '--\r\n', 'multipart/form-data; boundary=' + boundary];
+  }
+  if (b instanceof Blob) return [b._bytes, b.type || null];
+  if (b instanceof ArrayBuffer) return [new Uint8Array(b), null];
+  if (ArrayBuffer.isView(b)) return [new Uint8Array(b.buffer, b.byteOffset, b.byteLength), null];
+  return [String(b), 'text/plain;charset=UTF-8'];
+}
+
+// Send a request; `headers` iterates [name, value] pairs. Returns
+// { status, url, headers: [[name, value]...], body, type, redirected }, or
+// null for a network error.
+function nativeFetch(url, method, headers, body, mode, credentials, redirect) {
+  let flat = '';
+  if (headers) for (const [k, v] of headers) flat += String(k).replace(/\n/g, '') + '\n' + String(v).replace(/[\r\n]/g, ' ') + '\n';
+  const r = N.fetch(String(url), String(method || 'GET'), flat, body === undefined ? null : body,
+    mode || 'cors', credentials || 'same-origin', redirect || 'follow');
+  if (!r) return null;
+  const list = [];
+  for (const line of r[2].split('\r\n')) {
+    const i = line.indexOf(': ');
+    if (i > 0) list.push([line.slice(0, i), line.slice(i + 2)]);
+  }
+  return { status: +r[0], url: r[1], headers: list, body: r[3], type: r[4], redirected: r[5] === '1' };
 }
 const STATUS_TEXT = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' };
 
@@ -385,18 +421,29 @@ class Request extends Body {
     init = init || {};
     const src = input instanceof Request ? input : null;
     this.url = src ? src.url : new URL(String(input), N.baseUrl()).href;
-    this.method = String(init.method || (src && src.method) || 'GET').toUpperCase();
+    this.method = String(init.method || (src && src.method) || 'GET');
+    // Only these methods are uppercased (`patch` stays `patch`, like Chrome).
+    const upper = this.method.toUpperCase();
+    if (['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'].includes(upper)) this.method = upper;
+    if (['CONNECT', 'TRACE', 'TRACK'].includes(upper)) throw new TypeError("'" + this.method + "' HTTP method is unsupported.");
     this.headers = new Headers(init.headers || (src && src.headers));
     this.signal = init.signal || (src && src.signal) || new AbortSignal();
-    this.credentials = init.credentials || 'same-origin';
-    this.mode = init.mode || 'cors';
+    this.credentials = init.credentials || (src && src.credentials) || 'same-origin';
+    this.mode = init.mode || (src && src.mode) || 'cors';
+    if (this.mode === 'navigate') throw new TypeError("Cannot construct a Request with a RequestInit whose mode member is set as 'navigate'.");
+    if (this.mode === 'no-cors' && !['GET', 'HEAD', 'POST'].includes(this.method)) throw new TypeError("'" + this.method + "' is unsupported in no-cors mode.");
     this.cache = init.cache || 'default';
-    this.redirect = init.redirect || 'follow';
+    this.redirect = init.redirect || (src && src.redirect) || 'follow';
     this.referrer = 'about:client';
     this.referrerPolicy = init.referrerPolicy || '';
     this.integrity = init.integrity || '';
     this.keepalive = !!init.keepalive;
-    defProp(this, '_body', { value: init.body === undefined || init.body === null ? null : String(init.body) });
+    const raw = init.body !== undefined ? init.body : src ? src._payload : null;
+    if (raw !== null && raw !== undefined && (this.method === 'GET' || this.method === 'HEAD')) throw new TypeError('Request with GET/HEAD method cannot have body.');
+    const [payload, type] = requestBody(raw);
+    if (type && !this.headers.has('content-type')) this.headers.set('content-type', type);
+    defProp(this, '_payload', { value: payload });
+    defProp(this, '_body', { value: payload });
   }
   clone() { return new Request(this); }
 }
@@ -446,11 +493,13 @@ function fetch(input, init) {
     if (req.signal.aborted) { reject(req.signal.reason); return; }
     queueTask(() => {
       if (req.signal.aborted) { reject(req.signal.reason); return; }
-      const r = nativeFetch(req.url, req.method);
+      const r = nativeFetch(req.url, req.method, req.headers, req._payload, req.mode, req.credentials, req.redirect);
       if (!r) { reject(new TypeError('Failed to fetch')); return; }
-      const res = new Response(r.body, { status: r.status, headers: r.type ? { 'content-type': r.type } : {} });
+      const empty = req.method === 'HEAD' || r.type === 'opaque' || r.type === 'opaqueredirect';
+      const res = new Response(empty ? null : r.body, { status: r.status, headers: r.headers });
       res.url = r.url;
-      res.type = 'basic';
+      res.type = r.type;
+      res.redirected = r.redirected;
       resolve(res);
     });
   });
@@ -471,18 +520,32 @@ class XMLHttpRequest extends EventTarget {
     defProp(this, '_res', { value: null, writable: true });
   }
   open(method, url, async) {
-    this._req = { method: String(method).toUpperCase(), url: new URL(String(url), N.baseUrl()).href, async: async !== false, aborted: false };
+    let m = String(method);
+    const upper = m.toUpperCase();
+    if (['CONNECT', 'TRACE', 'TRACK'].includes(upper)) throw domErr('SecurityError', "'" + m + "' HTTP method is unsupported.");
+    if (['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'].includes(upper)) m = upper;
+    this._req = { method: m, url: new URL(String(url), N.baseUrl()).href, async: async !== false, aborted: false, headers: [], body: null };
     this._res = null;
     this.status = 0;
     this._state(1);
   }
-  setRequestHeader() {}
+  setRequestHeader(name, value) {
+    if (!this._req || this.readyState !== 1) throw domErr('InvalidStateError', "The object's state must be OPENED.");
+    this._req.headers.push([String(name), String(value)]);
+  }
   overrideMimeType() {}
   getResponseHeader(name) {
     if (!this._res) return null;
-    return String(name).toLowerCase() === 'content-type' && this._res.type ? this._res.type : null;
+    const n = String(name).toLowerCase();
+    const vals = this._res.headers.filter(h => h[0] === n).map(h => h[1]);
+    return vals.length ? vals.join(', ') : null;
   }
-  getAllResponseHeaders() { return this._res && this._res.type ? 'content-type: ' + this._res.type + '\r\n' : ''; }
+  getAllResponseHeaders() {
+    if (!this._res) return '';
+    const m = new Map();
+    for (const [k, v] of this._res.headers) m.set(k, m.has(k) ? m.get(k) + ', ' + v : v);
+    return Array.from(m.keys()).sort().map(k => k + ': ' + m.get(k) + '\r\n').join('');
+  }
   get responseText() {
     if (this.responseType !== '' && this.responseType !== 'text') throw domErr('InvalidStateError', 'responseText is only available if responseType is "" or "text"');
     return this._res ? this._res.body : '';
@@ -494,7 +557,7 @@ class XMLHttpRequest extends EventTarget {
     switch (this.responseType) {
       case 'json': try { return JSON.parse(body); } catch (e) { return null; }
       case 'arraybuffer': return new TextEncoder().encode(body).buffer;
-      case 'blob': return new Blob([body], { type: this._res.type || '' });
+      case 'blob': return new Blob([body], { type: this.getResponseHeader('content-type') || '' });
       case 'document': return detachedDocument(body);
       default: return body;
     }
@@ -503,7 +566,11 @@ class XMLHttpRequest extends EventTarget {
   _finish() {
     const req = this._req;
     if (!req || req.aborted) return;
-    const r = nativeFetch(req.url, req.method);
+    const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+    const [payload, type] = hasBody ? requestBody(req.body) : [null, null];
+    const headers = req.headers.slice();
+    if (type && !headers.some(h => h[0].toLowerCase() === 'content-type')) headers.push(['Content-Type', type]);
+    const r = nativeFetch(req.url, req.method, headers, payload, 'cors', this.withCredentials ? 'include' : 'same-origin', 'follow');
     if (!r) {
       this._state(4);
       dispatch(this, new ProgressEvent('error'));
@@ -522,7 +589,8 @@ class XMLHttpRequest extends EventTarget {
     dispatch(this, new ProgressEvent('loadend', { lengthComputable: true, loaded: n, total: n }));
   }
   send(body) {
-    if (!this._req) throw domErr('InvalidStateError', "The object's state must be OPENED.");
+    if (!this._req || this.readyState !== 1) throw domErr('InvalidStateError', "The object's state must be OPENED.");
+    this._req.body = body === undefined ? null : body;
     dispatch(this, new ProgressEvent('loadstart'));
     if (this._req.async) queueTask(() => this._finish());
     else this._finish();

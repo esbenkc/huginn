@@ -36,6 +36,7 @@ impl Page {
             document: &mut self.doc,
             loader: &self.loader,
             document_url: &self.url,
+            referrer: "",
             base_url: &self.url,
             viewport: (1280.0, 800.0),
             now_ms: self.now,

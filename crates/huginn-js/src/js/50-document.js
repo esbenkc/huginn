@@ -179,7 +179,6 @@ defProp(G, 'WebKitCSSMatrix', { value: DOMMatrix, writable: true, configurable: 
 // --------------------------------------------------------------- document --
 
 let readyState = 'loading';
-const cookies = new Map();
 
 class Document extends Node {
   constructor() { super(); }
@@ -187,23 +186,10 @@ class Document extends Node {
   get documentURI() { return curUrl; }
   get domain() { return urlParts()[5]; }
   set domain(v) {}
-  get referrer() { return ''; }
-  get cookie() { return Array.from(cookies, ([k, v]) => (k ? k + '=' : '') + v).join('; '); }
-  set cookie(v) {
-    const parts = String(v).split(';');
-    const eq = parts[0].indexOf('=');
-    const name = (eq >= 0 ? parts[0].slice(0, eq) : '').trim();
-    const value = (eq >= 0 ? parts[0].slice(eq + 1) : parts[0]).trim();
-    let expired = false;
-    for (const p of parts.slice(1)) {
-      const i = p.indexOf('=');
-      const k = (i >= 0 ? p.slice(0, i) : p).trim().toLowerCase();
-      const val = i >= 0 ? p.slice(i + 1).trim() : '';
-      if (k === 'max-age' && Number(val) <= 0) expired = true;
-      if (k === 'expires' && Date.parse(val) < Date.now()) expired = true;
-    }
-    if (expired) cookies.delete(name); else cookies.set(name, value);
-  }
+  get referrer() { return N.referrer(); }
+  // The browser's cookie jar, without HttpOnly cookies.
+  get cookie() { return N.cookie(); }
+  set cookie(v) { N.setCookie(String(v)); }
   get readyState() { return readyState; }
   get characterSet() { return 'UTF-8'; }
   get charset() { return 'UTF-8'; }

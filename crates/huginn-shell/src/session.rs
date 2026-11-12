@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use huginn_net::{DecodedImage, Url};
+use huginn_net::{CookieJar, DecodedImage, Url};
 
 use crate::browser::{Browser, WindowOp};
 use crate::engine::{self, Command, EngineEvent};
@@ -68,6 +68,12 @@ pub struct Shared {
     pub closed: Vec<ClosedTab>,
     /// Activation clock for discarding.
     clock: u64,
+    /// Cookies of normal windows, saved in the profile (in memory for
+    /// headless runs without `HUGINN_PROFILE_DIR`).
+    cookies: Arc<CookieJar>,
+    /// Cookies of private windows: in memory only, shared by all private
+    /// windows and dropped when the last one closes.
+    private_cookies: Option<Arc<CookieJar>>,
 }
 
 impl Shared {
@@ -76,9 +82,18 @@ impl Shared {
         self.next_tab
     }
 
-    pub(crate) fn spawn_engine(&self, tab: TabId) -> Sender<Command> {
+    /// Start the engine thread of a tab; `private`: it uses the private
+    /// windows' cookie jar.
+    pub(crate) fn spawn_engine(&mut self, tab: TabId, private: bool) -> Sender<Command> {
         let notify = self.notify.clone();
-        engine::spawn(self.js, Arc::new(move |ev| notify(tab, ev)))
+        let cookies = if private {
+            self.private_cookies
+                .get_or_insert_with(|| Arc::new(CookieJar::in_memory()))
+                .clone()
+        } else {
+            self.cookies.clone()
+        };
+        engine::spawn(self.js, cookies, Arc::new(move |ev| notify(tab, ev)))
     }
 
     pub(crate) fn tick(&mut self) -> u64 {
@@ -126,9 +141,18 @@ impl Shared {
         });
     }
 
+    /// Clear browsing data: history, recently closed tabs and cookies (of
+    /// normal and private windows).
     pub fn clear_history(&mut self) {
         self.visits.clear();
         self.closed.clear();
+        self.cookies.clear();
+        if let Err(e) = self.cookies.save() {
+            eprintln!("huginn: cannot save cookies: {e}");
+        }
+        if let Some(c) = &self.private_cookies {
+            c.clear();
+        }
     }
 
     pub fn is_bookmarked(&self, url: &Url) -> bool {
@@ -189,17 +213,23 @@ pub struct Session {
 }
 
 impl Session {
-    /// `headless`: bookmarks are saved only with `HUGINN_PROFILE_DIR` set.
+    /// `headless`: bookmarks and cookies are saved only with
+    /// `HUGINN_PROFILE_DIR` set.
     pub fn new(js: bool, notify: Notify, size: (f32, f32), scale: f32, headless: bool) -> Session {
-        let bookmarks_path = if headless && std::env::var_os("HUGINN_PROFILE_DIR").is_none() {
+        let profile = if headless && std::env::var_os("HUGINN_PROFILE_DIR").is_none() {
             None
         } else {
-            internal_pages::profile_dir().map(|d| d.join("bookmarks.tsv"))
+            internal_pages::profile_dir()
         };
+        let bookmarks_path = profile.as_ref().map(|d| d.join("bookmarks.tsv"));
         let bookmarks = bookmarks_path
             .as_deref()
             .map(internal_pages::load_bookmarks)
             .unwrap_or_default();
+        let cookies = Arc::new(match &profile {
+            Some(d) => CookieJar::persistent(d.join("cookies.tsv")),
+            None => CookieJar::in_memory(),
+        });
         let live_background = std::env::var("HUGINN_LIVE_TABS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -223,6 +253,8 @@ impl Session {
                 favicons: HashMap::new(),
                 closed: Vec::new(),
                 clock: 0,
+                cookies,
+                private_cookies: None,
             })),
             next_window: 0,
             size,
@@ -322,6 +354,11 @@ impl Session {
         if self.windows.is_empty() {
             self.quit = true;
         }
+        // The last private window closed: its cookies go (engine threads of
+        // its tabs drop their reference as they end).
+        if !self.windows.iter().any(|w| w.private) {
+            self.shared.borrow_mut().private_cookies = None;
+        }
         if zoom {
             for w in &mut self.windows {
                 w.apply_zoom();
@@ -380,7 +417,24 @@ impl Session {
             .map(|w| w.tabs().iter().filter(|t| t.has_engine()).count())
             .sum();
         out.insert("engines".into(), engines.into());
+        out.insert("cookies".into(), shared.cookies.len().into());
+        out.insert(
+            "private_cookies".into(),
+            shared
+                .private_cookies
+                .as_ref()
+                .map_or(serde_json::Value::Null, |c| c.len().into()),
+        );
         serde_json::Value::Object(out)
+    }
+}
+
+impl Drop for Session {
+    /// Write the cookies changed since the last periodic save.
+    fn drop(&mut self) {
+        if let Err(e) = self.shared.borrow().cookies.save() {
+            eprintln!("huginn: cannot save cookies: {e}");
+        }
     }
 }
 

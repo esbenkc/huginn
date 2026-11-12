@@ -77,6 +77,9 @@ rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8",
 ureq = { version = "3.5.1", default-features = false, features = ["rustls", "gzip", "brotli"] }
 url = "2.5"
 data-url = "0.3"
+# Public Suffix List compiled into code (no list parsed at run time): cookie
+# `Domain` checks and site boundaries.
+psl = "2.1"
 # Text decoding for non-UTF-8 documents and stylesheets (WHATWG Encoding Standard).
 encoding_rs = "0.8"
 # CompressionStream and DecompressionStream (already in the tree through png and ureq).
@@ -94,6 +97,8 @@ resvg = { version = "0.50", default-features = false }
 v8 = { version = "152.2.0", default-features = false, features = ["use_custom_libcxx"] }
 
 # Misc
+# Locks without poisoning (already in the tree through Stylo).
+parking_lot = "0.12"
 serde_json = "1"
 
 # Window for `huginn open`: winit for the event loop, softbuffer to show

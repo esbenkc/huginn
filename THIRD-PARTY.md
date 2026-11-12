@@ -35,6 +35,7 @@ The browser uses system fonts only; no font files are included.
 | wuff | 0.2.10 | MIT | WOFF and WOFF2 decoding | https://github.com/nicoburns/wuff |
 | ureq (rustls, ring, webpki-roots) | 3.5.1 | MIT OR Apache-2.0 (ring: Apache-2.0 AND ISC; webpki-roots: CDLA-Permissive-2.0) | HTTP client and TLS | https://github.com/algesten/ureq |
 | url, data-url | 2.5.8 / 0.3.2 | MIT OR Apache-2.0 | URL parsing | https://github.com/servo/rust-url |
+| psl, psl-types | 2.1.252 / 2.0.11 | MIT OR Apache-2.0 (the Public Suffix List data in it: MPL-2.0) | cookie domains and site boundaries | https://github.com/addr-rs/psl |
 | encoding_rs | 0.8.44 | (Apache-2.0 OR MIT) AND BSD-3-Clause | character encodings | https://github.com/hsivonen/encoding_rs |
 | icu_* (ICU4X, via Stylo and Parley) | 2.x | Unicode-3.0 | Unicode segmentation and properties | https://github.com/unicode-org/icu4x |
 | winit | 0.30.13 | Apache-2.0 | windows and the event loop | https://github.com/rust-windowing/winit |
@@ -292,6 +293,8 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | precomputed-hash | 0.1.1 | MIT |  |
 | prettyplease | 0.2.37 | MIT OR Apache-2.0 | build |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |  |
+| psl | 2.1.252 | MIT/Apache-2.0 (list data: MPL-2.0) |  |
+| psl-types | 2.0.11 | MIT/Apache-2.0 |  |
 | pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 |  |
 | quick-error | 2.0.1 | MIT/Apache-2.0 |  |
 | quote | 1.0.47 | MIT OR Apache-2.0 |  |
