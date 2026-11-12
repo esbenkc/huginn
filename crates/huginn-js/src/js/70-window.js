@@ -240,19 +240,23 @@ const history = new History();
 
 // ------------------------------------------------------------- navigator --
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+// N.os: the system this build runs on (`install_ops`).
+const OS = N.os === 'macos'
+  ? { ua: 'Macintosh; Intel Mac OS X 10_15_7', platform: 'MacIntel', name: 'macOS', version: '14.0.0', arch: 'arm' }
+  : { ua: 'X11; Linux x86_64', platform: 'Linux x86_64', name: 'Linux', version: '6.8.0', arch: 'x86' };
+const UA = `Mozilla/5.0 (${OS.ua}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36`;
 class Navigator {}
 const navigatorProps = {
   userAgent: UA, appVersion: UA.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko',
-  productSub: '20030107', vendor: 'Google Inc.', vendorSub: '', platform: 'MacIntel', language: 'en-US',
+  productSub: '20030107', vendor: 'Google Inc.', vendorSub: '', platform: OS.platform, language: 'en-US',
   languages: Object.freeze(['en-US', 'en']), cookieEnabled: true, onLine: true, hardwareConcurrency: 8,
   deviceMemory: 8, maxTouchPoints: 0, webdriver: false, doNotTrack: null, pdfViewerEnabled: true,
   plugins: Object.freeze([]), mimeTypes: Object.freeze([]),
   userAgentData: {
     brands: [{ brand: 'Chromium', version: '131' }, { brand: 'Not_A Brand', version: '24' }],
-    mobile: false, platform: 'macOS',
-    getHighEntropyValues() { return Promise.resolve({ brands: this.brands, mobile: false, platform: 'macOS', platformVersion: '14.0.0', architecture: 'arm', model: '', uaFullVersion: '131.0.0.0' }); },
-    toJSON() { return { brands: this.brands, mobile: false, platform: 'macOS' }; },
+    mobile: false, platform: OS.name,
+    getHighEntropyValues() { return Promise.resolve({ brands: this.brands, mobile: false, platform: OS.name, platformVersion: OS.version, architecture: OS.arch, model: '', uaFullVersion: '131.0.0.0' }); },
+    toJSON() { return { brands: this.brands, mobile: false, platform: OS.name }; },
   },
   connection: Object.assign(new EventTarget(), { effectiveType: '4g', downlink: 10, rtt: 50, saveData: false, type: 'wifi' }),
   permissions: { query() { return Promise.resolve({ state: 'prompt', onchange: null, addEventListener() {}, removeEventListener() {} }); } },

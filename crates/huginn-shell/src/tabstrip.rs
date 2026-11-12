@@ -14,8 +14,9 @@ use crate::engine::escape_html;
 use crate::tab::{TABSTRIP_HEIGHT, Tab};
 use crate::ui::{Pixels, blend, render_snippet};
 
-/// Room for the macOS traffic lights at the left of the strip.
-pub const LEFT_INSET: f32 = 78.0;
+/// Space at the left of the strip: room for the macOS traffic lights, a small
+/// margin where the window has its own title bar.
+pub const LEFT_INSET: f32 = if cfg!(target_os = "macos") { 78.0 } else { 8.0 };
 const MAX_TAB_WIDTH: f32 = 240.0;
 const MIN_TAB_WIDTH: f32 = 36.0;
 const PLUS_WIDTH: f32 = 40.0;

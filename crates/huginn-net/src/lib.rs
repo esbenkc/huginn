@@ -139,7 +139,11 @@ impl Loader {
 
     fn build(loopback_only: bool) -> Loader {
         let config = ureq::Agent::config_builder()
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Huginn/0.1")
+            .user_agent(if cfg!(target_os = "macos") {
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Huginn/0.1"
+            } else {
+                "Mozilla/5.0 (X11; Linux x86_64) Huginn/0.1"
+            })
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .build();

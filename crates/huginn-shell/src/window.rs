@@ -20,6 +20,7 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WKey, NamedKey};
+#[cfg(target_os = "macos")]
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
@@ -174,7 +175,11 @@ impl App {
                 f64::from(w) / f64::from(scale),
                 f64::from(h) / f64::from(scale),
             ))
-            .with_position(LogicalPosition::new(80.0 + 28.0 * n, 60.0 + 28.0 * n))
+            .with_position(LogicalPosition::new(80.0 + 28.0 * n, 60.0 + 28.0 * n));
+        // macOS: the tab strip is drawn in the title bar area. Elsewhere the
+        // window keeps its normal title bar and the strip sits under it.
+        #[cfg(target_os = "macos")]
+        let attrs = attrs
             .with_titlebar_transparent(true)
             .with_title_hidden(true)
             .with_fullsize_content_view(true);
@@ -308,16 +313,25 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
+                // `cmd` is the primary shortcut modifier: Command on macOS,
+                // Control elsewhere (where `ctrl` is then the Super key).
+                let (cmd, ctrl) = if cfg!(target_os = "macos") {
+                    (s.super_key(), s.control_key())
+                } else {
+                    (s.control_key(), s.super_key())
+                };
                 self.mods = Modifiers {
-                    cmd: s.super_key(),
+                    cmd,
                     shift: s.shift_key(),
                     alt: s.alt_key(),
-                    ctrl: s.control_key(),
+                    ctrl,
                 };
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if let (Some(k), Some(b)) = (map_key(&event, mods), self.session.window_mut(key)) {
-                    b.key(KeyEvent { key: k, mods });
+                let ev = native_chord(&event, mods)
+                    .or_else(|| map_key(&event, mods).map(|key| KeyEvent { key, mods }));
+                if let (Some(ev), Some(b)) = (ev, self.session.window_mut(key)) {
+                    b.key(ev);
                 }
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
@@ -468,7 +482,9 @@ impl App {
         let focused = self.session.windows.get(self.session.focused).map(|b| b.id);
         let win = self.wins.values_mut().find(|w| Some(w.key) == focused);
         match (verb, win) {
-            ("capture", Some(win)) => capture(&win.window, rest.trim())?,
+            ("capture", Some(win)) => {
+                capture(&win.window, &mut self.session, win.key, rest.trim())?
+            }
             ("resize", Some(win)) => {
                 let v: Vec<f64> = rest
                     .split_whitespace()
@@ -492,7 +508,8 @@ impl App {
 }
 
 /// Save a screenshot of `window` (without its shadow) with `screencapture`.
-fn capture(window: &Window, path: &str) -> Result<(), String> {
+#[cfg(target_os = "macos")]
+fn capture(window: &Window, _: &mut Session, _: u64, path: &str) -> Result<(), String> {
     let id = window_number(window).ok_or("no window number")?;
     let status = std::process::Command::new("screencapture")
         .args(["-x", "-o", "-l", &id.to_string(), path])
@@ -505,6 +522,7 @@ fn capture(window: &Window, path: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// The window server's number for `window` (`-[NSWindow windowNumber]`).
 fn window_number(window: &Window) -> Option<isize> {
     use std::ffi::{c_char, c_void};
@@ -528,6 +546,82 @@ fn window_number(window: &Window) -> Option<isize> {
         (!ns_window.is_null())
             .then(|| send_int(ns_window, sel_registerName(c"windowNumber".as_ptr())))
     }
+}
+
+/// Save a screenshot of the window's content: the frame the browser composes
+/// (the same pixels the window shows, without the system title bar).
+#[cfg(not(target_os = "macos"))]
+fn capture(_: &Window, session: &mut Session, key: u64, path: &str) -> Result<(), String> {
+    let b = session.window_mut(key).ok_or("no window")?;
+    let (w, h) = b.size();
+    let mut frame = vec![0u32; w as usize * h as usize];
+    b.compose(&mut frame);
+    crate::headless::save_png(&frame, b, path)
+}
+
+/// Chrome's Linux and Windows chords that differ from its macOS ones, as the
+/// macOS chord the shell handles (`shortcuts.rs`, `Tab::key`). `mods` has
+/// Control in `cmd` here.
+#[cfg(not(target_os = "macos"))]
+fn native_chord(event: &WKeyEvent, mods: Modifiers) -> Option<KeyEvent> {
+    let cmd = Modifiers {
+        cmd: true,
+        ..Modifiers::default()
+    };
+    let ctrl = Modifiers {
+        ctrl: true,
+        shift: mods.shift,
+        ..Modifiers::default()
+    };
+    let ch = |c: &str| Key::Char(c.into());
+    let plain = !mods.cmd && !mods.alt && !mods.ctrl;
+    let only_cmd = mods.cmd && !mods.alt && !mods.ctrl;
+    let only_alt = mods.alt && !mods.cmd && !mods.ctrl && !mods.shift;
+    let (key, mods) = match &event.logical_key {
+        // Reload and hard reload.
+        WKey::Named(NamedKey::F5) if !mods.alt && !mods.ctrl => (
+            ch("r"),
+            Modifiers {
+                shift: mods.shift || mods.cmd,
+                ..cmd
+            },
+        ),
+        WKey::Named(NamedKey::F11) if plain => (ch("f"), Modifiers { ctrl: true, ..cmd }),
+        WKey::Named(NamedKey::F6) if plain => (ch("l"), cmd),
+        // Back and forward.
+        WKey::Named(NamedKey::ArrowLeft) if only_alt => (ch("["), cmd),
+        WKey::Named(NamedKey::ArrowRight) if only_alt => (ch("]"), cmd),
+        WKey::Named(NamedKey::Home) if only_alt => (ch("h"), Modifiers { shift: true, ..cmd }),
+        // Tab cycling.
+        WKey::Named(NamedKey::Tab) if only_cmd => (Key::Tab, ctrl),
+        WKey::Named(NamedKey::PageDown) if only_cmd && !mods.shift => (Key::Tab, ctrl),
+        WKey::Named(NamedKey::PageUp) if only_cmd && !mods.shift => (
+            Key::Tab,
+            Modifiers {
+                shift: true,
+                ..ctrl
+            },
+        ),
+        WKey::Character(_) if only_cmd || only_alt => {
+            let WKey::Character(c) = event.key_without_modifiers() else {
+                return None;
+            };
+            match (c.to_ascii_lowercase().as_str(), mods.shift) {
+                // History, bookmark manager, focus the address bar.
+                ("h", false) if only_cmd => (ch("y"), cmd),
+                ("o", true) if only_cmd => (ch("b"), Modifiers { alt: true, ..cmd }),
+                ("d", false) if only_alt => (ch("l"), cmd),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(KeyEvent { key, mods })
+}
+
+#[cfg(target_os = "macos")]
+fn native_chord(_: &WKeyEvent, _: Modifiers) -> Option<KeyEvent> {
+    None
 }
 
 fn map_key(event: &WKeyEvent, mods: Modifiers) -> Option<Key> {

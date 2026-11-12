@@ -178,6 +178,13 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
 
 ### Shortcuts and gestures (Chrome on macOS)
 
+On Linux, Ctrl takes the place of Cmd in every chord below, and `window.rs`
+(`native_chord`) maps Chrome's Linux chords that differ onto these: F5 and
+Ctrl+F5 (reload, hard reload), F11 (full screen), F6 and Alt+D (address bar),
+Alt+Left and Alt+Right (back, forward), Alt+Home (home), Ctrl+Tab and
+Ctrl+PageDown / Ctrl+PageUp (next and previous tab), Ctrl+H (history),
+Ctrl+Shift+O (bookmarks).
+
 | chord or gesture | action | status |
 |---|---|---|
 | Cmd+T | new tab: `huginn://newtab`, address bar focused | done |

@@ -36,6 +36,7 @@ The browser uses system fonts only; no font files are included.
 | icu_* (ICU4X, via Stylo and Parley) | 2.x | Unicode-3.0 | Unicode segmentation and properties | https://github.com/unicode-org/icu4x |
 | winit | 0.30.13 | Apache-2.0 | windows and the event loop | https://github.com/rust-windowing/winit |
 | softbuffer | 0.4.8 | MIT OR Apache-2.0 | shows CPU pixels in the window | https://github.com/rust-windowing/softbuffer |
+| arboard | 3.7.0 | MIT OR Apache-2.0 | the system clipboard on Linux (X11 and Wayland) | https://github.com/1Password/arboard |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | deflate for PDF output | https://github.com/Frommi/miniz_oxide |
 | serde_json | 1.0.154 | MIT OR Apache-2.0 | the timing JSON line | https://github.com/serde-rs/json |
 
@@ -89,6 +90,9 @@ compile time by the crates, 40 used only by build scripts). None is GPL, LGPL or
 ## All crates
 
 Generated from `cargo metadata --filter-platform aarch64-apple-darwin` on 2026-11-12.
+The Linux build adds crates that are not in this list yet (the X11 and Wayland
+backends of winit and softbuffer, fontconfig bindings, arboard and their
+dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-linux-gnu`.
 "build" marks crates that only build scripts use.
 
 | crate | version | license | |

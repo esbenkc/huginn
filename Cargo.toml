@@ -91,8 +91,8 @@ v8 = { version = "152.2.0", default-features = false, features = ["use_custom_li
 serde_json = "1"
 
 # Window for `huginn open`: winit for the event loop, softbuffer to show
-# CPU-rasterized pixels (no GPU device: far less memory than wgpu). macOS only
-# today; Linux would need the `x11`/`wayland` features of both.
+# CPU-rasterized pixels (no GPU device: far less memory than wgpu). huginn-shell
+# adds the `x11` and `wayland` features of both on Linux.
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 softbuffer = { version = "0.4.8", default-features = false }
 miniz_oxide = "0.8"
