@@ -395,3 +395,204 @@ fn navigator_reports_the_user_agent_and_brands_the_network_sends() {
         "bump CHROME_MAJOR with the v8 crate"
     );
 }
+
+impl Page {
+    fn body_attr(&self, name: &str) -> Option<String> {
+        self.doc
+            .attribute(self.doc.body().unwrap(), &huginn_dom::LocalName::from(name))
+            .map(str::to_owned)
+    }
+}
+
+/// Runs async checks; each pushes a failure description into `fails`. The
+/// result lands in `data-fails` once every check settled.
+const ASYNC_CHECKS: &str = r#"
+const fails = [];
+const checks = [];
+const check = (name, f) => checks.push(Promise.resolve().then(f).then(
+    r => { if (r !== true) fails.push(name + ': ' + r); },
+    e => fails.push(name + ' threw ' + e)));
+const done = () => Promise.all(checks).then(() => document.body.setAttribute('data-fails', JSON.stringify(fails)));
+"#;
+
+#[test]
+fn streams_pipe_tee_bytes_and_bodies() {
+    let mut p = Page::new("<body></body>");
+    let js = format!(
+        "{ASYNC_CHECKS}{}",
+        r#"
+        const collect = async rs => { const out = []; for await (const x of rs) out.push(x); return out; };
+        check('pipeThrough with backpressure', async () => {
+            let pulls = 0;
+            const rs = new ReadableStream({ pull(c) { pulls++; if (pulls <= 3) c.enqueue('ab' + pulls); else c.close(); } }, { highWaterMark: 1 });
+            const up = new TransformStream({ transform(ch, c) { c.enqueue(ch.toUpperCase()); }, flush(c) { c.enqueue('!'); } });
+            const out = (await collect(rs.pipeThrough(up))).join(' ');
+            return out === 'AB1 AB2 AB3 !' || out;
+        });
+        check('pipeTo waits for slow writes and closes', async () => {
+            const got = [];
+            let closed = false;
+            const ws = new WritableStream({ write(ch) { got.push(ch); return new Promise(r => setTimeout(r, 2)); }, close() { closed = true; } });
+            const rs = new ReadableStream({ start(c) { [1, 2, 3].forEach(x => c.enqueue(x)); c.close(); } });
+            await rs.pipeTo(ws);
+            return (got.join() === '1,2,3' && closed) || got.join() + ' ' + closed;
+        });
+        check('errors propagate through pipes', async () => {
+            let aborted;
+            const rs = new ReadableStream({ start(c) { c.error(new Error('boom')); } });
+            const r = await rs.pipeTo(new WritableStream({ abort(e) { aborted = e.message; } })).then(() => 'resolved', e => e.message);
+            return (r === 'boom' && aborted === 'boom') || r + ' ' + aborted;
+        });
+        check('tee gives both branches every chunk', async () => {
+            const [a, b] = new ReadableStream({ start(c) { c.enqueue(1); c.enqueue(2); c.close(); } }).tee();
+            const [x, y] = await Promise.all([collect(a), collect(b)]);
+            return (x.join() === '1,2' && y.join() === '1,2') || x + '|' + y;
+        });
+        check('byob reads fill the given view', async () => {
+            const rs = new ReadableStream({ type: 'bytes', start(c) { c.enqueue(new Uint8Array([1, 2])); c.enqueue(new Uint8Array([3, 4, 5])); c.close(); } });
+            const reader = rs.getReader({ mode: 'byob' });
+            const { value } = await reader.read(new Uint16Array(4), { min: 2 });
+            const end = await reader.read(new Uint8Array(1));
+            return (value instanceof Uint16Array && value.length === 2 && end.value.length === 1 && end.value[0] === 5)
+                || [value.length, end.value && end.value.length].join();
+        });
+        check('a locked stream cannot get a second reader', () => {
+            const rs = new ReadableStream();
+            rs.getReader();
+            try { rs.getReader(); return 'second reader'; } catch (e) { return e instanceof TypeError; }
+        });
+        check('Response bodies are byte streams', async () => {
+            const r = new Response('h\u00e9');
+            const { value } = await r.body.getReader().read();
+            const used = await r.text().then(() => 'read twice', e => e instanceof TypeError);
+            return (value instanceof Uint8Array && value.length === 3 && r.bodyUsed && used === true) || [value, used].join();
+        });
+        check('Response from a stream, cloned', async () => {
+            const enc = new TextEncoder();
+            const r = new Response(new ReadableStream({ start(c) { c.enqueue(enc.encode('{"a":')); c.enqueue(enc.encode('1}')); c.close(); } }));
+            const copy = r.clone();
+            const [j, t] = await Promise.all([r.json(), copy.text()]);
+            return (j.a === 1 && t === '{"a":1}') || t;
+        });
+        check('binary bodies stay binary', async () => {
+            const b = new Uint8Array(await new Response(new Uint8Array([0xff, 0, 0x80])).arrayBuffer());
+            const s = await new Response(new Blob(['ab', new Uint8Array([0xe2, 0x82, 0xac])]).stream()).text();
+            return (b.join() === '255,0,128' && s === 'ab\u20ac') || b.join() + ' ' + s;
+        });
+        check('text streams split characters across chunks', async () => {
+            const parts = ['h\u00e9 ', '\ud83d', '\ude00!'];
+            const rs = new ReadableStream({ start(c) { parts.forEach(x => c.enqueue(x)); c.close(); } });
+            const bytes = rs.pipeThrough(new TextEncoderStream());
+            // Re-chunk byte by byte so every multi-byte character is split.
+            const single = bytes.pipeThrough(new TransformStream({ transform(ch, c) { for (const b of ch) c.enqueue(new Uint8Array([b])); } }));
+            const out = (await collect(single.pipeThrough(new TextDecoderStream()))).join('');
+            return out === parts.join('') || JSON.stringify(out);
+        });
+        check('compression round trip and truncation', async () => {
+            const text = 'stream '.repeat(200);
+            const pack = (f, b) => new Response(new Blob([b]).stream().pipeThrough(new CompressionStream(f))).arrayBuffer();
+            const unpack = (f, b) => new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream(f))).text();
+            for (const f of ['gzip', 'deflate', 'deflate-raw']) {
+                const packed = await pack(f, text);
+                if (packed.byteLength >= text.length || await unpack(f, packed) !== text) return f + ' round trip';
+            }
+            const cut = new Uint8Array(await pack('gzip', text)).subarray(0, 12);
+            return await unpack('gzip', cut).then(() => 'truncated input accepted', e => e instanceof TypeError);
+        });
+        done();
+        "#
+    );
+    p.run(&js).unwrap();
+    p.load(200.0);
+    assert_eq!(p.body_attr("data-fails").as_deref(), Some("[]"));
+}
+
+#[test]
+fn text_decoder_streams_and_legacy_encodings() {
+    let mut p = Page::new("<body></body>");
+    p.run(
+        r#"
+        const out = [];
+        const euro = new TextEncoder().encode('a\u20acb');
+        const d = new TextDecoder();
+        out.push(d.decode(euro.subarray(0, 2), { stream: true }) + '|' + d.decode(euro.subarray(2, 3), { stream: true }) + '|' + d.decode(euro.subarray(3)));
+        out.push(new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x41, 0xff])));
+        try { new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xc0, 0x80])); out.push('no error'); } catch (e) { out.push(e.name); }
+        const w = new TextDecoder(' Latin1 ');
+        out.push(w.encoding + ':' + w.decode(new Uint8Array([0x80, 0xe6])));
+        out.push(new TextDecoder('utf-16le').decode(new Uint8Array([0x3d, 0xd8, 0x00, 0xde])));
+        out.push(new TextDecoder('shift_jis').decode(new Uint8Array([0x82, 0xa0])));
+        try { new TextDecoder('no-such-encoding'); out.push('accepted'); } catch (e) { out.push(e.name); }
+        const into = new Uint8Array(4);
+        const r = new TextEncoder().encodeInto('a\u20acb', into);
+        out.push(r.read + ',' + r.written);
+        document.body.setAttribute('data-out', out.join(' / '));
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        p.body_attr("data-out").as_deref(),
+        Some(
+            "a||\u{20ac}b / A\u{FFFD} / TypeError / windows-1252:\u{20ac}\u{e6} / \u{1F600} / \u{3042} / RangeError / 2,4"
+        )
+    );
+}
+
+#[test]
+fn import_maps_remap_static_and_dynamic_imports() {
+    let mut p = Page::new("<body></body>");
+    let module = |text: &str| format!("data:text/javascript,{}", text.replace(' ', "%20"));
+    let first = format!(
+        r#"{{"imports": {{"lib": "{}", "dup": "{}"}}}}"#,
+        module("export default 'mapped'"),
+        module("export default 1")
+    );
+    let second = format!(
+        r#"{{"imports": {{"dup": "{}", "late": "{}"}}}}"#,
+        module("export default 2"),
+        module("export default 'late'")
+    );
+    for map in [&first, &second] {
+        p.call(|e, cx| {
+            e.execute(
+                cx,
+                map,
+                "http://127.0.0.1:9/dir/page.html",
+                ScriptKind::ImportMap,
+            )
+        })
+        .unwrap();
+    }
+    // An invalid map is an error and changes nothing.
+    assert!(
+        p.call(|e, cx| e.execute(
+            cx,
+            "[1]",
+            "http://127.0.0.1:9/dir/page.html",
+            ScriptKind::ImportMap
+        ))
+        .is_err()
+    );
+    p.call(|e, cx| {
+        e.execute(
+            cx,
+            "import v from 'lib'; import d from 'dup'; document.body.setAttribute('data-static', v + d);",
+            "http://127.0.0.1:9/dir/page.html",
+            ScriptKind::Module,
+        )
+    })
+    .unwrap();
+    p.run(
+        r#"
+        import('late').then(m => document.body.setAttribute('data-late', m.default));
+        import('unmapped').catch(e => document.body.setAttribute('data-unmapped', e.name));
+        "#,
+    )
+    .unwrap();
+    // `import()` settles in a timer round; due times follow real time spent.
+    p.load(1000.0);
+    // The first map's "dup" wins: later maps cannot redefine a specifier.
+    assert_eq!(p.body_attr("data-static").as_deref(), Some("mapped1"));
+    assert_eq!(p.body_attr("data-late").as_deref(), Some("late"));
+    assert_eq!(p.body_attr("data-unmapped").as_deref(), Some("TypeError"));
+}

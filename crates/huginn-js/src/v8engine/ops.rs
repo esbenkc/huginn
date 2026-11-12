@@ -391,8 +391,9 @@ fn after_insert(
     }
 }
 
-/// A script element just got connected: inline classic scripts run now,
-/// everything else is queued for the next timer round.
+/// A script element just got connected: inline classic scripts and import
+/// maps run now, everything else is queued for the next timer round.
+/// External import maps are never loaded, as in browsers.
 fn start_script(scope: &mut v8::PinScope<'_, '_>, st: &SharedState, node: NodeId) {
     let (source, url, kind) = {
         let Some(cx) = host(scope) else { return };
@@ -400,15 +401,22 @@ fn start_script(scope: &mut v8::PinScope<'_, '_>, st: &SharedState, node: NodeId
         let Some(kind) = doc.element(node).and_then(script_kind) else {
             return;
         };
-        if doc.attribute(node, &local_name!("src")).is_some() || kind == ScriptKind::Module {
+        let external = doc.attribute(node, &local_name!("src")).is_some();
+        if kind == ScriptKind::ImportMap && external {
+            return;
+        }
+        if external || kind == ScriptKind::Module {
             st.borrow_mut().pending_scripts.push_back(node);
             return;
         }
         (inline_source(doc, node), cx.document_url.to_string(), kind)
     };
-    debug_assert_eq!(kind, ScriptKind::Classic);
     let prev = st.borrow_mut().current_script.replace(node);
-    if let Err(e) = run_classic(scope, &source, &url) {
+    let r = match kind {
+        ScriptKind::ImportMap => super::modules::register_import_map(scope, st, &source, &url),
+        _ => run_classic(scope, &source, &url),
+    };
+    if let Err(e) = r {
         st.borrow_mut().log_error(&e.to_string());
     }
     st.borrow_mut().current_script = prev;
@@ -447,6 +455,7 @@ pub(super) fn run_external_script(
     let r = match kind {
         ScriptKind::Classic => run_classic(scope, &source, &url),
         ScriptKind::Module => super::modules::run_module(scope, st, &source, &url),
+        ScriptKind::ImportMap => super::modules::register_import_map(scope, st, &source, &url),
     };
     st.borrow_mut().current_script = prev;
     match r {
@@ -965,6 +974,7 @@ op!(op_disabled(scope, args, rv) {
 /// Build the `N` object with every op.
 pub(super) fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
     let obj = v8::Object::new(scope);
+    super::codec::install(scope, obj);
     macro_rules! install {
         ($($name:literal => $f:ident),* $(,)?) => {
             $(

@@ -79,6 +79,8 @@ url = "2.5"
 data-url = "0.3"
 # Text decoding for non-UTF-8 documents and stylesheets (WHATWG Encoding Standard).
 encoding_rs = "0.8"
+# CompressionStream and DecompressionStream (already in the tree through png and ureq).
+flate2 = "1.1"
 
 # Web fonts: WOFF and WOFF2 to TrueType/OpenType (pure Rust, as in Blitz).
 wuff = { version = "0.2.10", default-features = false, features = ["brotli", "z"] }

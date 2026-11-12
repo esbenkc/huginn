@@ -17,6 +17,8 @@ pub mod activation;
 #[cfg_attr(not(feature = "v8"), allow(dead_code))]
 mod dom_ops;
 pub mod forms;
+#[cfg_attr(not(feature = "v8"), allow(dead_code))]
+mod importmap;
 #[cfg(feature = "v8")]
 mod v8engine;
 
@@ -25,11 +27,13 @@ use std::fmt;
 use huginn_dom::{Document, ElementData, NodeData, NodeId, local_name};
 use huginn_net::{Loader, Url};
 
-/// Classic script or ES module.
+/// Classic script, ES module, or import map.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScriptKind {
     Classic,
     Module,
+    /// `<script type="importmap">`: JSON that maps module specifiers.
+    ImportMap,
 }
 
 /// When a script runs relative to parsing.
@@ -71,6 +75,7 @@ pub fn script_kind(el: &ElementData) -> Option<ScriptKind> {
         | "application/x-javascript"
         | "text/jscript" => ScriptKind::Classic,
         "module" => ScriptKind::Module,
+        "importmap" => ScriptKind::ImportMap,
         _ => return None,
     };
     if kind == ScriptKind::Classic && el.attr(&local_name!("nomodule")).is_some() {
@@ -80,7 +85,8 @@ pub fn script_kind(el: &ElementData) -> Option<ScriptKind> {
 }
 
 /// Find the scripts the HTML spec would run, in document order. Data blocks
-/// (`type="application/json"` etc.) and `nomodule` scripts are skipped.
+/// (`type="application/json"` etc.) and `nomodule` scripts are skipped, and
+/// so are external import maps, which browsers do not load.
 pub fn collect_scripts(doc: &Document, base: &Url) -> Vec<ScriptRef> {
     let mut out = Vec::new();
     for n in doc.elements_by_local_name(&local_name!("script")) {
@@ -91,6 +97,9 @@ pub fn collect_scripts(doc: &Document, base: &Url) -> Vec<ScriptRef> {
         let src = el
             .attr(&local_name!("src"))
             .and_then(|s| huginn_net::resolve_url(base, s));
+        if kind == ScriptKind::ImportMap && el.attr(&local_name!("src")).is_some() {
+            continue;
+        }
         let timing = if el.attr(&local_name!("async")).is_some()
             && (src.is_some() || kind == ScriptKind::Module)
         {
@@ -421,7 +430,9 @@ mod tests {
                <script src="y.js" async></script>
                <script type="module" src="m.js"></script>
                <script type="application/json">{}</script>
-               <script nomodule src="old.js"></script>"#,
+               <script nomodule src="old.js"></script>
+               <script type="importmap" async>{}</script>
+               <script type="importmap" src="map.json"></script>"#,
         );
         let base = Url::parse("http://h/dir/page.html").unwrap();
         let s = collect_scripts(&doc, &base);
@@ -448,6 +459,7 @@ mod tests {
                     ScriptTiming::Defer,
                     Some("http://h/dir/m.js")
                 ),
+                (ScriptKind::ImportMap, ScriptTiming::Blocking, None),
             ]
         );
         assert_eq!(inline_source(&doc, s[0].node), "a()");
