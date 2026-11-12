@@ -699,18 +699,24 @@ by the V8 engine). Charset sniffing is in huginn-net (`Resource::html_text`).
 Done: V8, on by default (`--lite-mode`); the DOM layer in JavaScript (`src/js/`):
 nodes, elements, attributes, `classList`, `dataset`, inline `style`, events
 (capture and bubble, `on*` handlers), timers, rAF, `MessageChannel`,
-`fetch`/XHR (same origin), `URL`, `TextEncoder`, `localStorage` (in memory),
+`fetch`/XHR (same origin), `URL`, `TextEncoder`/`TextDecoder` (every WHATWG
+encoding, streaming; native, through encoding_rs), WHATWG streams (readable
+with byte streams and BYOB readers, writable, transform, pipes, tee, text and
+compression streams; `65-streams.js`, built on first use), `Response.body`
+as a stream, `localStorage` (in memory),
 `matchMedia`, `location`/`history`, custom elements (upgrade and callbacks,
 shadow trees included: a node in a shadow tree is connected when its host
 is; `importNode`/`cloneNode` upgrade copies), shadow roots (rendered through
 the flat tree; `::part`, `::slotted`, `:host`),
 `MutationObserver` (records for script mutations), `IntersectionObserver`
 (reports real geometry once), `getComputedStyle`, `getBoundingClientRect`;
-classic, defer, async and module scripts (static imports and `import()`;
-no import maps), script-inserted scripts, `document.write`. Timers are
+classic, defer, async and module scripts (static imports, `import()`,
+`import.meta`, import maps with scopes and merging: `src/importmap.rs`),
+script-inserted scripts, `document.write`. Timers are
 ordered from the start time of the engine call, so the order does not depend
 on CPU speed.
-1. Import maps (github's React islands fail on `import 'react'` today).
-2. A V8 startup snapshot of the prelude (isolate plus prelude cost about
+1. A V8 startup snapshot of the prelude (isolate plus prelude cost about
    5.5 ms and 15 MB RSS per script page).
-3. Image `load` events and `naturalWidth` (needs decoded sizes from huginn-net).
+2. Image `load` events and `naturalWidth` (needs decoded sizes from huginn-net).
+3. `about:blank` iframes with their own realm (`contentWindow` is null today;
+   Google's search page script reads builtins from one and fails).
