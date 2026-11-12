@@ -5,11 +5,12 @@
 //!   [`Loader::fetch_all`] fetches many URLs in parallel on scoped threads.
 //!   Images and fonts go through [`Loader::fetch_uncached`]: their bodies are
 //!   decoded on the fetching thread and dropped right away.
-//! - [`decode_image`] decodes PNG/JPEG/GIF/WebP/BMP/ICO and SVG into the
-//!   rasterizer's pixel type (`vello_common::pixmap::Pixmap`, premultiplied
-//!   RGBA8). Big images shown much smaller are downscaled while decoding. The
-//!   decoded pixels are stored once and shared by layout (for the natural
-//!   size) and paint (for drawing). There is no second copy.
+//! - [`decode_image`] decodes PNG/JPEG/GIF/WebP/BMP/ICO, AVIF (the `avif`
+//!   feature) and SVG into the rasterizer's pixel type
+//!   (`vello_common::pixmap::Pixmap`, premultiplied RGBA8). Big images shown
+//!   much smaller are downscaled while decoding. The decoded pixels are stored
+//!   once and shared by layout (for the natural size) and paint (for
+//!   drawing). There is no second copy.
 //! - [`decode_font`] turns WOFF/WOFF2 into TrueType/OpenType.
 //! - [`decode_html`]/[`decode_text`] pick the character encoding (BOM,
 //!   `Content-Type`, `<meta charset>`, `@charset`).
@@ -26,11 +27,14 @@ use std::time::Duration;
 pub use url::Url;
 pub use vello_common::pixmap::Pixmap;
 
+#[cfg(feature = "avif")]
+mod avif;
 mod charset;
 mod font;
 mod media;
 mod srcset;
 mod svg;
+pub mod ua;
 
 pub use charset::{decode_html, decode_text};
 pub use font::{FontFormat, decode_font, font_format, size_adjust_font};
@@ -139,11 +143,7 @@ impl Loader {
 
     fn build(loopback_only: bool) -> Loader {
         let config = ureq::Agent::config_builder()
-            .user_agent(if cfg!(target_os = "macos") {
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Huginn/0.1"
-            } else {
-                "Mozilla/5.0 (X11; Linux x86_64) Huginn/0.1"
-            })
+            .user_agent(ua::USER_AGENT)
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .build();
@@ -278,11 +278,15 @@ impl Loader {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(NetError::UnsupportedScheme(url.scheme().to_owned()));
         }
-        let resp = self
+        let mut req = self
             .agent
             .post(url.as_str())
             .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-            .header("Content-Type", content_type)
+            .header("Content-Type", content_type);
+        for (k, v) in ua::client_hint_headers(url) {
+            req = req.header(*k, *v);
+        }
+        let resp = req
             .send(body)
             .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
         read_response(url, resp)
@@ -292,19 +296,28 @@ impl Loader {
         let accept = match kind {
             ResourceKind::Document => "text/html,application/xhtml+xml,*/*;q=0.8",
             ResourceKind::Stylesheet => "text/css,*/*;q=0.1",
-            ResourceKind::Image => "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
+            ResourceKind::Image => IMAGE_ACCEPT,
             ResourceKind::Font => "font/woff2,font/woff,font/ttf,*/*;q=0.5",
             ResourceKind::Script | ResourceKind::Other => "*/*",
         };
-        let resp = self
-            .agent
-            .get(url.as_str())
-            .header("Accept", accept)
+        let mut req = self.agent.get(url.as_str()).header("Accept", accept);
+        for (k, v) in ua::client_hint_headers(url) {
+            req = req.header(*k, *v);
+        }
+        let resp = req
             .call()
             .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
         read_response(url, resp)
     }
 }
+
+/// `Accept` for images: only formats [`decode_image`] decodes, in Chrome's
+/// order. Servers that negotiate send AVIF or WebP when they are listed.
+const IMAGE_ACCEPT: &str = if cfg!(feature = "avif") {
+    "image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.8"
+} else {
+    "image/webp,image/svg+xml,image/*,*/*;q=0.8"
+};
 
 /// Status check, final URL, content type and body of an HTTP response.
 fn read_response(
@@ -392,6 +405,7 @@ fn mime_from_path(path: &Path) -> Option<&'static str> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "avif" => "image/avif",
         "svg" => "image/svg+xml",
         "ico" => "image/x-icon",
         "woff" => "font/woff",
@@ -481,7 +495,8 @@ impl DecodedImage {
     }
 }
 
-/// Decode PNG, JPEG, GIF (first frame), WebP, BMP, ICO or SVG bytes.
+/// Decode PNG, JPEG, GIF (first frame), WebP, BMP, ICO, AVIF (the `avif`
+/// feature; still images) or SVG bytes.
 ///
 /// `display` is the size the image will be drawn at, in device pixels, when
 /// the caller knows it (`<img width height>`, `srcset` slot, CSS px sizes); a
@@ -495,9 +510,8 @@ pub fn decode_image(bytes: &[u8], display: Option<(u32, u32)>) -> Result<Decoded
     if svg::is_svg(bytes) {
         return decode_svg(bytes, display);
     }
-    let img = image::load_from_memory(bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+    let (img, has_alpha) = decode_raster(bytes)?;
     let (w, h) = (img.width(), img.height());
-    let has_alpha = img.color().has_alpha();
     let img = match display {
         Some((dw, dh)) if w > 0 && h > 0 => {
             // A 0 side is unknown; the known side decides.
@@ -528,6 +542,20 @@ pub fn decode_image(bytes: &[u8], display: Option<(u32, u32)>) -> Result<Decoded
         },
     );
     Ok(DecodedImage::new(pixmap, (w, h)))
+}
+
+/// Decode a raster image; also says whether it may have transparency.
+fn decode_raster(bytes: &[u8]) -> Result<(image::DynamicImage, bool), NetError> {
+    #[cfg(feature = "avif")]
+    if avif::is_avif(bytes) {
+        let a = avif::decode(bytes).map_err(NetError::Decode)?;
+        let img = image::RgbaImage::from_raw(a.width, a.height, a.pixels)
+            .ok_or_else(|| NetError::Decode("AVIF: bad buffer size".into()))?;
+        return Ok((image::DynamicImage::ImageRgba8(img), a.has_alpha));
+    }
+    let img = image::load_from_memory(bytes).map_err(|e| NetError::Decode(e.to_string()))?;
+    let has_alpha = img.color().has_alpha();
+    Ok((img, has_alpha))
 }
 
 /// Decoded images, filled by the shell and read by layout (`<img>` sizes,

@@ -17,7 +17,7 @@ The interfaces between crates are in [CONTRACTS.md](CONTRACTS.md).
 | `huginn-style` | CSS parsing, selector matching, cascade, computed style (`StyleEngine`, `StyleMap`, `ComputedStyle`) | huginn-dom, cssparser |
 | `huginn-layout` | Box tree, block/flex/grid layout, inline text layout (`LayoutEngine`, `LayoutTree`) | huginn-dom, huginn-style, huginn-net, Taffy, Parley |
 | `huginn-paint` | Display list (`DisplayList`) and the CPU rasterizer (`CpuRasterizer`), PNG encoding | huginn-layout, huginn-style, huginn-net, vello_cpu, png |
-| `huginn-net` | Fetching (`Loader`: http, https, file, data), in-memory cache, charset decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice | ureq, url, data-url, image, vello_common, resvg, wuff, encoding_rs |
+| `huginn-net` | Fetching (`Loader`: http, https, file, data), in-memory cache, charset decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | ureq, url, data-url, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs |
 | `huginn-js` | Script engine: V8 (cargo feature `v8`, on by default), the JavaScript DOM layer (prelude), native DOM operations, modules | huginn-dom, huginn-net, huginn-style, v8 |
 | `huginn-shell` | The `huginn` binary. Runs the page-load pipeline and prints the timing JSON | all of the above |
 
@@ -349,6 +349,85 @@ our biggest memory lever, so keep it that way: no helper processes.
 - **Known waste** (owner tasks in CONTRACTS.md): identical computed styles
   are not shared. Detached DOM nodes are never freed.
 
+## User agent
+
+Huginn sends the tokens of Chrome's reduced user agent that sites sniff for
+a modern engine, names itself, and does not claim to be Chrome:
+
+```
+Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Huginn/0.1 Safari/537.36
+Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Huginn/0.1 Safari/537.36
+```
+
+Why:
+
+- Sites sniff the user agent. With the old `Mozilla/5.0 (Macintosh; Intel
+  Mac OS X 10_15_7) Huginn/0.1`, google.com served its old basic-HTML page,
+  then a script bot check that failed, then HTTP 429. With the
+  `AppleWebKit/537.36 (KHTML, like Gecko)` and `Safari/537.36` tokens it
+  serves the current page. Other new engines also borrow tokens: Servo
+  sends a Firefox string with `Servo/1.0` in it.
+- No `Chrome/` token. Bot filters compare a Chrome claim with the TLS and
+  HTTP fingerprint of the connection. Huginn's (rustls, HTTP/1.1) is not
+  Chrome's, so a Chrome claim reads as a bot and gets a hard 403. Huginn
+  does not imitate Chrome's fingerprint; that would be bot-detection
+  evasion. Each cell below is one or more live requests (2026-11-12, no
+  cookies, same request; only the user agent differs). "Chrome" is this
+  string with `Chrome/152.0.0.0` before `Safari/537.36` and the Huginn
+  token at the end.
+
+  | site | old (`Huginn/0.1` only) | Chrome + Huginn | this string |
+  |---|---|---|---|
+  | google.com | old basic page | current page | current page |
+  | pexels.com | 200 | 403 | 200 |
+  | canva.com | 200 | 403 | 200 |
+  | coinbase.com | 200 | 403 | 200 |
+  | crunchyroll.com | 200 | 403 | 200 |
+  | medium.com | 403 | 200 | 200 |
+  | openai.com | 403 (200 on a retry) | 200 | 200 |
+  | quora.com | 403 | 403 | 403 (200 with the client hints) |
+  | zillow.com | 200 | 200 | 403 |
+  | instagram.com | 200, 417 KB | 200, 518 KB | 200, 417 KB |
+
+  The same for every string: 200 from dr.dk, bbc.com, reddit.com, x.com,
+  youtube.com, discord.com, gitlab.com, notion.so, figma.com and
+  cloudflare.com; 403 from stackoverflow.com, npmjs.com, udemy.com, etsy.com
+  and nytimes.com (cookie or script challenges); 401 from wsj.com; 202 from
+  amazon.com.
+- `Huginn/<major.minor>` names the browser. Sites and server logs can tell
+  Huginn apart, and a site can work around a Huginn bug. The platform part
+  is Chrome's frozen one (`10_15_7` on every macOS version), so the string
+  says nothing beyond the OS family and the Huginn version.
+- One source, `huginn_net::ua`, feeds the `User-Agent` header,
+  `navigator.userAgent`, `navigator.userAgentData` and the `Sec-CH-UA`,
+  `Sec-CH-UA-Mobile` and `Sec-CH-UA-Platform` headers. The brands are
+  `Chromium` 152, `Huginn` and a GREASE brand: Huginn runs Chrome 152's
+  JavaScript engine (V8 15.2), so scripts that check the Chromium version
+  get the JavaScript features they expect. A test in
+  `crates/huginn-js/tests/v8.rs` fails when the `v8` crate moves and
+  `ua::CHROME_MAJOR` does not. As in Chrome, the client hints go only to
+  `https:` and loopback URLs, and only these low-entropy ones; Huginn
+  ignores `Accept-CH`.
+- HTTP/2 would be a separate improvement (for speed), not a way to look
+  like Chrome.
+
+The image `Accept` header lists only formats `decode_image` decodes:
+`image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.8`. Image servers and
+CDNs pick the format from it. Listing a format Huginn could not decode
+made every negotiated image vanish (dr.dk sent AVIF). Without the `avif`
+cargo feature, `image/avif` is not listed.
+
+AVIF images are decoded by rav1d (a Rust port of dav1d, the decoder Chrome
+uses) after avif-parse reads the HEIF container (`huginn-net/src/avif.rs`).
+Huginn converts YUV to RGB itself, with bilinear chroma upsampling as in
+libavif; the output matches libavif within 1 per channel. rav1d is built
+without its assembly: the crates.io release does not build its ARM
+assembly, and its x86 assembly needs `nasm`. A 720x405 photo decodes in
+about 6 ms (JPEG: about 1 ms), 1920x1080 in about 40 ms. Each decode uses
+one thread (`n_threads = 1`); images still decode in parallel on the six
+fetch threads. Not supported yet: grid (tiled) AVIF, `irot`/`imir`/`clap`
+transforms, animation (the first frame is shown).
+
 ## External crates
 
 Versions are the ones in `Cargo.lock`.
@@ -363,6 +442,8 @@ Versions are the ones in `Cargo.lock`.
 | vello_cpu / vello_common | 0.4.0 | huginn-paint, huginn-net | CPU vector rasterizer from the Linebender project. Paths, rounded rects, clips, glyphs, images. No GPU needed for headless screenshots. |
 | png | 0.18.1 | huginn-paint | PNG encoding, fast compression. |
 | image | 0.25.10 | huginn-net | PNG, JPEG, GIF, WebP, BMP and ICO decoding, and the area-average downscale for big images shown small. |
+| rav1d | 1.1.0 | huginn-net (feature `avif`, default on) | AV1 decoding for AVIF images. Memory-safe Rust port of dav1d, the decoder Chrome uses. Pure Rust, no system library. BSD-2-Clause. |
+| avif-parse | 2.1.0 | huginn-net (feature `avif`) | Reads the AVIF (HEIF) container: the color and alpha AV1 items. MPL-2.0. |
 | resvg (usvg, tiny-skia) | 0.50.0 | huginn-net | SVG images, CSS SVG backgrounds and inline `<svg>`. Features off: no text (it would load a font database on every page), no raster images inside SVG. tiny-skia's premultiplied RGBA moves into vello's pixmap without a conversion. |
 | wuff | 0.2.10 | huginn-net | Pure-Rust WOFF and WOFF2 to sfnt (the WOFF2 glyf/loca transform included), as in Blitz. Every web font in the corpus is WOFF2. |
 | encoding_rs | 0.8.44 | huginn-net | WHATWG Encoding Standard decoders for non-UTF-8 documents and stylesheets. UTF-8 input is borrowed, not copied. |
@@ -390,7 +471,7 @@ Licenses of all dependencies: [THIRD-PARTY.md](THIRD-PARTY.md).
 | Font discovery (lazy, on-disk family index) | `huginn-layout/src/fonts.rs` | fontique scans the files |
 | Display list and paint order (stacking, backgrounds, borders, clips) | `huginn-paint/src/lib.rs` | |
 | Rasterization | glue in `huginn-paint/src/raster.rs` | vello_cpu |
-| Image, SVG and font decoding | glue in `huginn-net` | image, resvg, wuff |
+| Image, SVG and font decoding | glue in `huginn-net`; AVIF YUV to RGB in `huginn-net/src/avif.rs` | image, rav1d, avif-parse, resvg, wuff |
 | Which images and fonts a page needs (`srcset`, `<picture>`, lazy, `@font-face` matching, `unicode-range`) | `huginn-shell/src/resources.rs`, `huginn-net` media queries | |
 | Charset sniffing | `huginn-net/src/charset.rs` (BOM, `Content-Type`, `<meta>` prescan, `@charset`) | encoding_rs |
 | Script loading order, event loop, DOM bindings (JS prelude + native ops), modules | `huginn-js`, `huginn-shell/src/scripts.rs` | V8 runs the JavaScript |

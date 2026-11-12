@@ -28,6 +28,8 @@ The browser uses system fonts only; no font files are included.
 | resvg (usvg, tiny-skia) | 0.50.0 | Apache-2.0 OR MIT (tiny-skia: BSD-3-Clause) | SVG images | https://github.com/linebender/resvg |
 | v8 (rusty_v8) | 152.2.0 | MIT (bindings); V8 itself: BSD-3-Clause | JavaScript engine | https://github.com/denoland/rusty_v8 |
 | image | 0.25.10 | MIT OR Apache-2.0 | PNG, JPEG, GIF, WebP, BMP, ICO decoding | https://github.com/image-rs/image |
+| rav1d | 1.1.0 | BSD-2-Clause | AV1 decoding for AVIF images (Rust port of dav1d) | https://github.com/memorysafety/rav1d |
+| avif-parse | 2.1.0 | MPL-2.0 | AVIF (HEIF) container parsing | https://github.com/kornelski/avif-parse |
 | png | 0.18.1 | MIT OR Apache-2.0 | PNG encoding | https://github.com/image-rs/image-png |
 | wuff | 0.2.10 | MIT | WOFF and WOFF2 decoding | https://github.com/nicoburns/wuff |
 | ureq (rustls, ring, webpki-roots) | 3.5.1 | MIT OR Apache-2.0 (ring: Apache-2.0 AND ISC; webpki-roots: CDLA-Permissive-2.0) | HTTP client and TLS | https://github.com/algesten/ureq |
@@ -48,25 +50,26 @@ example ICU, zlib, abseil-cpp and LLVM's libc++, which is Apache-2.0 WITH LLVM-e
 See https://github.com/denoland/rusty_v8 and https://v8.dev for the full notices.
 If you ship a `huginn` binary, ship those notices with it.
 
-### MPL-2.0 (Stylo and cssparser)
+### MPL-2.0 (Stylo, cssparser and avif-parse)
 
 The MPL-2.0 is a file-level copyleft license. Huginn uses these crates unchanged from
 crates.io and does not copy their files into this repository, so Huginn's own files
 stay MIT OR Apache-2.0. If you distribute a binary, tell recipients where the source of
-the MPL-2.0 crates is (crates.io, https://github.com/servo/stylo).
+the MPL-2.0 crates is (crates.io, https://github.com/servo/stylo,
+https://github.com/kornelski/avif-parse).
 
 ## License summary
 
-306 third-party crates are in the dependency graph for macOS arm64 (266 linked or used at
+321 third-party crates are in the dependency graph for macOS arm64 (281 linked or used at
 compile time by the crates, 40 used only by build scripts). None is GPL, LGPL or AGPL.
 
 | license expression | crates |
 |---|---|
-| MIT OR Apache-2.0 | 130 |
-| MIT | 54 |
+| MIT OR Apache-2.0 | 137 |
+| MIT | 57 |
 | Apache-2.0 OR MIT | 32 |
 | Unicode-3.0 | 27 |
-| MPL-2.0 | 14 |
+| MPL-2.0 | 15 |
 | Zlib OR Apache-2.0 OR MIT | 8 |
 | BSD-3-Clause | 7 |
 | Unlicense OR MIT | 6 |
@@ -74,16 +77,18 @@ compile time by the crates, 40 used only by build scripts). None is GPL, LGPL or
 | Apache-2.0 | 3 |
 | Zlib | 3 |
 | ISC | 3 |
+| BSD-2-Clause | 2 |
 | BSD-3-Clause OR MIT | 2 |
 | MIT OR Zlib OR Apache-2.0 | 2 |
 | BSD-3-Clause OR Apache-2.0 | 2 |
+| BSD-2-Clause OR Apache-2.0 OR MIT | 2 |
 | 0BSD OR MIT OR Apache-2.0 | 1 |
-| BSD-2-Clause | 1 |
 | Apache-2.0 AND MIT | 1 |
 | (Apache-2.0 OR MIT) AND BSD-3-Clause | 1 |
 | Apache-2.0 AND ISC | 1 |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | 1 |
 | Apache-2.0 OR ISC OR MIT | 1 |
+| CC0-1.0 | 1 |
 | (MIT OR Apache-2.0) AND Unicode-3.0 | 1 |
 | CDLA-Permissive-2.0 | 1 |
 
@@ -106,12 +111,17 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | app_units | 0.7.8 | MPL-2.0 |  |
 | arrayref | 0.3.9 | BSD-2-Clause |  |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |  |
+| assert_matches | 1.5.0 | MIT/Apache-2.0 |  |
 | atomic_refcell | 0.1.14 | Apache-2.0 OR MIT |  |
+| atomig | 0.4.3 | MIT/Apache-2.0 |  |
+| atomig-macro | 0.4.0 | MIT/Apache-2.0 |  |
 | autocfg | 1.5.1 | Apache-2.0 OR MIT | build |
+| avif-parse | 2.1.0 | MPL-2.0 |  |
 | base64 | 0.23.1 | MIT OR Apache-2.0 |  |
 | bindgen | 0.72.1 | BSD-3-Clause | build |
 | bitflags | 1.3.2 | MIT/Apache-2.0 |  |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |  |
+| bitreader | 0.3.11 | MIT OR Apache-2.0 |  |
 | block2 | 0.5.1 | MIT |  |
 | brotli-decompressor | 5.0.3 | BSD-3-Clause/MIT |  |
 | brotli-decompressor | 6.3.1 | BSD-3-Clause/MIT |  |
@@ -160,6 +170,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | equivalent | 1.0.3 | Apache-2.0 OR MIT |  |
 | errno | 0.3.15 | MIT OR Apache-2.0 | build |
 | euclid | 0.22.14 | MIT OR Apache-2.0 |  |
+| fallible_collections | 0.5.2 | MIT OR Apache-2.0 |  |
 | fastrand | 2.5.0 | Apache-2.0 OR MIT |  |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 |  |
 | fearless_simd | 1.2.0 | Apache-2.0 OR MIT |  |
@@ -215,6 +226,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | ixdtf | 0.6.7 | Unicode-3.0 |  |
 | jobserver | 0.1.35 | MIT OR Apache-2.0 | build |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT |  |
+| leb128 | 0.2.7 | MIT OR Apache-2.0 |  |
 | libc | 0.2.191 | MIT OR Apache-2.0 |  |
 | libloading | 0.8.9 | ISC | build |
 | libm | 0.2.16 | MIT |  |
@@ -232,6 +244,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |  |
 | moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 |  |
 | multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT |  |
+| nasm-rs | 0.3.2 | MIT OR Apache-2.0 | build |
 | new_debug_unreachable | 1.0.6 | MIT |  |
 | nom | 7.1.3 | MIT | build |
 | num-derive | 0.4.2 | MIT OR Apache-2.0 |  |
@@ -283,6 +296,8 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | quote | 1.0.47 | MIT OR Apache-2.0 |  |
 | rand | 0.8.8 | MIT OR Apache-2.0 |  |
 | rand_core | 0.6.4 | MIT OR Apache-2.0 |  |
+| rav1d | 1.1.0 | BSD-2-Clause |  |
+| raw-cpuid | 11.6.0 | MIT |  |
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib |  |
 | rayon | 1.12.0 | MIT OR Apache-2.0 |  |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 |  |
@@ -302,7 +317,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT |  |
 | rustls-pki-types | 1.16.0 | MIT OR Apache-2.0 |  |
 | rustls-webpki | 0.103.16 | ISC |  |
-| rustversion | 1.0.23 | MIT OR Apache-2.0 | build |
+| rustversion | 1.0.23 | MIT OR Apache-2.0 |  |
 | same-file | 1.0.6 | Unlicense/MIT | build |
 | scopeguard | 1.2.0 | MIT OR Apache-2.0 |  |
 | selectors | 0.43.0 | MPL-2.0 |  |
@@ -332,7 +347,9 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | strict-num | 0.1.1 | MIT |  |
 | string_cache | 0.11.0 | MIT OR Apache-2.0 |  |
 | string_cache_codegen | 0.11.2 | MIT OR Apache-2.0 | build |
+| strum | 0.26.3 | MIT |  |
 | strum | 0.28.0 | MIT |  |
+| strum_macros | 0.26.4 | MIT |  |
 | strum_macros | 0.28.0 | MIT |  |
 | stylo | 0.24.0 | MPL-2.0 |  |
 | stylo_atoms | 0.24.0 | MPL-2.0 |  |
@@ -358,6 +375,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | tiny-skia | 0.12.0 | BSD-3-Clause |  |
 | tiny-skia-path | 0.12.0 | BSD-3-Clause |  |
 | tinystr | 0.8.5 | Unicode-3.0 |  |
+| to_method | 1.1.0 | CC0-1.0 |  |
 | to_shmem | 0.8.0 | MPL-2.0 |  |
 | to_shmem_derive | 0.3.0 | MPL-2.0 |  |
 | toml | 1.2.1+spec-1.1.0 | MIT OR Apache-2.0 | build |
@@ -392,6 +410,8 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | wuff | 0.2.10 | MIT |  |
 | yoke | 0.8.4 | Unicode-3.0 |  |
 | yoke-derive | 0.8.4 | Unicode-3.0 |  |
+| zerocopy | 0.7.35 | BSD-2-Clause OR Apache-2.0 OR MIT |  |
+| zerocopy-derive | 0.7.35 | BSD-2-Clause OR Apache-2.0 OR MIT |  |
 | zerofrom | 0.1.8 | Unicode-3.0 |  |
 | zerofrom-derive | 0.1.8 | Unicode-3.0 |  |
 | zeroize | 1.9.1 | Apache-2.0 OR MIT |  |

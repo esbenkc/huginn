@@ -533,7 +533,7 @@ impl DecodedImage {
     pub fn width(&self) -> u32; pub fn height(&self) -> u32;               // natural size, CSS px
     pub fn pixmap(&self) -> &Arc<Pixmap>;                                   // may be smaller or bigger: scale by its size
 }
-/// PNG JPEG GIF WebP BMP ICO, and SVG (sniffed). `display` = drawn size in
+/// PNG JPEG GIF WebP BMP ICO, AVIF (feature `avif`, default on), and SVG (sniffed). `display` = drawn size in
 /// device px if known (0 = unknown side): rasters >= 2x that are downscaled,
 /// SVGs are rendered at it.
 pub fn decode_image(bytes: &[u8], display: Option<(u32, u32)>) -> Result<DecodedImage, NetError>;
@@ -556,10 +556,21 @@ pub fn parse_length(s: &str, screen: &Screen) -> Option<f32>;      // px, em, re
 pub fn parse_srcset(s: &str) -> Vec<SrcsetCandidate<'_>>;         // { url, descriptor: Width(f32) | Density(f32) }
 pub fn eval_sizes(sizes: &str, screen: &Screen) -> Option<f32>;   // slot width, CSS px
 pub fn choose_candidate<'a>(c: &[SrcsetCandidate<'a>], slot_width: f32, dpr: f32) -> Option<&'a str>;
+
+// What Huginn says it is: one source for headers and `navigator` (huginn-js).
+pub mod ua {
+    pub const USER_AGENT: &str;              // "Mozilla/5.0 (<Chrome's platform>) AppleWebKit/537.36 (KHTML, like Gecko) Huginn/<major.minor> Safari/537.36"; no Chrome/ token
+    pub const CHROME_MAJOR: &str;            // Chromium brand version: Chrome release of the embedded V8
+    pub const SEC_CH_UA: &str;               // brands: Chromium, Huginn, GREASE
+    pub const HUGINN_FULL_VERSION: &str;
+    pub fn client_hint_headers(url: &Url) -> &'static [(&'static str, &'static str)];  // Sec-CH-UA*; https and loopback only
+}
 ```
 
 Invariants:
 - Non-2xx HTTP responses are `NetError::Http`.
+- Every http(s) request sends `ua::USER_AGENT` and `ua::client_hint_headers`.
+  The image `Accept` header lists only formats `decode_image` decodes.
 - Pixmaps are premultiplied RGBA8 (vello's storage), at most 65535 px per
   side. `DecodedImage::width()/height()` are the natural size in CSS px; the
   pixmap size can differ, so layout uses `width()` and paint scales by

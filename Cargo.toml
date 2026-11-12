@@ -68,6 +68,10 @@ vello_common = { version = "0.4.0", default-features = false, features = ["std"]
 
 # Images
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+# AVIF images: the HEIF container (avif-parse) and the AV1 frame (rav1d, a
+# Rust port of dav1d). No system libraries; see crates/huginn-net/src/avif.rs.
+avif-parse = "2.1.0"
+rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
 # Networking
 ureq = { version = "3.5.1", default-features = false, features = ["rustls", "gzip", "brotli"] }

@@ -181,6 +181,45 @@ fn video_poster_is_drawn_at_its_size_and_contained() {
 }
 
 #[test]
+fn avif_images_are_decoded_and_drawn() {
+    let dir = out_dir("avif");
+    let page = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/avif.html");
+    let png_path = dir.join("avif.png");
+    render(&page, &png_path, 800, 300);
+    let (w, _, rgba) = decode_png(&png_path);
+    let px = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    };
+    // The files are lossy: allow a few steps per channel.
+    let near = |x: u32, y: u32, want: [u8; 4], what: &str| {
+        let got = px(x, y);
+        assert!(
+            got.iter().zip(want).all(|(&g, w)| g.abs_diff(w) <= 8),
+            "{what} at {x},{y}: {got:?}, want {want:?}"
+        );
+    };
+    let (red, blue, green) = ([255, 0, 0, 255], [0, 0, 255, 255], [0, 255, 0, 255]);
+    let gray = [128, 128, 128, 255];
+    near(10, 116, red, "8-bit 4:2:0 left");
+    near(54, 116, blue, "8-bit 4:2:0 right");
+    near(110, 116, red, "10-bit left");
+    near(154, 116, blue, "10-bit right");
+    // Natural size 32x16.
+    near(205, 108, red, "natural-size left");
+    near(226, 108, blue, "natural-size right");
+    near(240, 108, gray, "natural width ends at 32 px");
+    near(205, 122, gray, "natural height ends at 16 px");
+    near(310, 116, green, "alpha: opaque half");
+    // Red at alpha 128 over the gray page.
+    near(354, 106, [192, 64, 64, 255], "alpha: half transparent");
+    near(354, 126, gray, "alpha: transparent");
+    near(410, 116, red, "background left");
+    near(454, 116, blue, "background right");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn script_scrolls_an_element_and_its_sticky_header_sticks() {
     let dir = out_dir("scroll");
     let page = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/scroll.html");
