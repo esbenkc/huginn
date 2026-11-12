@@ -4,7 +4,10 @@
 //!   an in-memory cache keyed by URL, so a resource used twice is fetched once.
 //!   [`Loader::fetch_all`] fetches many URLs in parallel on scoped threads.
 //!   Images and fonts go through [`Loader::fetch_uncached`]: their bodies are
-//!   decoded on the fetching thread and dropped right away.
+//!   decoded on the fetching thread and dropped right away. It follows
+//!   redirects itself, hop by hop: cookies ([`CookieJar`], RFC 6265bis with
+//!   `SameSite`), `Referer` ([`ReferrerPolicy`]), and for scripts' requests
+//!   the Fetch standard's modes and CORS ([`Loader::fetch_for_script`]).
 //! - [`decode_image`] decodes PNG/JPEG/GIF/WebP/BMP/ICO, AVIF (the `avif`
 //!   feature) and SVG into the rasterizer's pixel type
 //!   (`vello_common::pixmap::Pixmap`, premultiplied RGBA8). Big images shown
@@ -24,21 +27,28 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use parking_lot::RwLock;
+
 pub use url::Url;
 pub use vello_common::pixmap::Pixmap;
 
 #[cfg(feature = "avif")]
 mod avif;
 mod charset;
+mod cookies;
+mod cors;
 mod font;
 mod media;
+mod referrer;
 mod srcset;
 mod svg;
 pub mod ua;
 
 pub use charset::{decode_html, decode_text};
+pub use cookies::{CookieContext, CookieJar, SameSite, registrable_domain, same_site};
 pub use font::{FontFormat, decode_font, font_format, size_adjust_font};
 pub use media::{Screen, media_matches, parse_length};
+pub use referrer::{ReferrerPolicy, referrer_for};
 pub use srcset::{Descriptor, SrcsetCandidate, choose_candidate, eval_sizes, parse_srcset};
 pub use svg::{decode_svg, is_svg};
 
@@ -53,6 +63,128 @@ pub enum ResourceKind {
     Other,
 }
 
+impl ResourceKind {
+    /// `Sec-Fetch-Dest`.
+    fn destination(self) -> &'static str {
+        match self {
+            ResourceKind::Document => "document",
+            ResourceKind::Stylesheet => "style",
+            ResourceKind::Script => "script",
+            ResourceKind::Image => "image",
+            ResourceKind::Font => "font",
+            ResourceKind::Other => "empty",
+        }
+    }
+}
+
+/// A request's mode (Fetch standard).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Loading a top-level document.
+    Navigate,
+    /// Other origins fail.
+    SameOrigin,
+    /// Other origins answer with an opaque response (`<img>`, classic `<script>`).
+    NoCors,
+    /// Other origins must allow the request (`fetch()`, module scripts).
+    Cors,
+}
+
+/// When a request carries cookies (Fetch "credentials mode").
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Credentials {
+    Omit,
+    /// Only to the requesting document's own origin.
+    SameOrigin,
+    Include,
+}
+
+/// What a script may see of a response (Fetch "response type").
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ResponseType {
+    /// Same origin: everything but `Set-Cookie`.
+    #[default]
+    Basic,
+    /// Another origin that allowed the request: safelisted and exposed headers.
+    Cors,
+    /// Another origin in `no-cors` mode: nothing.
+    Opaque,
+    /// A redirect with `redirect: "manual"`: nothing.
+    OpaqueRedirect,
+}
+
+/// What happens on a redirect (`fetch()`'s `redirect` option).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RedirectMode {
+    #[default]
+    Follow,
+    Error,
+    Manual,
+}
+
+/// An element's `crossorigin` attribute (HTML "CORS settings attribute").
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CorsSettings {
+    /// No attribute: a `no-cors` request with cookies.
+    #[default]
+    NoCors,
+    /// `crossorigin` or `crossorigin=anonymous`; also every module script.
+    Anonymous,
+    /// `crossorigin=use-credentials`.
+    UseCredentials,
+}
+
+impl CorsSettings {
+    /// The state of a `crossorigin` attribute (`None`: the attribute is absent).
+    pub fn from_attr(value: Option<&str>) -> CorsSettings {
+        match value {
+            None => CorsSettings::NoCors,
+            Some(v) if v.trim().eq_ignore_ascii_case("use-credentials") => {
+                CorsSettings::UseCredentials
+            }
+            Some(_) => CorsSettings::Anonymous,
+        }
+    }
+
+    fn mode(self) -> (Mode, Credentials) {
+        match self {
+            CorsSettings::NoCors => (Mode::NoCors, Credentials::Include),
+            CorsSettings::Anonymous => (Mode::Cors, Credentials::SameOrigin),
+            CorsSettings::UseCredentials => (Mode::Cors, Credentials::Include),
+        }
+    }
+}
+
+/// The document a loader fetches for (its origin, site for cookies and
+/// referrer), or the document that started a navigation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Client {
+    pub url: Url,
+    pub referrer_policy: ReferrerPolicy,
+}
+
+impl Client {
+    pub fn new(url: Url) -> Client {
+        Client {
+            url,
+            referrer_policy: ReferrerPolicy::default(),
+        }
+    }
+}
+
+/// A request made by a script (`fetch()`, `XMLHttpRequest`).
+#[derive(Clone, Debug)]
+pub struct ScriptRequest {
+    pub url: Url,
+    pub method: String,
+    /// Author headers; forbidden ones are dropped.
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub mode: Mode,
+    pub credentials: Credentials,
+    pub redirect: RedirectMode,
+}
+
 /// A fetched resource.
 #[derive(Debug)]
 pub struct Resource {
@@ -64,6 +196,12 @@ pub struct Resource {
     pub content_type: Option<String>,
     /// The `charset` parameter of the `Content-Type`, if any (as written).
     pub charset: Option<String>,
+    /// Response headers, names lowercase, without `Set-Cookie`.
+    pub headers: Vec<(String, String)>,
+    /// What a script may see of it.
+    pub response_type: ResponseType,
+    /// A redirect was followed.
+    pub redirected: bool,
     pub body: Vec<u8>,
 }
 
@@ -80,6 +218,35 @@ impl Resource {
     pub fn html_text(&self) -> std::borrow::Cow<'_, str> {
         decode_html(&self.body, self.charset.as_deref())
     }
+
+    /// The first value of response header `name` (lowercase).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn local(
+        url: &Url,
+        content_type: Option<String>,
+        charset: Option<String>,
+        body: Vec<u8>,
+    ) -> Resource {
+        Resource {
+            url: url.clone(),
+            status: 200,
+            headers: content_type
+                .iter()
+                .map(|t| ("content-type".to_owned(), t.clone()))
+                .collect(),
+            content_type,
+            charset,
+            response_type: ResponseType::Basic,
+            redirected: false,
+            body,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,9 +254,14 @@ pub enum NetError {
     InvalidUrl(String),
     UnsupportedScheme(String),
     Io(String),
-    Http { url: String, status: u16 },
+    Http {
+        url: String,
+        status: u16,
+    },
     Transport(String),
     Decode(String),
+    /// Refused by the same-origin policy or CORS.
+    Blocked(String),
 }
 
 impl fmt::Display for NetError {
@@ -101,6 +273,7 @@ impl fmt::Display for NetError {
             NetError::Http { url, status } => write!(f, "HTTP {status} for {url}"),
             NetError::Transport(e) => write!(f, "transport error: {e}"),
             NetError::Decode(e) => write!(f, "decode error: {e}"),
+            NetError::Blocked(e) => write!(f, "blocked: {e}"),
         }
     }
 }
@@ -111,13 +284,19 @@ impl std::error::Error for NetError {}
 const MAX_BODY: u64 = 64 << 20;
 /// Max parallel fetches in [`Loader::fetch_all`]. Same as Chrome's per-host HTTP/1.1 limit.
 const MAX_PARALLEL: usize = 6;
+/// Redirects followed per request (Fetch's limit).
+const MAX_REDIRECTS: usize = 20;
 
 /// Fetches resources and caches them in memory for the life of the loader.
 ///
 /// `Loader` is `Sync`: share one per page (or per process) by reference.
+/// Requests carry the cookies of its [`CookieJar`] and the `Origin` and
+/// `Referer` of its [`Client`], the document it fetches for.
 pub struct Loader {
     agent: ureq::Agent,
     cache: Mutex<HashMap<Url, Arc<Resource>>>,
+    cookies: Arc<CookieJar>,
+    client: RwLock<Option<Client>>,
 }
 
 impl Default for Loader {
@@ -126,26 +305,63 @@ impl Default for Loader {
     }
 }
 
+/// One request on its way through redirects.
+struct Request<'a> {
+    url: Url,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<&'a [u8]>,
+    kind: ResourceKind,
+    mode: Mode,
+    credentials: Credentials,
+    redirect: RedirectMode,
+    /// The document making the request (or starting the navigation);
+    /// `None`: the browser itself (the address bar, a bookmark).
+    client: Option<Client>,
+    /// Return non-2xx responses (with their body) instead of an error.
+    any_status: bool,
+}
+
+/// What a request's chain of URLs has been relative to its client, for `Sec-Fetch-Site`.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SiteRelation {
+    SameOrigin,
+    SameSite,
+    CrossSite,
+}
+
 impl Loader {
-    /// A loader. `HUGINN_NET_LOOPBACK_ONLY=1` in the environment makes it
-    /// [`Loader::loopback_only`]. The benchmark sets it so Huginn is offline
-    /// there like Chrome and Ladybird.
+    /// A loader with its own in-memory cookie jar. `HUGINN_NET_LOOPBACK_ONLY=1`
+    /// in the environment makes it [`Loader::loopback_only`]. The benchmark
+    /// sets it so Huginn is offline there like Chrome and Ladybird.
     pub fn new() -> Loader {
-        Loader::build(std::env::var_os("HUGINN_NET_LOOPBACK_ONLY").is_some_and(|v| v == "1"))
+        Loader::with_cookies(Arc::new(CookieJar::in_memory()))
+    }
+
+    /// A loader that stores and sends cookies in `jar` (shared by the tabs
+    /// of a profile).
+    pub fn with_cookies(jar: Arc<CookieJar>) -> Loader {
+        Loader::build(
+            std::env::var_os("HUGINN_NET_LOOPBACK_ONLY").is_some_and(|v| v == "1"),
+            jar,
+        )
     }
 
     /// A loader that reaches only 127.0.0.1, localhost and ::1. Every other
     /// host fails at once as "host not found" (no DNS lookup, no connect,
     /// redirects included).
     pub fn loopback_only() -> Loader {
-        Loader::build(true)
+        Loader::build(true, Arc::new(CookieJar::in_memory()))
     }
 
-    fn build(loopback_only: bool) -> Loader {
+    fn build(loopback_only: bool, cookies: Arc<CookieJar>) -> Loader {
         let config = ureq::Agent::config_builder()
             .user_agent(ua::USER_AGENT)
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
+            // Redirects are followed here, hop by hop, for cookies and CORS.
+            .max_redirects(0)
+            .allow_non_standard_methods(true)
             .build();
         let agent = if loopback_only {
             ureq::Agent::with_parts(
@@ -159,16 +375,49 @@ impl Loader {
         Loader {
             agent,
             cache: Mutex::new(HashMap::new()),
+            cookies,
+            client: RwLock::new(None),
         }
     }
 
-    /// Fetch one URL. Cached results are returned without a new request.
-    /// Non-2xx HTTP responses are errors.
+    /// The cookie jar requests use (and `document.cookie` reads).
+    pub fn cookies(&self) -> &Arc<CookieJar> {
+        &self.cookies
+    }
+
+    /// Set the document this loader fetches for. Call once the document's
+    /// final URL (and `Referrer-Policy`) is known.
+    pub fn set_client(&self, client: Option<Client>) {
+        *self.client.write() = client;
+    }
+
+    /// The document this loader fetches for.
+    pub fn client(&self) -> Option<Client> {
+        self.client.read().clone()
+    }
+
+    /// Fetch one URL as a `no-cors` subresource of the client document.
+    /// Cached results are returned without a new request. Non-2xx HTTP
+    /// responses are errors.
     pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError> {
-        if let Some(hit) = self.cache.lock().expect("cache poisoned").get(url) {
+        self.fetch_with(url, kind, CorsSettings::NoCors)
+    }
+
+    /// [`Loader::fetch`] with a `crossorigin` state: `Anonymous` and
+    /// `UseCredentials` make a CORS request, so another origin must allow it
+    /// (module scripts, `<script crossorigin>`).
+    pub fn fetch_with(
+        &self,
+        url: &Url,
+        kind: ResourceKind,
+        cors: CorsSettings,
+    ) -> Result<Arc<Resource>, NetError> {
+        if let Some(hit) = self.cache.lock().expect("cache poisoned").get(url)
+            && (cors == CorsSettings::NoCors || hit.response_type != ResponseType::Opaque)
+        {
             return Ok(hit.clone());
         }
-        let res = Arc::new(self.fetch_uncached(url, kind)?);
+        let res = Arc::new(self.fetch_uncached_with(url, kind, cors)?);
         self.cache
             .lock()
             .expect("cache poisoned")
@@ -230,84 +479,571 @@ impl Loader {
 
     /// Fetch without touching the cache. Use for bodies that are decoded once
     /// and then dropped (images, fonts), so they do not stay in memory.
+    /// `ResourceKind::Document` is a navigation started by the browser
+    /// itself (view source, save page).
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError> {
-        match url.scheme() {
-            "file" => {
-                let path = url
-                    .to_file_path()
-                    .map_err(|_| NetError::InvalidUrl(url.to_string()))?;
-                let body = std::fs::read(&path)
-                    .map_err(|e| NetError::Io(format!("{}: {e}", path.display())))?;
-                Ok(Resource {
-                    url: url.clone(),
-                    status: 200,
-                    content_type: mime_from_path(&path).map(str::to_owned),
-                    charset: None,
-                    body,
-                })
-            }
-            "data" => {
-                let data = data_url::DataUrl::process(url.as_str())
-                    .map_err(|e| NetError::InvalidUrl(format!("{url}: {e:?}")))?;
-                let (body, _) = data
-                    .decode_to_vec()
-                    .map_err(|e| NetError::Decode(format!("data URL: {e:?}")))?;
-                let mime = data.mime_type();
-                let charset = mime.get_parameter("charset").map(str::to_owned);
-                Ok(Resource {
-                    url: url.clone(),
-                    status: 200,
-                    content_type: Some(format!("{}/{}", mime.type_, mime.subtype)),
-                    charset,
-                    body,
-                })
-            }
-            "http" | "https" => self.fetch_http(url, kind),
-            other => Err(NetError::UnsupportedScheme(other.to_owned())),
+        if kind == ResourceKind::Document {
+            return self.navigate(url, None, None).map(|(r, _)| r);
         }
+        self.fetch_uncached_with(url, kind, CorsSettings::NoCors)
     }
 
-    /// POST `body` to an http(s) `url` (a form submission) and return the
-    /// document it answers with. Never cached.
-    pub fn post_document(
+    fn fetch_uncached_with(
         &self,
         url: &Url,
-        content_type: &str,
-        body: &[u8],
+        kind: ResourceKind,
+        cors: CorsSettings,
     ) -> Result<Resource, NetError> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(NetError::UnsupportedScheme(url.scheme().to_owned()));
+        let (mode, credentials) = cors.mode();
+        match url.scheme() {
+            // Modules from `file:` are refused like in Chrome (opaque origin).
+            "file" if mode == Mode::Cors => Err(NetError::Blocked(format!(
+                "{url}: not a CORS request target"
+            ))),
+            "http" | "https" => self.send(Request {
+                url: url.clone(),
+                method: "GET".into(),
+                headers: Vec::new(),
+                body: None,
+                kind,
+                mode,
+                credentials,
+                redirect: RedirectMode::Follow,
+                client: self.client(),
+                any_status: false,
+            }),
+            _ => fetch_local(url),
         }
-        let mut req = self
-            .agent
-            .post(url.as_str())
-            .header("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-            .header("Content-Type", content_type);
-        for (k, v) in ua::client_hint_headers(url) {
-            req = req.header(*k, *v);
-        }
-        let resp = req
-            .send(body)
-            .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
-        read_response(url, resp)
     }
 
-    fn fetch_http(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError> {
-        let accept = match kind {
-            ResourceKind::Document => "text/html,application/xhtml+xml,*/*;q=0.8",
-            ResourceKind::Stylesheet => "text/css,*/*;q=0.1",
-            ResourceKind::Image => IMAGE_ACCEPT,
-            ResourceKind::Font => "font/woff2,font/woff,font/ttf,*/*;q=0.5",
-            ResourceKind::Script | ResourceKind::Other => "*/*",
-        };
-        let mut req = self.agent.get(url.as_str()).header("Accept", accept);
-        for (k, v) in ua::client_hint_headers(url) {
-            req = req.header(*k, *v);
+    /// Load a top-level document: a `GET`, or a form `POST` (`post`:
+    /// content type and body). `initiator`: the page that started the
+    /// navigation (a link, a form, `location`); `None` for the browser UI.
+    /// Returns the response and the `Referer` it was requested with
+    /// (`document.referrer`).
+    pub fn navigate(
+        &self,
+        url: &Url,
+        post: Option<(&str, &[u8])>,
+        initiator: Option<&Client>,
+    ) -> Result<(Resource, Option<String>), NetError> {
+        if !matches!(url.scheme(), "http" | "https") {
+            if post.is_some() {
+                return Err(NetError::UnsupportedScheme(url.scheme().to_owned()));
+            }
+            return fetch_local(url).map(|r| (r, None));
         }
-        let resp = req
-            .call()
+        let (method, headers, body) = match post {
+            Some((ty, body)) => (
+                "POST",
+                vec![("content-type".to_owned(), ty.to_owned())],
+                Some(body),
+            ),
+            None => ("GET", Vec::new(), None),
+        };
+        let res = self.send(Request {
+            url: url.clone(),
+            method: method.into(),
+            headers,
+            body,
+            kind: ResourceKind::Document,
+            mode: Mode::Navigate,
+            credentials: Credentials::Include,
+            redirect: RedirectMode::Follow,
+            client: initiator.cloned(),
+            any_status: false,
+        })?;
+        let referrer = initiator.and_then(|c| referrer_for(&c.url, c.referrer_policy, &res.url));
+        Ok((res, referrer))
+    }
+
+    /// A request from a script of the client document (`fetch()`,
+    /// `XMLHttpRequest`): any method, headers and body, CORS for other
+    /// origins. Any HTTP status is a response. What the script may see is
+    /// already filtered: opaque responses have status 0, no headers and no
+    /// body; CORS responses only the headers the server exposes.
+    pub fn fetch_for_script(&self, req: ScriptRequest) -> Result<Resource, NetError> {
+        let method = cors::normalize_method(&req.method);
+        if cors::is_forbidden_method(&method) || req.mode == Mode::Navigate {
+            return Err(NetError::Blocked(format!("{method} {}", req.url)));
+        }
+        let mut headers: Vec<(String, String)> = req
+            .headers
+            .into_iter()
+            .filter(|(n, v)| !cors::is_forbidden_request_header(n, v))
+            .map(|(n, v)| (n.to_ascii_lowercase(), v))
+            .collect();
+        if req.mode == Mode::NoCors {
+            if !cors::is_safelisted_method(&method) {
+                return Err(NetError::Blocked(format!(
+                    "{method} is not allowed in no-cors mode"
+                )));
+            }
+            headers.retain(|(n, v)| cors::is_safelisted_request_header(n, v));
+        }
+        let client = self.client();
+        match req.url.scheme() {
+            "data" => return fetch_local(&req.url),
+            "http" | "https" => {}
+            s => {
+                return Err(NetError::Blocked(format!(
+                    "{s}: URLs cannot be fetched by scripts"
+                )));
+            }
+        }
+        // A plain same-origin GET may reuse what the page already loaded.
+        let same_origin = client
+            .as_ref()
+            .is_some_and(|c| c.url.origin() == req.url.origin());
+        let cacheable = same_origin
+            && method == "GET"
+            && headers.is_empty()
+            && req.credentials != Credentials::Omit
+            && req.redirect == RedirectMode::Follow;
+        if cacheable
+            && let Some(hit) = self.cache.lock().expect("cache poisoned").get(&req.url)
+            && hit.response_type == ResponseType::Basic
+        {
+            return Ok(Resource {
+                url: hit.url.clone(),
+                status: hit.status,
+                content_type: hit.content_type.clone(),
+                charset: hit.charset.clone(),
+                headers: hit.headers.clone(),
+                response_type: ResponseType::Basic,
+                redirected: hit.redirected,
+                body: hit.body.clone(),
+            });
+        }
+        let mut res = self.send(Request {
+            url: req.url,
+            method,
+            headers,
+            body: req.body.as_deref(),
+            kind: ResourceKind::Other,
+            mode: req.mode,
+            credentials: req.credentials,
+            redirect: req.redirect,
+            client,
+            any_status: true,
+        })?;
+        match res.response_type {
+            ResponseType::Basic => {}
+            ResponseType::Cors => {
+                res.headers = cors::exposed_headers(
+                    &res.headers,
+                    true,
+                    req.credentials == Credentials::Include,
+                );
+            }
+            ResponseType::Opaque | ResponseType::OpaqueRedirect => {
+                res.status = 0;
+                res.headers = Vec::new();
+                res.content_type = None;
+                res.charset = None;
+                res.body = Vec::new();
+            }
+        }
+        Ok(res)
+    }
+
+    /// Fetch's main fetch for http(s), simplified: mode checks, CORS
+    /// preflight, cookies, `Origin`/`Referer`/`Sec-Fetch-*`, and redirects
+    /// followed one hop at a time.
+    fn send(&self, mut req: Request<'_>) -> Result<Resource, NetError> {
+        let origin = req.client.as_ref().map(|c| c.url.origin());
+        let mut policy = req
+            .client
+            .as_ref()
+            .map_or(ReferrerPolicy::default(), |c| c.referrer_policy);
+        // The referrer for the next hop; dropped for good once a hop's
+        // policy yields none.
+        let mut referrer_source = req.client.as_ref().map(|c| c.url.clone());
+        let unsafe_names = cors::unsafe_request_header_names(&req.headers);
+        let mut tainted_origin = false;
+        let mut tainting = ResponseType::Basic;
+        let mut redirected = false;
+        let mut relation = SiteRelation::SameOrigin;
+        for _hop in 0..=MAX_REDIRECTS {
+            let url = req.url.clone();
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(NetError::Blocked(format!("redirect to {url}")));
+            }
+            let same_origin =
+                !tainted_origin && origin.as_ref().is_some_and(|o| *o == url.origin());
+            let serialized_origin = match &origin {
+                Some(o) if o.is_tuple() && !tainted_origin => o.ascii_serialization(),
+                _ => "null".to_owned(),
+            };
+            if let Some(c) = &req.client {
+                let r = if same_origin {
+                    SiteRelation::SameOrigin
+                } else if same_site(&c.url, &url) {
+                    SiteRelation::SameSite
+                } else {
+                    SiteRelation::CrossSite
+                };
+                relation = relation.max(r);
+            }
+            match req.mode {
+                Mode::SameOrigin if !same_origin => {
+                    return Err(NetError::Blocked(format!("{url} is not same-origin")));
+                }
+                Mode::NoCors if !same_origin => {
+                    if tainting == ResponseType::Basic {
+                        tainting = ResponseType::Opaque;
+                    }
+                }
+                Mode::Cors if !same_origin => {
+                    tainting = ResponseType::Cors;
+                    if !cors::is_safelisted_method(&req.method) || !unsafe_names.is_empty() {
+                        let referer = referrer_source
+                            .as_ref()
+                            .and_then(|s| referrer_for(s, policy, &url));
+                        self.preflight(
+                            &url,
+                            &req.method,
+                            &unsafe_names,
+                            &serialized_origin,
+                            referer.as_deref(),
+                            req.credentials == Credentials::Include,
+                            relation,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+            let include_credentials = match req.credentials {
+                Credentials::Include => true,
+                Credentials::SameOrigin => tainting == ResponseType::Basic && same_origin,
+                Credentials::Omit => false,
+            };
+            let safe_method = matches!(req.method.as_str(), "GET" | "HEAD");
+            let cookie_cx = match (&req.mode, &req.client) {
+                (Mode::Navigate, None) => CookieContext {
+                    allows: SameSite::Strict,
+                    top_level: true,
+                },
+                (Mode::Navigate, Some(_)) => CookieContext {
+                    allows: if relation < SiteRelation::CrossSite {
+                        SameSite::Strict
+                    } else if safe_method {
+                        SameSite::Lax
+                    } else {
+                        SameSite::None
+                    },
+                    top_level: true,
+                },
+                (_, Some(c)) => CookieContext {
+                    allows: if same_site(&c.url, &url) {
+                        SameSite::Strict
+                    } else {
+                        SameSite::None
+                    },
+                    top_level: false,
+                },
+                (_, None) => CookieContext::SAME_SITE,
+            };
+
+            // Request headers.
+            let accept = match req.kind {
+                ResourceKind::Document => "text/html,application/xhtml+xml,*/*;q=0.8",
+                ResourceKind::Stylesheet => "text/css,*/*;q=0.1",
+                ResourceKind::Image => IMAGE_ACCEPT,
+                ResourceKind::Font => "font/woff2,font/woff,font/ttf,*/*;q=0.5",
+                ResourceKind::Script | ResourceKind::Other => "*/*",
+            };
+            let mut b = ureq::http::Request::builder()
+                .method(req.method.as_str())
+                .uri(url.as_str());
+            if !req.headers.iter().any(|(n, _)| n == "accept") {
+                b = b.header("Accept", accept);
+            }
+            for (k, v) in ua::client_hint_headers(&url) {
+                b = b.header(*k, *v);
+            }
+            for (n, v) in &req.headers {
+                b = b.header(n.as_str(), v.as_str());
+            }
+            let referer = referrer_source
+                .as_ref()
+                .and_then(|s| referrer_for(s, policy, &url));
+            if referer.is_none() {
+                referrer_source = None;
+            }
+            if let Some(r) = &referer {
+                b = b.header("Referer", r.as_str());
+            }
+            if req.client.is_some() {
+                if tainting == ResponseType::Cors {
+                    b = b.header("Origin", serialized_origin.as_str());
+                } else if !safe_method {
+                    let hide = match policy {
+                        ReferrerPolicy::NoReferrer => true,
+                        ReferrerPolicy::NoReferrerWhenDowngrade
+                        | ReferrerPolicy::StrictOrigin
+                        | ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+                            origin.as_ref().is_some_and(|o| match o {
+                                url::Origin::Tuple(s, ..) => s == "https",
+                                url::Origin::Opaque(_) => false,
+                            }) && !cookies::is_secure(&url)
+                        }
+                        ReferrerPolicy::SameOrigin => !same_origin,
+                        _ => false,
+                    };
+                    b = b.header(
+                        "Origin",
+                        if hide {
+                            "null"
+                        } else {
+                            serialized_origin.as_str()
+                        },
+                    );
+                }
+            }
+            if include_credentials && let Some(c) = self.cookies.header_for(&url, cookie_cx) {
+                b = b.header("Cookie", c);
+            }
+            if cookies::is_secure(&url) {
+                b = b
+                    .header(
+                        "Sec-Fetch-Site",
+                        match (&req.client, relation) {
+                            (None, _) => "none",
+                            (_, SiteRelation::SameOrigin) => "same-origin",
+                            (_, SiteRelation::SameSite) => "same-site",
+                            (_, SiteRelation::CrossSite) => "cross-site",
+                        },
+                    )
+                    .header(
+                        "Sec-Fetch-Mode",
+                        match req.mode {
+                            Mode::Navigate => "navigate",
+                            Mode::SameOrigin => "same-origin",
+                            Mode::NoCors => "no-cors",
+                            Mode::Cors => "cors",
+                        },
+                    )
+                    .header("Sec-Fetch-Dest", req.kind.destination());
+                if req.mode == Mode::Navigate && req.client.is_none() {
+                    b = b.header("Sec-Fetch-User", "?1");
+                }
+            }
+            if req.mode == Mode::Navigate {
+                b = b.header("Upgrade-Insecure-Requests", "1");
+            }
+            let built = b
+                .body(req.body.unwrap_or(&[]))
+                .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?;
+            let mut resp = if req.body.is_some() {
+                self.agent.run(built)
+            } else {
+                let (parts, _) = built.into_parts();
+                self.agent.run(ureq::http::Request::from_parts(parts, ()))
+            }
             .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
-        read_response(url, resp)
+
+            // Response headers; cookies go to the jar.
+            let status = resp.status().as_u16();
+            let mut headers = Vec::with_capacity(resp.headers().len());
+            for (n, v) in resp.headers() {
+                let v = String::from_utf8_lossy(v.as_bytes());
+                if n == "set-cookie" || n == "set-cookie2" {
+                    if include_credentials && n == "set-cookie" {
+                        self.cookies.set_from_header(&url, &v, cookie_cx);
+                    }
+                    continue;
+                }
+                headers.push((n.as_str().to_owned(), v.into_owned()));
+            }
+            if tainting == ResponseType::Cors
+                && !cors::cors_check(
+                    &headers,
+                    &serialized_origin,
+                    req.credentials == Credentials::Include,
+                )
+            {
+                return Err(NetError::Blocked(format!(
+                    "{url}: CORS check failed for origin {serialized_origin}"
+                )));
+            }
+            if let Some(p) = cors::header_value(&headers, "referrer-policy")
+                .and_then(|v| ReferrerPolicy::parse_header(&v))
+            {
+                policy = p;
+            }
+
+            let location = cors::header_value(&headers, "location")
+                .filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308));
+            if let Some(location) = location {
+                match req.redirect {
+                    RedirectMode::Error => {
+                        return Err(NetError::Blocked(format!("{url}: unexpected redirect")));
+                    }
+                    RedirectMode::Manual => {
+                        return Ok(Resource {
+                            url,
+                            status: 0,
+                            content_type: None,
+                            charset: None,
+                            headers: Vec::new(),
+                            response_type: ResponseType::OpaqueRedirect,
+                            redirected,
+                            body: Vec::new(),
+                        });
+                    }
+                    RedirectMode::Follow => {}
+                }
+                let next = url
+                    .join(&location)
+                    .map_err(|_| NetError::InvalidUrl(format!("{url}: bad Location {location}")))?;
+                let has_credentials = !next.username().is_empty() || next.password().is_some();
+                if has_credentials
+                    && ((req.mode == Mode::Cors && origin.as_ref() != Some(&next.origin()))
+                        || tainting == ResponseType::Cors)
+                {
+                    return Err(NetError::Blocked(format!(
+                        "{next}: redirect with credentials"
+                    )));
+                }
+                if url.origin() != next.origin() {
+                    if origin.as_ref().is_some_and(|o| *o != url.origin()) {
+                        tainted_origin = true;
+                    }
+                    req.headers.retain(|(n, _)| n != "authorization");
+                }
+                if (matches!(status, 301 | 302) && req.method == "POST")
+                    || (status == 303 && !matches!(req.method.as_str(), "GET" | "HEAD"))
+                {
+                    req.method = "GET".into();
+                    req.body = None;
+                    req.headers.retain(|(n, _)| {
+                        !matches!(
+                            n.as_str(),
+                            "content-type"
+                                | "content-encoding"
+                                | "content-language"
+                                | "content-location"
+                        )
+                    });
+                }
+                req.url = next;
+                redirected = true;
+                continue;
+            }
+
+            if !req.any_status && !(200..300).contains(&status) {
+                return Err(NetError::Http {
+                    url: url.to_string(),
+                    status,
+                });
+            }
+            let header = cors::header_value(&headers, "content-type");
+            let content_type = header.as_deref().map(|v| {
+                v.split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase()
+            });
+            let charset = header.as_deref().and_then(charset_param).map(str::to_owned);
+            // Size the buffer from Content-Length so read_to_end does not double it.
+            let mut body = Vec::with_capacity(
+                resp.body().content_length().unwrap_or(0).min(MAX_BODY) as usize,
+            );
+            if req.method != "HEAD" {
+                resp.body_mut()
+                    .with_config()
+                    .limit(MAX_BODY)
+                    .reader()
+                    .read_to_end(&mut body)
+                    .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
+            }
+            return Ok(Resource {
+                url,
+                status,
+                content_type,
+                charset,
+                headers,
+                response_type: tainting,
+                redirected,
+                body,
+            });
+        }
+        Err(NetError::Transport(format!(
+            "{}: too many redirects",
+            req.url
+        )))
+    }
+
+    /// A CORS preflight (`OPTIONS`) for a request to `url`: no cookies; the
+    /// answer must allow the origin, the method and the unsafe headers.
+    #[allow(clippy::too_many_arguments)]
+    fn preflight(
+        &self,
+        url: &Url,
+        method: &str,
+        unsafe_names: &[String],
+        origin: &str,
+        referer: Option<&str>,
+        credentials: bool,
+        relation: SiteRelation,
+    ) -> Result<(), NetError> {
+        let mut b = ureq::http::Request::builder()
+            .method("OPTIONS")
+            .uri(url.as_str())
+            .header("Accept", "*/*")
+            .header("Access-Control-Request-Method", method)
+            .header("Origin", origin);
+        if !unsafe_names.is_empty() {
+            b = b.header("Access-Control-Request-Headers", unsafe_names.join(","));
+        }
+        if let Some(r) = referer {
+            b = b.header("Referer", r);
+        }
+        if cookies::is_secure(url) {
+            b = b
+                .header(
+                    "Sec-Fetch-Site",
+                    if relation == SiteRelation::CrossSite {
+                        "cross-site"
+                    } else {
+                        "same-site"
+                    },
+                )
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Dest", "empty");
+        }
+        for (k, v) in ua::client_hint_headers(url) {
+            b = b.header(*k, *v);
+        }
+        let built = b
+            .body(())
+            .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?;
+        let resp = self
+            .agent
+            .run(built)
+            .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
+        let headers: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(n, v)| {
+                (
+                    n.as_str().to_owned(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let ok = (200..300).contains(&resp.status().as_u16())
+            && cors::cors_check(&headers, origin, credentials)
+            && cors::preflight_allows(&headers, method, unsafe_names, credentials);
+        if ok {
+            Ok(())
+        } else {
+            Err(NetError::Blocked(format!(
+                "{url}: CORS preflight failed for origin {origin}"
+            )))
+        }
     }
 }
 
@@ -319,50 +1055,39 @@ const IMAGE_ACCEPT: &str = if cfg!(feature = "avif") {
     "image/webp,image/svg+xml,image/*,*/*;q=0.8"
 };
 
-/// Status check, final URL, content type and body of an HTTP response.
-fn read_response(
-    url: &Url,
-    mut resp: ureq::http::Response<ureq::Body>,
-) -> Result<Resource, NetError> {
-    let status = resp.status().as_u16();
-    if !(200..300).contains(&status) {
-        return Err(NetError::Http {
-            url: url.to_string(),
-            status,
-        });
+/// `file:` and `data:` URLs.
+fn fetch_local(url: &Url) -> Result<Resource, NetError> {
+    match url.scheme() {
+        "file" => {
+            let path = url
+                .to_file_path()
+                .map_err(|_| NetError::InvalidUrl(url.to_string()))?;
+            let body = std::fs::read(&path)
+                .map_err(|e| NetError::Io(format!("{}: {e}", path.display())))?;
+            Ok(Resource::local(
+                url,
+                mime_from_path(&path).map(str::to_owned),
+                None,
+                body,
+            ))
+        }
+        "data" => {
+            let data = data_url::DataUrl::process(url.as_str())
+                .map_err(|e| NetError::InvalidUrl(format!("{url}: {e:?}")))?;
+            let (body, _) = data
+                .decode_to_vec()
+                .map_err(|e| NetError::Decode(format!("data URL: {e:?}")))?;
+            let mime = data.mime_type();
+            let charset = mime.get_parameter("charset").map(str::to_owned);
+            Ok(Resource::local(
+                url,
+                Some(format!("{}/{}", mime.type_, mime.subtype)),
+                charset,
+                body,
+            ))
+        }
+        other => Err(NetError::UnsupportedScheme(other.to_owned())),
     }
-    let final_url = {
-        use ureq::ResponseExt;
-        Url::parse(&resp.get_uri().to_string()).unwrap_or_else(|_| url.clone())
-    };
-    let header = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok());
-    let content_type = header.map(|v| {
-        v.split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase()
-    });
-    let charset = header.and_then(charset_param).map(str::to_owned);
-    // Size the buffer from Content-Length so read_to_end does not double it.
-    let mut body =
-        Vec::with_capacity(resp.body().content_length().unwrap_or(0).min(MAX_BODY) as usize);
-    resp.body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .reader()
-        .read_to_end(&mut body)
-        .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
-    Ok(Resource {
-        url: final_url,
-        status,
-        content_type,
-        charset,
-        body,
-    })
 }
 
 /// `text/html; charset="utf-8"` -> `utf-8`.
@@ -649,6 +1374,293 @@ mod tests {
         assert!(host_not_found(loader.fetch(&external, ResourceKind::Other)));
         let redirect = Url::parse(&format!("http://127.0.0.1:{port}/redirect")).unwrap();
         assert!(host_not_found(loader.fetch(&redirect, ResourceKind::Other)));
+    }
+
+    /// A request a test server saw.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Seen {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// An HTTP/1.1 server on 127.0.0.1 answering with `handler`'s status
+    /// line plus headers (body after a blank line). Returns its port and the
+    /// requests it saw.
+    fn serve(handler: impl Fn(&Seen) -> String + Send + 'static) -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in server.incoming() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut parts = line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_owned();
+                let path = parts.next().unwrap_or("").to_owned();
+                let mut headers = Vec::new();
+                let mut len = 0;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    let h = h.trim_end();
+                    if h.is_empty() {
+                        break;
+                    }
+                    let (n, v) = h.split_once(':').unwrap();
+                    let (n, v) = (n.trim().to_ascii_lowercase(), v.trim().to_owned());
+                    if n == "content-length" {
+                        len = v.parse().unwrap();
+                    }
+                    headers.push((n, v));
+                }
+                let mut body = vec![0; len];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                let req = Seen {
+                    method,
+                    path,
+                    headers,
+                };
+                let reply = handler(&req);
+                log.lock().unwrap().push(req);
+                let (head, body) = reply.split_once("\n\n").unwrap_or((&reply, ""));
+                let head = head.replace('\n', "\r\n");
+                let out = format!(
+                    "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(out.as_bytes()).unwrap();
+            }
+        });
+        (port, seen)
+    }
+
+    fn script(url: &str, method: &str, credentials: Credentials) -> ScriptRequest {
+        ScriptRequest {
+            url: Url::parse(url).unwrap(),
+            method: method.into(),
+            headers: Vec::new(),
+            body: None,
+            mode: Mode::Cors,
+            credentials,
+            redirect: RedirectMode::Follow,
+        }
+    }
+
+    #[test]
+    fn cookies_are_stored_and_sent_across_redirect_hops() {
+        let (port, seen) = serve(|r| {
+            match r.path.as_str() {
+            "/login" => "302 Found\nLocation: /home\nSet-Cookie: sid=1; Path=/\nSet-Cookie: tp=1; SameSite=None; Secure; Path=/".into(),
+            _ => "200 OK\nContent-Type: text/plain\n\nhome".into(),
+        }
+        });
+        let loader = Loader::new();
+        let login = Url::parse(&format!("http://127.0.0.1:{port}/login")).unwrap();
+        let (doc, referrer) = loader.navigate(&login, None, None).unwrap();
+        assert_eq!(doc.url.path(), "/home");
+        assert!(doc.redirected && referrer.is_none());
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log[0].header("cookie"), None);
+        assert_eq!(log[1].header("cookie"), Some("sid=1; tp=1"));
+        assert_eq!(log[1].header("sec-fetch-site"), Some("none"));
+        assert_eq!(log[1].header("sec-fetch-mode"), Some("navigate"));
+
+        // A page on another site (localhost vs 127.0.0.1) loads an image from
+        // this server: only the SameSite=None cookie goes along, and the
+        // Referer is trimmed to the page's origin.
+        loader.set_client(Some(Client::new(
+            Url::parse("http://localhost:1/news/story?id=7").unwrap(),
+        )));
+        let img = Url::parse(&format!("http://127.0.0.1:{port}/pixel")).unwrap();
+        let r = loader.fetch_uncached(&img, ResourceKind::Image).unwrap();
+        assert_eq!(r.response_type, ResponseType::Opaque);
+        let log = seen.lock().unwrap().clone();
+        let last = log.last().unwrap();
+        assert_eq!(last.header("cookie"), Some("tp=1"));
+        assert_eq!(last.header("referer"), Some("http://localhost:1/"));
+        assert_eq!(last.header("sec-fetch-site"), Some("cross-site"));
+        assert_eq!(last.header("origin"), None);
+
+        // A link from that other site: Lax cookies go on a GET navigation,
+        // and the new document's referrer is the linking origin.
+        let initiator = loader.client().unwrap();
+        let (_, referrer) = loader.navigate(&img, None, Some(&initiator)).unwrap();
+        assert_eq!(referrer.as_deref(), Some("http://localhost:1/"));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log.last().unwrap().header("cookie"), Some("sid=1; tp=1"));
+        // ... but not on a cross-site POST.
+        loader
+            .navigate(&img, Some(("text/plain", b"x")), Some(&initiator))
+            .unwrap();
+        let log = seen.lock().unwrap().clone();
+        let post = log.last().unwrap();
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.header("cookie"), Some("tp=1"));
+        assert_eq!(post.header("origin"), Some("http://localhost:1"));
+    }
+
+    #[test]
+    fn cors_allows_denies_and_hides_what_scripts_may_not_read() {
+        let (port, seen) = serve(|r| {
+            let origin = r.header("origin").unwrap_or("").to_owned();
+            match r.path.as_str() {
+                "/open" => format!(
+                    "200 OK\nContent-Type: application/json\nX-Secret: s\nX-Public: p\nAccess-Control-Allow-Origin: {origin}\nAccess-Control-Expose-Headers: X-Public\nSet-Cookie: c=1; SameSite=None; Secure\n\n{{\"ok\":1}}"
+                ),
+                "/creds" => format!(
+                    "200 OK\nAccess-Control-Allow-Origin: {origin}\nAccess-Control-Allow-Credentials: true\n\nyes"
+                ),
+                "/star" => "200 OK\nAccess-Control-Allow-Origin: *\n\nstar".into(),
+                "/hop" => "302 Found\nLocation: /open\nAccess-Control-Allow-Origin: *".into(),
+                _ => "200 OK\nContent-Type: text/plain\n\nprivate data".into(),
+            }
+        });
+        let loader = Loader::new();
+        loader.set_client(Some(Client::new(
+            Url::parse("http://localhost:9/app").unwrap(),
+        )));
+        let at = |p: &str| format!("http://127.0.0.1:{port}{p}");
+
+        let r = loader
+            .fetch_for_script(script(&at("/open"), "GET", Credentials::SameOrigin))
+            .unwrap();
+        assert_eq!((r.status, r.response_type), (200, ResponseType::Cors));
+        assert_eq!(r.body, b"{\"ok\":1}");
+        let names: Vec<&str> = r.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"content-type") && names.contains(&"x-public"));
+        assert!(!names.contains(&"x-secret") && !names.contains(&"set-cookie"));
+        let req = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(req.header("origin"), Some("http://localhost:9"));
+        assert_eq!(
+            req.header("cookie"),
+            None,
+            "same-origin credentials stay home"
+        );
+        // Cookies of a credentials-less CORS response are not stored.
+        assert!(loader.cookies().is_empty());
+
+        // No Access-Control-Allow-Origin: the script gets a network error.
+        assert!(matches!(
+            loader.fetch_for_script(script(&at("/private"), "GET", Credentials::SameOrigin)),
+            Err(NetError::Blocked(_))
+        ));
+        // `*` does not allow credentials; an echoed origin with
+        // Allow-Credentials does.
+        assert!(
+            loader
+                .fetch_for_script(script(&at("/star"), "GET", Credentials::Include))
+                .is_err()
+        );
+        assert_eq!(
+            loader
+                .fetch_for_script(script(&at("/creds"), "GET", Credentials::Include))
+                .unwrap()
+                .body,
+            b"yes"
+        );
+        // no-cors: the request goes out, the response is opaque.
+        let mut req = script(&at("/private"), "GET", Credentials::Include);
+        req.mode = Mode::NoCors;
+        let r = loader.fetch_for_script(req).unwrap();
+        assert_eq!((r.status, r.response_type), (0, ResponseType::Opaque));
+        assert!(r.body.is_empty() && r.headers.is_empty());
+        // same-origin mode refuses other origins outright.
+        let mut req = script(&at("/open"), "GET", Credentials::Include);
+        req.mode = Mode::SameOrigin;
+        let before = seen.lock().unwrap().len();
+        assert!(loader.fetch_for_script(req).is_err());
+        assert_eq!(seen.lock().unwrap().len(), before, "nothing was sent");
+        // A CORS redirect within the server keeps working (each hop is checked).
+        let r = loader
+            .fetch_for_script(script(&at("/hop"), "GET", Credentials::SameOrigin))
+            .unwrap();
+        assert!(r.redirected && r.url.path() == "/open");
+    }
+
+    #[test]
+    fn preflight_guards_non_simple_requests() {
+        let (port, seen) = serve(|r| {
+            let origin = r.header("origin").unwrap_or("").to_owned();
+            match (r.method.as_str(), r.path.as_str()) {
+                ("OPTIONS", "/api") => format!(
+                    "204 No Content\nAccess-Control-Allow-Origin: {origin}\nAccess-Control-Allow-Methods: PUT\nAccess-Control-Allow-Headers: x-token\nAccess-Control-Allow-Credentials: true"
+                ),
+                ("OPTIONS", _) => "204 No Content".into(),
+                (_, "/api") => format!(
+                    "200 OK\nAccess-Control-Allow-Origin: {origin}\nAccess-Control-Allow-Credentials: true\n\nput ok"
+                ),
+                _ => "200 OK\nAccess-Control-Allow-Origin: *\n\nnever".into(),
+            }
+        });
+        let loader = Loader::new();
+        // A cookie for the API's site that a credentialed request carries.
+        let api = Url::parse(&format!("http://127.0.0.1:{port}/api")).unwrap();
+        loader.cookies().set_from_header(
+            &api,
+            "k=1; SameSite=None; Secure",
+            CookieContext::SAME_SITE,
+        );
+        loader.set_client(Some(Client::new(
+            Url::parse("http://localhost:9/").unwrap(),
+        )));
+
+        let mut req = script(api.as_str(), "put", Credentials::Include);
+        req.headers = vec![
+            ("X-Token".into(), "t".into()),
+            ("Content-Type".into(), "text/plain".into()),
+        ];
+        req.body = Some(b"data".to_vec());
+        let r = loader.fetch_for_script(req).unwrap();
+        assert_eq!(r.body, b"put ok");
+        let log = seen.lock().unwrap().clone();
+        let (pre, put) = (&log[log.len() - 2], &log[log.len() - 1]);
+        assert_eq!(pre.method, "OPTIONS");
+        assert_eq!(pre.header("access-control-request-method"), Some("PUT"));
+        assert_eq!(
+            pre.header("access-control-request-headers"),
+            Some("x-token")
+        );
+        assert_eq!(pre.header("cookie"), None, "preflights never carry cookies");
+        assert_eq!(
+            (put.method.as_str(), put.header("cookie")),
+            ("PUT", Some("k=1"))
+        );
+        assert_eq!(put.header("x-token"), Some("t"));
+
+        // A preflight that does not allow the method: the request is never sent.
+        let mut req = script(
+            &format!("http://127.0.0.1:{port}/other"),
+            "DELETE",
+            Credentials::SameOrigin,
+        );
+        req.headers = vec![("Cookie".into(), "forged=1".into())];
+        let before = seen.lock().unwrap().len();
+        assert!(matches!(
+            loader.fetch_for_script(req),
+            Err(NetError::Blocked(_))
+        ));
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(log.len(), before + 1);
+        assert_eq!(log[before].method, "OPTIONS");
+        assert_eq!(
+            log[before].header("cookie"),
+            None,
+            "forbidden headers are dropped"
+        );
     }
 
     #[test]

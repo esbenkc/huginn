@@ -25,7 +25,7 @@ mod v8engine;
 use std::fmt;
 
 use huginn_dom::{Document, ElementData, NodeData, NodeId, local_name};
-use huginn_net::{Loader, Url};
+use huginn_net::{CorsSettings, Loader, Url};
 
 /// Classic script, ES module, or import map.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -55,6 +55,21 @@ pub struct ScriptRef {
     pub timing: ScriptTiming,
     /// Absolute URL for external scripts, `None` for inline ones.
     pub src: Option<Url>,
+    /// How `src` is fetched: classic scripts from other origins load
+    /// `no-cors`; modules and `crossorigin` scripts need CORS.
+    pub cors: CorsSettings,
+}
+
+/// The CORS settings a `<script>` is fetched with: its `crossorigin`
+/// attribute; modules without one are `anonymous`.
+pub fn script_cors(el: &ElementData, kind: ScriptKind) -> CorsSettings {
+    match (
+        CorsSettings::from_attr(el.attr(&local_name!("crossorigin"))),
+        kind,
+    ) {
+        (CorsSettings::NoCors, ScriptKind::Module) => CorsSettings::Anonymous,
+        (c, _) => c,
+    }
 }
 
 /// Which kind of script a `<script>` element is, or `None` if the HTML spec
@@ -116,6 +131,7 @@ pub fn collect_scripts(doc: &Document, base: &Url) -> Vec<ScriptRef> {
             kind,
             timing,
             src,
+            cors: script_cors(el, kind),
         });
     }
     out
@@ -138,6 +154,8 @@ pub struct HostContext<'a> {
     pub loader: &'a Loader,
     /// `document.URL` and `location`.
     pub document_url: &'a Url,
+    /// `document.referrer`: the `Referer` the document was requested with.
+    pub referrer: &'a str,
     /// Base for relative URLs (`<base href>` or the document URL).
     pub base_url: &'a Url,
     /// Viewport size in CSS px (`window.innerWidth/innerHeight`).

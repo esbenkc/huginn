@@ -330,13 +330,6 @@ pub fn url_set(u: &Url, part: &str, value: &str) -> Option<Url> {
     Some(u)
 }
 
-/// Requests scripts may make: the document's own origin, plus `data:` URLs.
-/// Cross-origin requests fail like a network error, so third-party scripts
-/// (analytics, ads) never reach the network.
-pub fn fetch_allowed(document_url: &Url, target: &Url) -> bool {
-    target.scheme() == "data" || target.origin() == document_url.origin()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,13 +420,5 @@ mod tests {
             v.as_str(),
             "http://127.0.0.1:8114/examples/react/dist/?q=1#x"
         );
-        assert!(fetch_allowed(
-            &u,
-            &Url::parse("http://127.0.0.1:8114/learn.json").unwrap()
-        ));
-        assert!(!fetch_allowed(
-            &u,
-            &Url::parse("https://www.google-analytics.com/analytics.js").unwrap()
-        ));
     }
 }

@@ -17,7 +17,7 @@ The interfaces between crates are in [CONTRACTS.md](CONTRACTS.md).
 | `huginn-style` | CSS parsing, selector matching, cascade, computed style (`StyleEngine`, `StyleMap`, `ComputedStyle`) | huginn-dom, cssparser |
 | `huginn-layout` | Box tree, block/flex/grid layout, inline text layout (`LayoutEngine`, `LayoutTree`) | huginn-dom, huginn-style, huginn-net, Taffy, Parley |
 | `huginn-paint` | Display list (`DisplayList`) and the CPU rasterizer (`CpuRasterizer`), PNG encoding | huginn-layout, huginn-style, huginn-net, vello_cpu, png |
-| `huginn-net` | Fetching (`Loader`: http, https, file, data), in-memory cache, charset decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | ureq, url, data-url, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs |
+| `huginn-net` | Fetching (`Loader`: http, https, file, data), in-memory cache, cookies (`CookieJar`), CORS and referrer policy, charset decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | ureq, url, data-url, psl, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs |
 | `huginn-js` | Script engine: V8 (cargo feature `v8`, on by default), the JavaScript DOM layer (prelude), native DOM operations, modules | huginn-dom, huginn-net, huginn-style, v8 |
 | `huginn-shell` | The `huginn` binary. Runs the page-load pipeline and prints the timing JSON | all of the above |
 
@@ -31,7 +31,7 @@ ordered.
  URL or file path
    |  huginn_net::parse_target
    v
- Loader::fetch_uncached(Document)   huginn-net    bytes; Resource::html_text picks the charset
+ Loader::navigate                   huginn-net    bytes (cookies, redirects); Resource::html_text picks the charset
    |  huginn_dom::parse_html, then resources::plan_images (srcset, <picture>, lazy)
    v
  Document (arena of Node)           huginn-dom    NodeId per node
@@ -472,6 +472,8 @@ Versions are the ones in `Cargo.lock`.
 | encoding_rs | 0.8.44 | huginn-net | WHATWG Encoding Standard decoders for non-UTF-8 documents and stylesheets. UTF-8 input is borrowed, not copied. |
 | ureq (rustls) | 3.5.1 | huginn-net | Small blocking HTTP/1.1 client with gzip and brotli. The corpus is HTTP/1.1 on 127.0.0.1; an async stack (tokio, hyper) would add threads and memory for nothing. Six scoped worker threads fetch and decode in parallel. |
 | url / data-url | 2.5.8 / 0.3.2 | huginn-net, all | WHATWG URL parsing and `data:` URLs. |
+| psl | 2.1 | huginn-net | The Public Suffix List compiled into lookup code: cookie `Domain` checks and site boundaries (`SameSite`, `Sec-Fetch-Site`). No list is parsed at run time, so it costs no heap. |
+| parking_lot | 0.12 | huginn-net | Locks without poisoning for the cookie jar and the loader's client; already in the tree through Stylo. |
 | serde_json | 1.0.154 | huginn-shell | The timing JSON line. |
 | v8 (rusty_v8) | 152.2.0 | huginn-js (feature `v8`, default on in huginn-shell) | The JavaScript engine. The only engine that runs modern framework code (React on todomvc) fast enough. Its build downloads a prebuilt static library (~40 MB). ICU data: the 1.8 MB Flutter subset shipped with the crate (`crates/huginn-js/data/icudtl.dat`, Unicode License V3). |
 | stylo (+ selectors, stylo_traits, stylo_dom) | 0.24.0 | huginn-style | Servo's CSS engine: custom properties, `calc()`, every shorthand, `@layer`, `:has()`, media queries level 4. See "The Stylo decision". MPL-2.0. |
@@ -722,7 +724,8 @@ by the V8 engine). Charset sniffing is in huginn-net (`Resource::html_text`).
 Done: V8, on by default (`--lite-mode`); the DOM layer in JavaScript (`src/js/`):
 nodes, elements, attributes, `classList`, `dataset`, inline `style`, events
 (capture and bubble, `on*` handlers), timers, rAF, `MessageChannel`,
-`fetch`/XHR (same origin), `URL`, `TextEncoder`/`TextDecoder` (every WHATWG
+`fetch`/XHR (Fetch modes and CORS), `document.cookie` (the cookie jar),
+`URL`, `TextEncoder`/`TextDecoder` (every WHATWG
 encoding, streaming; native, through encoding_rs), WHATWG streams (readable
 with byte streams and BYOB readers, writable, transform, pipes, tee, text and
 compression streams; `65-streams.js`, built on first use), `Response.body`

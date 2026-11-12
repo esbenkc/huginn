@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use huginn_dom::NodeId;
 use huginn_layout::{LayoutTree, Rect};
-use huginn_net::{DecodedImage, Url};
+use huginn_net::{Client, DecodedImage, ReferrerPolicy, Url};
 use huginn_paint::{CpuRasterizer, Rasterizer};
 use huginn_style::Viewport;
 
@@ -78,6 +78,8 @@ pub(crate) struct HistoryEntry {
     /// Scroll position when we left the entry, restored on back/forward.
     pub scroll: f32,
     pub post: Option<PostData>,
+    /// The page that opened this entry (`Referer`, `SameSite`); `None`: the user.
+    pub initiator: Option<Client>,
 }
 
 /// The page layer: strips of `rows` device rows, rasterized on demand.
@@ -177,6 +179,8 @@ pub struct Tab {
     pub error: Option<String>,
     /// Load time of the current page (fetch to layout), ms.
     pub load_ms: f64,
+    /// The current document's referrer policy, for the links it opens.
+    referrer_policy: ReferrerPolicy,
     /// The page's icon URL and image, once loaded.
     pub icon: Option<Url>,
     pub favicon: Option<DecodedImage>,
@@ -241,6 +245,7 @@ impl Tab {
             title: String::new(),
             error: None,
             load_ms: 0.0,
+            referrer_policy: ReferrerPolicy::default(),
             icon: None,
             favicon: None,
             scroll: 0.0,
@@ -388,7 +393,7 @@ impl Tab {
 
     fn send(&mut self, make: impl FnOnce(u64) -> Command) {
         if self.engine.is_none() {
-            let engine = self.shared.borrow().spawn_engine(self.id);
+            let engine = self.shared.borrow_mut().spawn_engine(self.id, self.private);
             if !self.visible {
                 let _ = engine.send(Command::SetVisible {
                     seq: 0,
@@ -482,6 +487,7 @@ impl Tab {
         self.title = l.title;
         self.error = l.error;
         self.load_ms = l.load_ms;
+        self.referrer_policy = l.referrer_policy;
         self.loading = None;
         self.stale = false;
         if self.icon != l.icon {
@@ -525,12 +531,17 @@ impl Tab {
 
     // ----- navigation --------------------------------------------------------
 
-    /// Open `url` as a new history entry.
+    /// Open `url` as a new history entry, as the user (address bar, bookmark).
     pub fn navigate(&mut self, url: Url) {
-        self.navigate_with(url, None);
+        self.navigate_with(url, None, None);
     }
 
-    pub(crate) fn navigate_with(&mut self, url: Url, post: Option<PostData>) {
+    pub(crate) fn navigate_with(
+        &mut self,
+        url: Url,
+        post: Option<PostData>,
+        initiator: Option<Client>,
+    ) {
         if let Some(cur) = self.history.get_mut(self.index) {
             cur.scroll = self.scroll;
         }
@@ -545,6 +556,7 @@ impl Tab {
             url,
             scroll: 0.0,
             post,
+            initiator,
         });
         self.index = self.history.len() - 1;
         if same_doc {
@@ -635,10 +647,11 @@ impl Tab {
         self.needs_layout = false;
         self.zoom = self.shared.borrow().zoom_for(&self.history[self.index].url);
         let entry = &self.history[self.index];
-        let (generation, url, post, viewport) = (
+        let (generation, url, post, initiator, viewport) = (
             self.generation,
             entry.url.clone(),
             entry.post.clone(),
+            entry.initiator.clone(),
             self.viewport(),
         );
         let html = crate::internal_pages::html(&url, &self.shared.borrow(), self.private);
@@ -649,13 +662,14 @@ impl Tab {
             viewport,
             post,
             html,
+            initiator,
         });
         self.dirty = true;
     }
 
     /// Open a link the way a click with `button` and `mods` does in Chrome:
     /// Cmd or middle button: background tab (with Shift: foreground tab);
-    /// Shift: new window; else this tab.
+    /// Shift: new window; else this tab, with this page as the initiator.
     pub(crate) fn open_link(
         &mut self,
         url: Url,
@@ -674,7 +688,11 @@ impl Tab {
                 private: self.private,
             });
         } else {
-            self.navigate_with(url, post);
+            let initiator = self.url().filter(|_| self.error.is_none()).map(|u| Client {
+                url: u.clone(),
+                referrer_policy: self.referrer_policy,
+            });
+            self.navigate_with(url, post, initiator);
         }
     }
 

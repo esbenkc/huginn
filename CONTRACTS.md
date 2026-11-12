@@ -502,30 +502,80 @@ pub struct Resource {
     pub status: u16,                         // 200 for file: and data:
     pub content_type: Option<String>,        // lowercase, no parameters
     pub charset: Option<String>,             // Content-Type charset parameter, as written
+    pub headers: Vec<(String, String)>,      // lowercase names, no Set-Cookie
+    pub response_type: ResponseType,         // Basic (same origin), Cors, Opaque, OpaqueRedirect
+    pub redirected: bool,
     pub body: Vec<u8>,
 }
 impl Resource {
     pub fn text(&self) -> Cow<'_, str>;       // CSS/JS: BOM, charset param, @charset, else UTF-8 (lossy)
     pub fn html_text(&self) -> Cow<'_, str>;  // HTML: BOM, charset param, <meta charset> prescan, else UTF-8 or windows-1252
+    pub fn header(&self, name: &str) -> Option<&str>;  // first value, lowercase name
 }
 pub fn decode_html(bytes: &[u8], transport_charset: Option<&str>) -> Cow<'_, str>;  // UTF-8 is borrowed
 pub fn decode_text(bytes: &[u8], transport_charset: Option<&str>) -> Cow<'_, str>;
 pub enum NetError { InvalidUrl(String), UnsupportedScheme(String), Io(String),
-                    Http { url: String, status: u16 }, Transport(String), Decode(String) }
+                    Http { url: String, status: u16 }, Transport(String), Decode(String),
+                    Blocked(String) }      // same-origin policy or CORS refused it
+
+// Fetch standard request options.
+pub enum Mode { Navigate, SameOrigin, NoCors, Cors }
+pub enum Credentials { Omit, SameOrigin, Include }
+pub enum RedirectMode { Follow, Error, Manual }
+pub enum CorsSettings { NoCors, Anonymous, UseCredentials }   // `crossorigin`; from_attr(Option<&str>)
+/// The document a loader fetches for (origin, site for cookies, referrer),
+/// or the page that started a navigation.
+pub struct Client { pub url: Url, pub referrer_policy: ReferrerPolicy }
+pub struct ScriptRequest { pub url: Url, pub method: String, pub headers: Vec<(String, String)>,
+                           pub body: Option<Vec<u8>>, pub mode: Mode, pub credentials: Credentials,
+                           pub redirect: RedirectMode }
 
 pub struct Loader { .. }                     // Sync; one per page
 impl Loader {
-    pub fn new() -> Loader;                  // 30 s global timeout, 64 MiB body limit; HUGINN_NET_LOOPBACK_ONLY=1 -> loopback_only()
+    pub fn new() -> Loader;                  // own in-memory cookie jar; 30 s global timeout, 64 MiB body limit; HUGINN_NET_LOOPBACK_ONLY=1 -> loopback_only()
+    pub fn with_cookies(jar: Arc<CookieJar>) -> Loader;  // the profile's jar, shared by its tabs
     pub fn loopback_only() -> Loader;        // hosts other than 127.0.0.1/localhost/::1 fail as host-not-found (bench: offline like Chrome/Ladybird)
-    pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // cached by URL
-    /// No cache: for bodies decoded once and dropped (document, images, fonts).
+    pub fn cookies(&self) -> &Arc<CookieJar>;
+    pub fn set_client(&self, client: Option<Client>);   // the document, once its final URL is known
+    pub fn client(&self) -> Option<Client>;
+    pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // no-cors subresource, cached by URL
+    pub fn fetch_with(&self, url: &Url, kind: ResourceKind, cors: CorsSettings) -> Result<Arc<Resource>, NetError>;  // modules, <script crossorigin>
+    /// No cache: for bodies decoded once and dropped (images, fonts). Document = a browser-started navigation.
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError>;
-    /// Form POST to http(s); the answer document. Never cached.
-    pub fn post_document(&self, url: &Url, content_type: &str, body: &[u8]) -> Result<Resource, NetError>;
+    /// Top-level GET or form POST (content type, body); initiator = the page that started it.
+    /// Returns the document and its referrer (document.referrer). Never cached.
+    pub fn navigate(&self, url: &Url, post: Option<(&str, &[u8])>, initiator: Option<&Client>)
+        -> Result<(Resource, Option<String>), NetError>;
+    /// fetch()/XHR: any method, CORS (preflight, Access-Control-* checks) for other origins,
+    /// any status; opaque responses come back empty, CORS ones with exposed headers only.
+    pub fn fetch_for_script(&self, req: ScriptRequest) -> Result<Resource, NetError>;
     pub fn fetch_all(&self, requests: &[(Url, ResourceKind)]) -> Vec<Result<Arc<Resource>, NetError>>;  // <= 6 parallel, input order
     pub fn map_parallel<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>;
     pub fn clear_cache(&self);               // drop cached bodies (after CSS parsing)
 }
+
+/// RFC 6265bis cookies: Domain (no public suffixes), Path, Expires/Max-Age
+/// (<= 400 days), Secure (https and loopback), HttpOnly, SameSite (Lax when
+/// absent; None needs Secure), __Secure-/__Host- prefixes.
+pub struct CookieJar { .. }                  // Sync
+impl CookieJar {
+    pub fn in_memory() -> CookieJar;         // private windows, `huginn render`
+    pub fn persistent(path: PathBuf) -> CookieJar;   // loads; save() writes cookies with an expiry (0600)
+    pub fn save(&self) -> io::Result<()>;    // if changed
+    pub fn save_unless_saved_within(&self, interval: Duration) -> io::Result<()>;
+    pub fn clear(&self);
+    pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool;
+    pub fn header_for(&self, url: &Url, cx: CookieContext) -> Option<String>;
+    pub fn set_from_header(&self, url: &Url, set_cookie: &str, cx: CookieContext);
+    pub fn document_cookie(&self, url: &Url) -> String;           // no HttpOnly
+    pub fn set_document_cookie(&self, url: &Url, value: &str);    // cannot set or replace HttpOnly
+}
+pub struct CookieContext { pub allows: SameSite, pub top_level: bool }   // SAME_SITE const
+pub enum SameSite { None, Lax, Strict }
+pub fn registrable_domain(host: &str) -> &str;   // eTLD+1 (Public Suffix List)
+pub fn same_site(a: &Url, b: &Url) -> bool;      // schemeful
+pub enum ReferrerPolicy { .., StrictOriginWhenCrossOrigin /* default */, .. }   // parse_token, parse_header
+pub fn referrer_for(source: &Url, policy: ReferrerPolicy, target: &Url) -> Option<String>;
 pub fn parse_target(target: &str) -> Result<Url, NetError>;    // URL or file path
 pub fn resolve_url(base: &Url, href: &str) -> Option<Url>;
 
@@ -571,9 +621,19 @@ pub mod ua {
 ```
 
 Invariants:
-- Non-2xx HTTP responses are `NetError::Http`.
-- Every http(s) request sends `ua::USER_AGENT` and `ua::client_hint_headers`.
-  The image `Accept` header lists only formats `decode_image` decodes.
+- Non-2xx HTTP responses are `NetError::Http`, except from `fetch_for_script`.
+- Every http(s) request sends `ua::USER_AGENT` and `ua::client_hint_headers`
+  (on every redirect hop and preflight). The image `Accept` header lists only
+  formats `decode_image` decodes.
+- Redirects are followed by the loader, one hop at a time (at most 20):
+  each hop gets its own `Cookie`, `Referer`, `Origin` and `Sec-Fetch-*`
+  headers and stores its `Set-Cookie` headers; for CORS each hop must pass
+  the CORS check. Requests to other origins in `cors` mode send `Origin`;
+  non-simple ones are preflighted (`OPTIONS`, no cookies) first.
+- Cookies go out only with credentials (`Include`, or `SameOrigin` to the
+  client's origin), only if `SameSite` allows: same-site requests carry
+  all, cross-site top-level `GET` navigations `Lax` and `None`, other
+  cross-site requests `None` only. Scripts never see `Set-Cookie`.
 - Pixmaps are premultiplied RGBA8 (vello's storage), at most 65535 px per
   side. `DecodedImage::width()/height()` are the natural size in CSS px; the
   pixmap size can differ, so layout uses `width()` and paint scales by
@@ -600,7 +660,9 @@ of huginn-shell).
 ```rust
 pub enum ScriptKind { Classic, Module, ImportMap }  // ImportMap: `<script type="importmap">`, JSON that maps module specifiers
 pub enum ScriptTiming { Blocking, Defer, Async }
-pub struct ScriptRef { pub node: NodeId, pub kind: ScriptKind, pub timing: ScriptTiming, pub src: Option<Url> }
+pub struct ScriptRef { pub node: NodeId, pub kind: ScriptKind, pub timing: ScriptTiming, pub src: Option<Url>,
+                       pub cors: CorsSettings }   // crossorigin; modules default to Anonymous
+pub fn script_cors(el: &ElementData, kind: ScriptKind) -> CorsSettings;
 /// Scripts the HTML spec would run, in document order (skips data blocks and nomodule).
 pub fn collect_scripts(doc: &Document, base: &Url) -> Vec<ScriptRef>;
 pub fn script_kind(el: &ElementData) -> Option<ScriptKind>;   // None: not a runnable script
@@ -611,6 +673,7 @@ pub struct HostContext<'a> {
     pub document: &'a mut Document,
     pub loader: &'a Loader,
     pub document_url: &'a Url,               // document.URL, location
+    pub referrer: &'a str,                   // document.referrer
     pub base_url: &'a Url,                   // <base href> or the document URL
     pub viewport: (f32, f32),                // innerWidth, innerHeight
     pub now_ms: f64,                         // virtual ms since navigation start
@@ -676,7 +739,9 @@ DOM rules (pre-insertion checks, queries, URL parts) are in `src/dom_ops.rs`.
 | `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `cloneNode` | `huginn_dom::parse_fragment`, `serialize`, `Document::clone_node` |
 | `querySelector(All)`, `matches`, `closest` | `huginn_style::query_selector(_all)`, `matches_selector`, `closest` |
 | `getBoundingClientRect`, `offset*`, `client*`, `getComputedStyle` | `cx.layout` (`LayoutHost`) |
-| `fetch`, `XMLHttpRequest`, inserted `<script src>`, module imports | `cx.loader`, same origin (and `data:`) only |
+| `fetch`, `XMLHttpRequest` | `cx.loader.fetch_for_script`: Fetch modes and CORS; other origins must allow `cors` requests |
+| inserted `<script src>`, module imports | `cx.loader.fetch_with`: classic scripts `no-cors` from any origin; modules and `crossorigin` scripts CORS |
+| `document.cookie`, `document.referrer` | `cx.loader.cookies()` (no HttpOnly), `cx.referrer` |
 | wrapper identity | one JS wrapper per `NodeId::to_raw`, cached |
 
 Event loop, owned by the shell (`huginn-shell/src/scripts.rs`):

@@ -6,7 +6,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use huginn_dom::{Document, LocalName, Namespace, NodeData, NodeId, QualName, local_name, ns};
-use huginn_net::{ResourceKind, Url};
+use huginn_net::{
+    CorsSettings, Credentials, Mode, RedirectMode, ResourceKind, ResponseType, ScriptRequest, Url,
+};
 
 use super::{SharedState, run_classic};
 use crate::activation::{self, EventSink};
@@ -428,22 +430,29 @@ fn start_script(scope: &mut v8::PinScope<'_, '_>, st: &SharedState, node: NodeId
 pub(super) fn prefetch_pending_scripts(scope: &v8::PinScope<'_, '_>, st: &SharedState) {
     let Some(cx) = host(scope) else { return };
     let doc: &Document = cx.document;
-    let urls: Vec<(Url, ResourceKind)> = st
+    // Each with the CORS mode `run_external_script` will ask for.
+    let urls: Vec<(Url, CorsSettings)> = st
         .borrow()
         .pending_scripts
         .iter()
-        .filter_map(|&n| doc.attribute(n, &local_name!("src")))
-        .filter_map(|src| huginn_net::resolve_url(cx.base_url, src))
-        .filter(|u| dom_ops::fetch_allowed(cx.document_url, u))
-        .map(|u| (u, ResourceKind::Script))
+        .filter_map(|&n| {
+            let el = doc.element(n)?;
+            let src = huginn_net::resolve_url(cx.base_url, el.attr(&local_name!("src"))?)?;
+            Some((src, crate::script_cors(el, script_kind(el)?)))
+        })
         .collect();
     if urls.len() > 1 {
-        let _ = cx.loader.fetch_all(&urls);
+        let loader = cx.loader;
+        let _ = loader.map_parallel(&urls, |(u, cors)| {
+            loader.fetch_with(u, ResourceKind::Script, *cors)
+        });
     }
 }
 
-/// Fetch (same origin only) and run an external or module script inserted
-/// by script. Returns false if it could not be loaded or failed to compile.
+/// Fetch and run an external or module script inserted by script. Classic
+/// scripts load from any origin (`no-cors`); modules and `crossorigin`
+/// scripts need CORS from other origins. Returns false if it could not be
+/// loaded or failed to compile.
 pub(super) fn run_external_script(
     scope: &mut v8::PinScope<'_, '_>,
     st: &SharedState,
@@ -460,10 +469,10 @@ pub(super) fn run_external_script(
                 let Some(url) = huginn_net::resolve_url(cx.base_url, src) else {
                     return false;
                 };
-                if !dom_ops::fetch_allowed(cx.document_url, &url) {
-                    return false;
-                }
-                match cx.loader.fetch(&url, ResourceKind::Script) {
+                let cors = doc
+                    .element(node)
+                    .map_or(CorsSettings::NoCors, |e| crate::script_cors(e, kind));
+                match cx.loader.fetch_with(&url, ResourceKind::Script, cors) {
                     Ok(r) => (r.text().into_owned(), r.url.to_string(), kind),
                     Err(_) => return false,
                 }
@@ -768,26 +777,97 @@ op!(op_log(scope, args, rv) {
     }
 });
 
+// `fetch()` and XHR: N.fetch(url, method, headers, body, mode, credentials,
+// redirect). `headers`: "name\nvalue\n..." pairs; `body`: null, a string or
+// a Uint8Array. Returns [status, url, headers ("name: value\r\n"...), body
+// text, type, redirected ("1" or "")], or null for a network error (CORS
+// failures included). Opaque responses come back empty.
 op!(op_fetch(scope, args, rv) {
     let Some(cx) = host(scope) else { return };
     let href = arg_str(scope, &args, 0);
     let method = arg_str(scope, &args, 1);
+    let raw_headers = arg_str(scope, &args, 2);
+    let body = {
+        let b = args.get(3);
+        if b.is_null_or_undefined() {
+            None
+        } else if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(b) {
+            let mut bytes = vec![0; view.byte_length()];
+            view.copy_contents(&mut bytes);
+            Some(bytes)
+        } else {
+            Some(b.to_rust_string_lossy(scope).into_bytes())
+        }
+    };
+    let mode = match arg_str(scope, &args, 4).as_str() {
+        "no-cors" => Mode::NoCors,
+        "same-origin" => Mode::SameOrigin,
+        "navigate" => return rv.set_null(),
+        _ => Mode::Cors,
+    };
+    let credentials = match arg_str(scope, &args, 5).as_str() {
+        "omit" => Credentials::Omit,
+        "include" => Credentials::Include,
+        _ => Credentials::SameOrigin,
+    };
+    let redirect = match arg_str(scope, &args, 6).as_str() {
+        "error" => RedirectMode::Error,
+        "manual" => RedirectMode::Manual,
+        _ => RedirectMode::Follow,
+    };
     let Some(url) = huginn_net::resolve_url(cx.base_url, &href) else { return rv.set_null() };
-    if !(method == "GET" || method == "HEAD") || !dom_ops::fetch_allowed(cx.document_url, &url) {
-        return rv.set_null();
-    }
-    match cx.loader.fetch(&url, ResourceKind::Other) {
-        Ok(r) => {
-            let status = r.status.to_string();
-            let body = if method == "HEAD" { String::new() } else { r.text().into_owned() };
-            set_strs(scope, &mut rv, &[&status, r.url.as_str(), r.content_type.as_deref().unwrap_or(""), &body]);
+    let mut headers = Vec::new();
+    let mut lines = raw_headers.split('\n');
+    while let (Some(n), Some(v)) = (lines.next(), lines.next()) {
+        if !n.is_empty() {
+            headers.push((n.to_owned(), v.to_owned()));
         }
-        Err(huginn_net::NetError::Http { status, .. }) => {
-            let status = status.to_string();
-            set_strs(scope, &mut rv, &[&status, url.as_str(), "", ""]);
-        }
-        Err(_) => rv.set_null(),
     }
+    let req = ScriptRequest { url, method, headers, body, mode, credentials, redirect };
+    let r = match cx.loader.fetch_for_script(req) {
+        Ok(r) => r,
+        Err(e) => {
+            if state(scope).borrow().options.console {
+                eprintln!("huginn: fetch: {e}");
+            }
+            return rv.set_null();
+        }
+    };
+    let status = r.status.to_string();
+    let mut head = String::new();
+    for (n, v) in &r.headers {
+        head.push_str(n);
+        head.push_str(": ");
+        head.push_str(v);
+        head.push_str("\r\n");
+    }
+    let (ty, url) = match r.response_type {
+        ResponseType::Basic => ("basic", r.url.as_str()),
+        ResponseType::Cors => ("cors", r.url.as_str()),
+        ResponseType::Opaque => ("opaque", ""),
+        ResponseType::OpaqueRedirect => ("opaqueredirect", ""),
+    };
+    let text = r.text();
+    set_strs(scope, &mut rv, &[&status, url, &head, &text, ty, if r.redirected { "1" } else { "" }]);
+});
+
+// `document.cookie` (no HttpOnly cookies).
+op!(op_cookie(scope, args, rv) {
+    let Some(cx) = host(scope) else { return };
+    let c = cx.loader.cookies().document_cookie(cx.document_url);
+    set_str(scope, &mut rv, &c);
+});
+
+op!(op_set_cookie(scope, args, rv) {
+    let Some(cx) = host(scope) else { return };
+    let v = arg_str(scope, &args, 0);
+    cx.loader.cookies().set_document_cookie(cx.document_url, &v);
+});
+
+op!(op_referrer(scope, args, rv) {
+    let Some(cx) = host(scope) else { return };
+    let r = cx.referrer;
+    set_str(scope, &mut rv, r);
 });
 
 // Parse `href` against `base` ("" = the document base; "about:invalid-base"
@@ -1017,7 +1097,7 @@ pub(super) fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s,
         "byClass" => op_by_class, "docEl" => op_doc_el, "head" => op_head, "body" => op_body,
         "contains" => op_contains, "cmp" => op_cmp, "connected" => op_connected, "quirks" => op_quirks,
         "geom" => op_geom, "scrollPos" => op_scroll_pos, "setScrollPos" => op_set_scroll_pos, "cstyle" => op_cstyle, "now" => op_now, "taskNow" => op_task_now, "log" => op_log,
-        "fetch" => op_fetch,
+        "fetch" => op_fetch, "cookie" => op_cookie, "setCookie" => op_set_cookie, "referrer" => op_referrer,
         "url" => op_url, "urlSet" => op_url_set, "docUrl" => op_doc_url, "baseUrl" => op_base_url,
         "curScript" => op_cur_script, "write" => op_write, "customIn" => op_custom_in,
         "defineCE" => op_define_ce, "tmpl" => op_tmpl, "viewport" => op_viewport,

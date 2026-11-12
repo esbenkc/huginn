@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, NodeData, NodeId, local_name};
 use huginn_layout::{LayoutEngine, LayoutInput, LayoutTree, Rect, Size};
-use huginn_net::{ImageStore, Loader, ResourceKind, Url};
+use huginn_net::{Client, CorsSettings, ImageStore, Loader, ReferrerPolicy, ResourceKind, Url};
 use huginn_paint::{CpuRasterizer, Rasterizer};
 use huginn_style::{Origin, StyleEngine, StyleMap, StylesheetLoader, Viewport};
 
@@ -50,6 +50,8 @@ enum SheetSource {
 pub struct Page {
     /// Document URL after redirects.
     pub url: Url,
+    /// `document.referrer`: the `Referer` the document was requested with.
+    pub referrer: String,
     /// `<base href>` or `url`.
     pub base: Url,
     pub doc: Document,
@@ -270,16 +272,19 @@ pub fn load(
     js: bool,
     start: Instant,
 ) -> Result<Page, String> {
-    load_document(loader, url, None, viewport, js, false, start)
+    load_document(loader, url, None, None, viewport, js, false, start)
 }
 
-/// [`load`] with a request body (`post`: a form submission) and the option
-/// to keep the script engine alive in [`Page::js`].
+/// [`load`] with a request body (`post`: a form submission), the page that
+/// started the navigation (`initiator`: its URL and referrer policy decide
+/// `Referer` and `SameSite` cookies), and the option to keep the script
+/// engine alive in [`Page::js`]. The loader's client becomes the new document.
 #[allow(clippy::too_many_arguments)]
 pub fn load_document(
     loader: &Loader,
     url: &Url,
     post: Option<&huginn_js::forms::PostBody>,
+    initiator: Option<&Client>,
     viewport: Viewport,
     js: bool,
     keep_js: bool,
@@ -292,18 +297,32 @@ pub fn load_document(
     };
     // 1. Fetch the document (not cached: the body is dropped after parsing).
     let t = Instant::now();
-    let main = match post {
-        Some(p) => loader.post_document(url, &p.content_type, &p.body),
-        None => loader.fetch_uncached(url, ResourceKind::Document),
-    }
-    .map_err(|e| format!("cannot load {url}: {e}"))?;
+    let (main, referrer) = loader
+        .navigate(
+            url,
+            post.map(|p| (p.content_type.as_str(), p.body.as_slice())),
+            initiator,
+        )
+        .map_err(|e| format!("cannot load {url}: {e}"))?;
     let mut fetch = t.elapsed();
 
     // 2. Parse HTML (charset from BOM, Content-Type or <meta charset>).
     let t = Instant::now();
     let mut doc = huginn_dom::parse_html(&main.html_text());
     let doc_url = main.url.clone();
+    // The document's referrer policy: `<meta name=referrer>`, else the
+    // `Referrer-Policy` header, else the default.
+    let referrer_policy = meta_referrer_policy(&doc)
+        .or_else(|| {
+            main.header("referrer-policy")
+                .and_then(ReferrerPolicy::parse_header)
+        })
+        .unwrap_or_default();
     drop(main);
+    loader.set_client(Some(Client {
+        url: doc_url.clone(),
+        referrer_policy,
+    }));
     let base = document_base(&doc, &doc_url);
     let mut parse = t.elapsed();
 
@@ -323,20 +342,23 @@ pub fn load_document(
     // hidden ones are skipped and the rest are decoded at their displayed size.
     let t = Instant::now();
     let mut sheets = collect_stylesheets(&doc, &base, &screen);
-    let mut requests: Vec<(Url, ResourceKind)> = sheets
+    let mut requests: Vec<(Url, ResourceKind, CorsSettings)> = sheets
         .iter()
         .filter_map(|s| match s {
-            SheetSource::External(u) => Some((u.clone(), ResourceKind::Stylesheet)),
+            SheetSource::External(u) => {
+                Some((u.clone(), ResourceKind::Stylesheet, CorsSettings::NoCors))
+            }
             SheetSource::Inline(_) => None,
         })
         .collect();
     requests.extend(
         scripts
             .iter()
-            .filter_map(|s| s.src.clone())
-            .map(|u| (u, ResourceKind::Script)),
+            .filter_map(|s| Some((s.src.clone()?, ResourceKind::Script, s.cors))),
     );
-    let fetched = loader.fetch_all(&requests);
+    let fetched = loader.map_parallel(&requests, |(u, kind, cors)| {
+        loader.fetch_with(u, *kind, *cors)
+    });
     // Scripts lay out without images (their sizes are not known yet).
     let images = ImageStore::new();
     fetch += t.elapsed();
@@ -354,7 +376,7 @@ pub fn load_document(
             SheetSource::External(u) => {
                 if let Some(Ok(r)) = requests
                     .iter()
-                    .position(|(ru, _)| ru == u)
+                    .position(|(ru, _, _)| ru == u)
                     .map(|i| &fetched[i])
                 {
                     engine.add_stylesheet(&r.text(), r.url.as_str(), Origin::Author, &imports);
@@ -378,7 +400,7 @@ pub fn load_document(
                 let u = s.src.as_ref()?;
                 let i = requests
                     .iter()
-                    .position(|(ru, k)| ru == u && *k == ResourceKind::Script)?;
+                    .position(|(ru, k, _)| ru == u && *k == ResourceKind::Script)?;
                 fetched[i]
                     .as_ref()
                     .ok()
@@ -396,6 +418,7 @@ pub fn load_document(
             &mut doc,
             &loader,
             &doc_url,
+            referrer.as_deref().unwrap_or(""),
             &base,
             (viewport.width, viewport.height),
             start,
@@ -455,6 +478,7 @@ pub fn load_document(
 
     Ok(Page {
         url: doc_url,
+        referrer: referrer.unwrap_or_default(),
         base,
         doc,
         style_engine: engine,
@@ -506,6 +530,18 @@ fn document_base(doc: &Document, url: &Url) -> Url {
         .find_map(|b| doc.attribute(b, &local_name!("href")))
         .and_then(|h| huginn_net::resolve_url(url, h))
         .unwrap_or_else(|| url.clone())
+}
+
+/// The policy of the last `<meta name=referrer content=...>` that names one.
+fn meta_referrer_policy(doc: &Document) -> Option<ReferrerPolicy> {
+    doc.elements_by_local_name(&local_name!("meta"))
+        .filter(|&m| {
+            doc.attribute(m, &local_name!("name"))
+                .is_some_and(|n| n.trim().eq_ignore_ascii_case("referrer"))
+        })
+        .filter_map(|m| doc.attribute(m, &local_name!("content")))
+        .filter_map(ReferrerPolicy::parse_token)
+        .last()
 }
 
 fn collect_stylesheets(

@@ -1,15 +1,15 @@
 //! ES modules: `<script type="module">` with static imports, `import()`, and
 //! import maps. The import graph is fetched up front through the shell's
-//! loader (same origin only), then instantiated and evaluated. Specifiers
-//! resolve through the page's import map (`crate::importmap`).
+//! loader (other origins must allow it by CORS), then instantiated and
+//! evaluated. Specifiers resolve through the page's import map
+//! (`crate::importmap`).
 
 use std::collections::HashMap;
 
-use huginn_net::{ResourceKind, Url};
+use huginn_net::{CorsSettings, ResourceKind, Url};
 
 use super::{SharedState, exception_message, ops};
 use crate::ScriptError;
-use crate::dom_ops;
 use crate::importmap::{ImportMap, Json, Resolver};
 
 #[derive(Default)]
@@ -170,24 +170,18 @@ fn compile<'s>(
     v8::script_compiler::compile_module(scope, &mut source)
 }
 
-/// Fetch a module's source through the loader, same origin only.
-fn fetch_module(
-    loader: &huginn_net::Loader,
-    document_url: &Url,
-    url: &Url,
-) -> Result<(String, String), String> {
-    if !dom_ops::fetch_allowed(document_url, url) {
-        return Err(format!("cross-origin module {url} not loaded"));
-    }
+/// Fetch a module's source through the loader: a CORS request, so another
+/// origin must allow it (`Access-Control-Allow-Origin`).
+fn fetch_module(loader: &huginn_net::Loader, url: &Url) -> Result<(String, String), String> {
     let r = loader
-        .fetch(url, ResourceKind::Script)
+        .fetch_with(url, ResourceKind::Script, CorsSettings::Anonymous)
         .map_err(|e| format!("cannot load module {url}: {e}"))?;
     Ok((r.text().into_owned(), r.url.to_string()))
 }
 
 fn fetch_source(scope: &v8::PinScope<'_, '_>, url: &Url) -> Result<(String, String), String> {
     let cx = ops::host(scope).ok_or("no host context")?;
-    fetch_module(cx.loader, cx.document_url, url)
+    fetch_module(cx.loader, url)
 }
 
 /// Fetch `urls` in parallel; results keep their order.
@@ -195,8 +189,8 @@ fn fetch_all(scope: &v8::PinScope<'_, '_>, urls: &[Url]) -> Vec<Result<(String, 
     let Some(cx) = ops::host(scope) else {
         return urls.iter().map(|_| Err("no host context".into())).collect();
     };
-    let (loader, document_url) = (cx.loader, cx.document_url);
-    loader.map_parallel(urls, |u| fetch_module(loader, document_url, u))
+    let loader = cx.loader;
+    loader.map_parallel(urls, |u| fetch_module(loader, u))
 }
 
 /// Compile `source` (whose imports resolve against `base`) and fetch and
