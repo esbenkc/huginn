@@ -172,11 +172,12 @@ impl LTree {
                     {
                         inputs.parent_size.width = Some(0.0);
                     }
+                    let limits = replaced_limits(&tree.nodes[ix(id)].ts, inputs.parent_size);
                     taffy::compute_leaf_layout(
                         inputs,
                         &tree.nodes[ix(id)].ts,
                         crate::convert::resolve_calc,
-                        |known, _| replaced_size(w, h, known),
+                        |known, _| replaced_size(w, h, known, limits),
                     )
                 }
                 Algo::Empty => taffy::compute_leaf_layout(
@@ -199,9 +200,45 @@ impl LTree {
     }
 }
 
+/// Content-box `min-width`, `max-width`, `min-height`, `max-height` of a
+/// replaced box (`None`: no constraint, or a percentage of an indefinite size).
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Limits {
+    min: tf::Size<Option<f32>>,
+    max: tf::Size<Option<f32>>,
+}
+
+fn replaced_limits(ts: &TStyle, parent: tf::Size<Option<f32>>) -> Limits {
+    use taffy::{MaybeResolve, ResolveOrZero};
+    let calc = crate::convert::resolve_calc;
+    let to_content = |s: tf::Size<Option<f32>>| {
+        if ts.box_sizing != taffy::BoxSizing::BorderBox {
+            return s;
+        }
+        let pb = ts.padding.resolve_or_zero(parent.width, calc).sum_axes()
+            + ts.border.resolve_or_zero(parent.width, calc).sum_axes();
+        tf::Size {
+            width: s.width.map(|v| (v - pb.width).max(0.0)),
+            height: s.height.map(|v| (v - pb.height).max(0.0)),
+        }
+    };
+    Limits {
+        min: to_content(ts.min_size.maybe_resolve(parent, calc)),
+        max: to_content(ts.max_size.maybe_resolve(parent, calc)),
+    }
+}
+
 /// Size of a replaced element from its intrinsic size and the known dimensions
-/// (aspect ratio preserved).
-pub(crate) fn replaced_size(w: f32, h: f32, known: tf::Size<Option<f32>>) -> tf::Size<f32> {
+/// (aspect ratio preserved). With neither dimension known, the min/max
+/// `limits` apply as in CSS 2.1, section 10.4 (the table for replaced
+/// elements with an intrinsic ratio): `max-width: 100%; height: auto`
+/// scales the height down with the width.
+pub(crate) fn replaced_size(
+    w: f32,
+    h: f32,
+    known: tf::Size<Option<f32>>,
+    limits: Limits,
+) -> tf::Size<f32> {
     match (known.width, known.height) {
         (Some(kw), Some(kh)) => tf::Size {
             width: kw,
@@ -215,10 +252,36 @@ pub(crate) fn replaced_size(w: f32, h: f32, known: tf::Size<Option<f32>>) -> tf:
             width: if h > 0.0 { kh * w / h } else { w },
             height: kh,
         },
+        (None, None) if w > 0.0 && h > 0.0 => {
+            let (width, height) = constrain_ratio(w, h, limits);
+            tf::Size { width, height }
+        }
         (None, None) => tf::Size {
             width: w,
             height: h,
         },
+    }
+}
+
+/// CSS 2.1, section 10.4: used size of a replaced box with intrinsic size
+/// `w` x `h` (both > 0) and auto width and height under min/max limits.
+fn constrain_ratio(w: f32, h: f32, l: Limits) -> (f32, f32) {
+    let min_w = l.min.width.unwrap_or(0.0).max(0.0);
+    let min_h = l.min.height.unwrap_or(0.0).max(0.0);
+    let max_w = l.max.width.unwrap_or(f32::INFINITY).max(min_w);
+    let max_h = l.max.height.unwrap_or(f32::INFINITY).max(min_h);
+    match (w > max_w, w < min_w, h > max_h, h < min_h) {
+        (true, _, true, _) if max_w / w <= max_h / h => (max_w, min_h.max(max_w * h / w)),
+        (true, _, true, _) => (min_w.max(max_h * w / h), max_h),
+        (_, true, _, true) if min_w / w <= min_h / h => (max_w.min(min_h * w / h), min_h),
+        (_, true, _, true) => (min_w, max_h.min(min_w * h / w)),
+        (_, true, true, _) => (min_w, max_h),
+        (true, _, _, true) => (max_w, min_h),
+        (true, _, _, _) => (max_w, min_h.max(max_w * h / w)),
+        (_, true, _, _) => (min_w, max_h.min(min_w * h / w)),
+        (_, _, true, _) => (min_w.max(max_h * w / h), max_h),
+        (_, _, _, true) => (max_w.min(min_h * w / h), min_h),
+        _ => (w, h),
     }
 }
 

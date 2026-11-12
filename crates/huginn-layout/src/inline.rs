@@ -14,7 +14,7 @@ use huginn_style::{Color, ComputedStyle, LengthPercentage, LengthPercentageAuto,
 use taffy::prelude as tf;
 use taffy::{
     AvailableSpace, BlockContext, Layout, LayoutInput, LayoutOutput, LayoutPartialTree,
-    ResolveOrZero, RunMode,
+    MaybeResolve, ResolveOrZero, RunMode,
 };
 
 use crate::tree::{LTree, child_input};
@@ -317,6 +317,17 @@ pub(crate) fn compute(
     let inset_left = border.left + padding.left;
     let inset_top = border.top + padding.top;
     let run_mode = inputs.run_mode;
+    // The final pass breaks lines at the available width only when that width
+    // is the box's own: the parent fixed it (block flow, stretched grid and
+    // flex items, atomic inlines) or the style sets it. A float, an absolutely
+    // positioned box or a grid item with auto margins is laid out without a
+    // width and shrinks to fit, as in a measuring pass.
+    let fixed_width = inputs.known_dimensions.width.is_some()
+        || ts
+            .size
+            .width
+            .maybe_resolve(parent_w, crate::convert::resolve_calc)
+            .is_some();
     let mut child_outputs: Vec<(tf::NodeId, taffy::OofCandidates)> = Vec::new();
     // Floats of the enclosing block formatting context: lines next to a
     // float are shortened and moved beside it.
@@ -336,7 +347,8 @@ pub(crate) fn compute(
             // shrink to fit into it.
             let exact = match avail.width {
                 AvailableSpace::Definite(a)
-                    if known.width.is_some() || run_mode == RunMode::PerformLayout =>
+                    if known.width.is_some()
+                        || (run_mode == RunMode::PerformLayout && fixed_width) =>
                 {
                     Some(a)
                 }

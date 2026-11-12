@@ -342,3 +342,137 @@ fn generic_families_resolve_like_desktop_chrome_on_macos() {
         "the fonts differ, so the test can tell"
     );
 }
+
+/// An image store with one `w` x `h` SVG at `http://t.test/i.svg`.
+fn one_image(w: u32, h: u32) -> ImageStore {
+    let mut images = ImageStore::new();
+    let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"/>"#);
+    images.insert(
+        &Url::parse("http://t.test/i.svg").unwrap(),
+        huginn_net::decode_svg(svg.as_bytes(), None).unwrap(),
+    );
+    images
+}
+
+fn size(r: Rect) -> (f32, f32) {
+    (r.width.round(), r.height.round())
+}
+
+#[test]
+fn order_moves_flex_and_grid_items_but_not_positioned_children() {
+    // A label with `order: -1` after a title in a column flexbox goes above
+    // it (it used to be laid out after the title, over its last line).
+    let (doc, tree) = layout(
+        "<style>body{margin:0} .f{display:flex;flex-direction:column} .g{display:grid}
+        div div{height:10px}</style>
+        <div class=f><div id=t>t</div><div id=l style='order:-1'>l</div>
+          <div id=p style='position:absolute;order:-5;top:0'></div><div id=e>e</div></div>
+        <div class=g style='margin-top:100px'><div id=a style='order:2'></div><div id=b></div></div>",
+    );
+    assert_eq!(rect(&doc, &tree, "l").y, 0.0);
+    assert_eq!(rect(&doc, &tree, "t").y, 10.0);
+    assert_eq!(rect(&doc, &tree, "e").y, 20.0);
+    assert_eq!(rect(&doc, &tree, "b").y, 130.0);
+    assert_eq!(rect(&doc, &tree, "a").y, 140.0);
+    // Paint order follows: the label's box comes before the title's.
+    let t = tree.box_for_node(by_id(&doc, "t")).unwrap();
+    let order: Vec<_> = tree
+        .children(tree.get(t).parent.unwrap())
+        .filter_map(|c| tree.get(c).node)
+        .collect();
+    let ids: Vec<_> = ["l", "t", "p", "e"]
+        .iter()
+        .map(|i| by_id(&doc, i))
+        .collect();
+    assert_eq!(
+        order, ids,
+        "items sorted, the positioned box keeps its slot"
+    );
+}
+
+#[test]
+fn max_width_scales_an_image_with_its_aspect_ratio() {
+    // `max-width: 100%; height: auto`: the height follows the used width,
+    // with or without width/height attributes (CSS 2.1 10.4, Sizing 4 5.1).
+    let images = one_image(720, 405);
+    let (doc, tree) = layout_with(
+        "<!DOCTYPE html><style>body{margin:0} div{width:182px}
+        img{max-width:100%;height:auto;display:block}</style>
+        <div><img id=a src=http://t.test/i.svg></div>
+        <div><img id=b src=http://t.test/i.svg width=720 height=405></div>
+        <div><img id=c src=http://t.test/i.svg width=720 height=405 style='height:405px'></div>
+        <div><img id=d src=http://t.test/i.svg style='min-height:200px'></div>",
+        &images,
+    );
+    assert_eq!(size(rect(&doc, &tree, "a")), (182.0, 102.0));
+    assert_eq!(size(rect(&doc, &tree, "b")), (182.0, 102.0));
+    assert_eq!(size(rect(&doc, &tree, "c")), (182.0, 405.0), "fixed height");
+    assert_eq!(size(rect(&doc, &tree, "d")), (182.0, 200.0), "10.4 row 11");
+}
+
+#[test]
+fn percentage_width_images_do_not_widen_fit_content_boxes() {
+    // A grid item with auto margins and a float are fit-content sized; a
+    // `width: 100%` image has a zero min-content contribution, so they take
+    // the available width instead of the image's natural width. The same
+    // holds for a grid container with a `1fr` column (dr.dk's cards), whose
+    // column also fills that width.
+    let images = one_image(720, 405);
+    let (doc, tree) = layout_with(
+        "<!DOCTYPE html><style>body{margin:0} .m{display:grid;width:200px}
+        img{display:block;width:100%;height:auto} .fr{display:grid;grid-template-columns:1fr}</style>
+        <div class=m><div id=a style='margin-inline:auto'><img src=http://t.test/i.svg></div></div>
+        <div class=m><div id=b class=fr style='margin-inline:auto'><img src=http://t.test/i.svg></div></div>
+        <div style='width:200px'><div id=c class=fr style='float:left'><img src=http://t.test/i.svg></div></div>
+        <div class=m style='clear:both'><div id=d class=fr style='margin-inline:auto'>
+          aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss</div></div>",
+        &images,
+    );
+    for id in ["a", "b", "c"] {
+        assert_eq!(size(rect(&doc, &tree, id)), (200.0, 113.0), "#{id}");
+    }
+    assert_eq!(
+        rect(&doc, &tree, "d").width,
+        200.0,
+        "text wraps in the 1fr column"
+    );
+}
+
+#[test]
+fn grid_tracks_keep_both_parts_of_a_calc() {
+    let (doc, tree) = layout(
+        "<style>body{margin:0} .g{display:grid;width:200px;
+        grid-template-columns:calc(25% - 18px) minmax(calc(10% + 5px), 1fr)} .g div{height:5px}</style>
+        <div class=g><div id=a></div><div id=b></div></div>",
+    );
+    assert_eq!(rect(&doc, &tree, "a").width, 32.0);
+    assert_eq!(rect(&doc, &tree, "b").x, 32.0);
+}
+
+#[test]
+fn floats_with_inline_content_shrink_to_fit() {
+    // A float whose content is text or an image is as wide as that content,
+    // not as its containing block.
+    let images = one_image(140, 60);
+    let (doc, tree) = layout_with(
+        "<!DOCTYPE html><style>body{margin:0;font:16px/20px sans-serif} .c{width:500px;height:60px}</style>
+        <div class=c><span id=a style='float:right'>hello</span></div>
+        <div class=c><a id=b style='float:right'><img src=http://t.test/i.svg></a></div>
+        <div class=c><div id=c style='float:left;text-align:center;width:300px'>hi</div></div>",
+        &images,
+    );
+    let a = rect(&doc, &tree, "a");
+    assert!(
+        a.width > 10.0 && a.width < 60.0,
+        "text width, got {}",
+        a.width
+    );
+    assert_eq!(a.x + a.width, 500.0);
+    let b = rect(&doc, &tree, "b");
+    assert_eq!((b.x, b.width), (360.0, 140.0));
+    assert_eq!(rect(&doc, &tree, "c").width, 300.0, "a set width stays");
+    let c = tree.box_for_node(by_id(&doc, "c")).unwrap();
+    let run = &tree.text_runs(c)[0];
+    let x = tree.glyphs[run.glyphs.start as usize].x;
+    assert!(x > 130.0, "centered in the 300px float, got {x}");
+}
