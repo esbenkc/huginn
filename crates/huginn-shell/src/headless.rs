@@ -283,7 +283,7 @@ fn frame_for(b: &Browser) -> Vec<u32> {
     vec![0; w as usize * h as usize]
 }
 
-fn save_png(frame: &[u32], b: &Browser, path: &str) -> Result<(), String> {
+pub(crate) fn save_png(frame: &[u32], b: &Browser, path: &str) -> Result<(), String> {
     let (width, height) = b.size();
     let mut data = Vec::with_capacity(frame.len() * 4);
     for &p in frame {

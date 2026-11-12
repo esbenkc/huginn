@@ -13,7 +13,9 @@
 //! - Fallback fonts for symbols and non-Latin scripts load when the text
 //!   contains such characters.
 //!
-//! On platforms other than macOS, the full system collection is used.
+//! On platforms other than macOS, the full system collection is used (on
+//! Linux: fontconfig's fonts, generic families and fallbacks), and the
+//! macOS-only parts of Blink's metrics (the ascent hack) are off.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,6 +113,28 @@ const GENERICS: &[(GenericFamily, &[&str])] = &[
     (GenericFamily::Math, &["STIX Two Math"]),
     (GenericFamily::FangSong, &["STFangsong"]),
 ];
+
+/// Common web fonts that systems other than macOS and Windows lack, and the
+/// fonts with the same metrics that stand in for them (fontconfig's
+/// `30-metric-aliases.conf`). First one installed wins.
+const METRIC_ALIASES: &[(&[&str], &[&str])] = &[
+    (
+        &["Arial", "Helvetica", "Helvetica Neue"],
+        &["Liberation Sans", "Arimo", "Nimbus Sans"],
+    ),
+    (
+        &["Times New Roman", "Times"],
+        &["Liberation Serif", "Tinos", "Nimbus Roman"],
+    ),
+    (
+        &["Courier New", "Courier"],
+        &["Liberation Mono", "Cousine", "Nimbus Mono PS"],
+    ),
+];
+
+/// Color emoji fonts for the `emoji` generic family where the system
+/// collection does not name one.
+const SYSTEM_EMOJI: &[&str] = &["Noto Color Emoji", "Twemoji", "Noto Emoji"];
 
 /// A class of characters that needs fallback fonts, the scripts (fallback
 /// keys) it applies to, and the families to try, in order.
@@ -274,6 +298,16 @@ impl Fonts {
             system_fonts: index.is_none(),
         });
         let loaded = vec![false; index.as_ref().map_or(0, |i| i.files.len())];
+        let mut collection = collection;
+        if index.is_none()
+            && collection
+                .generic_families(GenericFamily::Emoji)
+                .next()
+                .is_none()
+            && let Some(id) = SYSTEM_EMOJI.iter().find_map(|n| collection.family_id(n))
+        {
+            collection.set_generic_families(GenericFamily::Emoji, std::iter::once(id));
+        }
         Fonts {
             ctx: parley::FontContext {
                 collection,
@@ -396,7 +430,9 @@ impl Fonts {
         };
         let m = font.and_then(|f| {
             let name = collection.family_name(f.family.0).unwrap_or("");
-            let ascent_hack = matches!(name, "Times" | "Helvetica" | "Courier");
+            // Blink has this hack in its macOS font code only.
+            let ascent_hack =
+                cfg!(target_os = "macos") && matches!(name, "Times" | "Helvetica" | "Courier");
             read_vmetrics(f.blob.as_ref(), f.index, ascent_hack)
         });
         self.vmetrics.insert(key, m);
@@ -427,6 +463,16 @@ impl Fonts {
                 }
                 FontFamilyName::Named(n) => {
                     if !self.ensure_family(n) {
+                        // No index (not macOS): the usual metric-compatible
+                        // stand-in for a common web font, as fontconfig does.
+                        if self.index.is_none()
+                            && let Some(alias) = self.metric_alias(n)
+                        {
+                            let alias = FontFamilyName::Named(alias.into());
+                            if !out.contains(&alias) {
+                                out.push(alias);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -505,6 +551,17 @@ impl Fonts {
         self.ctx.collection.family_id(name)
     }
 
+    /// The first installed stand-in for the missing family `name`.
+    fn metric_alias(&mut self, name: &str) -> Option<&'static str> {
+        let (_, aliases) = METRIC_ALIASES
+            .iter()
+            .find(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(name)))?;
+        aliases
+            .iter()
+            .copied()
+            .find(|a| self.ctx.collection.family_id(a).is_some())
+    }
+
     fn ensure_generic(&mut self, g: GenericFamily) {
         let bit = 1u32 << (g as u32);
         if self.index.is_none() || self.generics & bit != 0 {
@@ -574,8 +631,15 @@ fn cache_path() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("HUGINN_CACHE_DIR") {
         return Some(PathBuf::from(d).join("fonts-v1.idx"));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Caches/Huginn/fonts-v1.idx"))
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    if cfg!(target_os = "macos") {
+        return Some(home.join("Library/Caches/Huginn/fonts-v1.idx"));
+    }
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+        .unwrap_or(home.join(".cache"));
+    Some(cache.join("huginn/fonts-v1.idx"))
 }
 
 /// Directories whose mtime invalidates the index (fonts added or removed).

@@ -14,3 +14,8 @@ huginn-net.workspace = true
 taffy.workspace = true
 parley.workspace = true
 markup5ever.workspace = true
+
+# Linux: load libfontconfig at run time (dlopen), so the build does not need
+# the fontconfig development package. Same fontique that parley uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+fontique = { version = "0.12.0", default-features = false, features = ["fontconfig-dlopen"] }

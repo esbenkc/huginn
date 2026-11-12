@@ -2,7 +2,7 @@
 
 Huginn is a small web browser written in Rust. It is not a fork of Chromium,
 WebKit, Gecko or Servo. It is one process, it draws on the CPU, and it runs on
-macOS on Apple silicon.
+macOS on Apple silicon and on Linux (x86-64, X11 and Wayland).
 
 ![A Huginn window with three tabs](docs/img/window.png)
 
@@ -72,9 +72,16 @@ run the benchmark.
 
 ## Build
 
-You need macOS on Apple silicon, Rust 1.94 or newer, and `python3` on your
-`PATH` (Stylo generates code at build time). The first build downloads a
-prebuilt V8 library (about 40 MB).
+You need macOS on Apple silicon or Linux on x86-64, Rust 1.94 or newer, and
+`python3` on your `PATH` (Stylo generates code at build time). The first build
+downloads a prebuilt V8 library (about 40 MB).
+
+On Linux the build needs a C toolchain but no development packages:
+fontconfig, X11, Wayland and xkbcommon are loaded at run time. The Linux port
+is newer than the macOS one: it uses the system's fontconfig fonts (with
+Liberation fonts standing in for Arial, Times New Roman and Courier New), the
+window has the normal title bar, and the shortcuts are Chrome's Linux ones
+(Ctrl where macOS has Cmd). The benchmark numbers above are from macOS only.
 
 ```sh
 cargo build --release -p huginn-shell
@@ -105,7 +112,8 @@ macOS; the list is in [ARCHITECTURE.md](ARCHITECTURE.md#shortcuts-and-gestures-c
 |---|---|
 | ![huginn://newtab](docs/img/newtab.png) | ![A test page rendered by huginn render](docs/img/render-text.png) |
 
-Environment variables: `HUGINN_PROFILE_DIR` (where bookmarks are saved),
+Environment variables: `HUGINN_PROFILE_DIR` (where bookmarks are saved; the
+default is `~/Library/Application Support/Huginn`, on Linux `~/.config/huginn`),
 `HUGINN_NO_JS=1`, `HUGINN_NET_LOOPBACK_ONLY=1` (no network except 127.0.0.1),
 `HUGINN_LIVE_TABS` and `HUGINN_MEMORY_BUDGET_MB` (tab discarding).
 
@@ -120,7 +128,8 @@ Missing or incomplete:
 
 - **No sandbox and no site isolation.** Pages run in the same process as the
   browser. Do not use Huginn where security matters.
-- macOS on Apple silicon only.
+- macOS on Apple silicon and Linux on x86-64 only. On Linux, font discovery
+  is not lazy yet (each start scans the system fonts, tens of ms).
 - No developer tools, extensions, settings page or bookmarks bar.
 - No CSS animations or transitions, no `@container`, no `@media print`.
 - Style and layout run in full after each change, not incrementally.

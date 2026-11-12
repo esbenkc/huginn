@@ -183,12 +183,21 @@ pub struct Bookmark {
 }
 
 /// Where bookmarks live: `$HUGINN_PROFILE_DIR`, else
-/// `~/Library/Application Support/Huginn`.
+/// `~/Library/Application Support/Huginn` on macOS and
+/// `$XDG_CONFIG_HOME/huginn` (`~/.config/huginn`) elsewhere.
 pub fn profile_dir() -> Option<PathBuf> {
     if let Some(d) = std::env::var_os("HUGINN_PROFILE_DIR") {
         return Some(PathBuf::from(d));
     }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/Huginn"))
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home.map(|h| h.join("Library/Application Support/Huginn"));
+    }
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+        .or(home.map(|h| h.join(".config")))
+        .map(|d| d.join("huginn"))
 }
 
 /// The bookmarks file: one bookmark per line, `url<TAB>title`.

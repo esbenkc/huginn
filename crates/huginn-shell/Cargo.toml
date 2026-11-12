@@ -33,3 +33,12 @@ miniz_oxide.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 png.workspace = true
+
+# Linux: winit and softbuffer need their X11 and Wayland backends. The
+# libraries are loaded at run time (dlopen), so no -dev packages are needed.
+# GNOME has no server-side decorations; winit draws the title bar itself.
+[target.'cfg(target_os = "linux")'.dependencies]
+winit = { workspace = true, features = ["x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
+softbuffer = { workspace = true, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+# The system clipboard (X11 selections, Wayland data control). Text only.
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }

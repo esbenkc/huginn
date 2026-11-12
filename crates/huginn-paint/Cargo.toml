@@ -17,3 +17,8 @@ glifo.workspace = true
 
 [dev-dependencies]
 huginn-dom.workspace = true
+
+# Linux: color emoji (Noto Color Emoji) are PNG bitmaps in the font (CBDT),
+# which vello_cpu draws only with its `png` feature.
+[target.'cfg(target_os = "linux")'.dependencies]
+vello_cpu = { workspace = true, features = ["png"] }

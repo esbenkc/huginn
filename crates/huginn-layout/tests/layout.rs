@@ -317,6 +317,7 @@ fn percentage_width_images_compress_the_min_content_of_inline_blocks() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "names macOS system fonts")]
 fn generic_families_resolve_like_desktop_chrome_on_macos() {
     // Desktop Chrome on macOS (locale_settings_mac.grd): serif is Times,
     // sans-serif Helvetica and monospace Menlo. Same text, same width as

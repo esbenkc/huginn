@@ -385,6 +385,7 @@ impl Session {
 }
 
 /// This process's `phys_footprint` in bytes (`proc_pid_rusage`, macOS).
+#[cfg(target_os = "macos")]
 fn footprint() -> Option<u64> {
     unsafe extern "C" {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
@@ -396,4 +397,28 @@ fn footprint() -> Option<u64> {
     // SAFETY: the buffer outlives the call and is bigger than rusage_info_v4.
     let r = unsafe { proc_pid_rusage(std::process::id() as i32, RUSAGE_INFO_V4, buf.as_mut_ptr()) };
     (r == 0).then_some(buf[2 + 7])
+}
+
+/// This process's private memory in bytes: anonymous resident pages plus
+/// swap (`RssAnon` and `VmSwap` in `/proc/self/status`), the closest Linux
+/// has to macOS's `phys_footprint`.
+#[cfg(target_os = "linux")]
+fn footprint() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = |field: &str| -> Option<u64> {
+        let line = status.lines().find(|l| l.starts_with(field))?;
+        line[field.len()..]
+            .trim()
+            .strip_suffix("kB")?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some((kb("RssAnon:")? + kb("VmSwap:").unwrap_or(0)) * 1024)
+}
+
+/// Unknown on this platform: tabs are discarded by count only.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn footprint() -> Option<u64> {
+    None
 }

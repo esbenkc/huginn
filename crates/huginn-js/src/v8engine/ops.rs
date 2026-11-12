@@ -996,5 +996,14 @@ pub(super) fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s,
         "click" => op_click, "submit" => op_submit, "navigate" => op_navigate, "focus" => op_focus,
         "focused" => op_focused, "disabled" => op_disabled,
     }
+    // The system this build runs on, for `navigator` (70-window.js).
+    let os = if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
+    if let (Some(key), Some(os)) = (v8::String::new(scope, "os"), v8::String::new(scope, os)) {
+        obj.set(scope, key.into(), os.into());
+    }
     obj
 }

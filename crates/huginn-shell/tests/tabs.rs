@@ -429,14 +429,18 @@ fn background_tabs_are_discarded_under_memory_pressure() {
 
 #[test]
 fn tab_strip_mouse_new_switch_close_and_reorder() {
-    // At 800 px, three tabs are (800 - 78 - 48) / 3 = 224.67 px wide from x 78;
-    // a close button's centre is 19 px from its tab's right edge.
-    let w = (800.0 - 78.0 - 48.0) / 3.0;
-    let tab_x = |i: f32| 78.0 + i * w + w / 2.0;
+    // The strip starts after the traffic lights on macOS, after a small
+    // margin elsewhere (`tabstrip::LEFT_INSET`).
+    let inset: f32 = if cfg!(target_os = "macos") { 78.0 } else { 8.0 };
+    // At 800 px on macOS, three tabs are (800 - 78 - 48) / 3 = 224.67 px wide
+    // from x 78, elsewhere at their 240 px maximum; a close button's centre
+    // is 19 px from its tab's right edge.
+    let w = ((800.0 - inset - 48.0) / 3.0).min(240.0);
+    let tab_x = |i: f32| inset + i * w + w / 2.0;
     // With two tabs left, they are 240 px wide again.
-    let close_x = |i: f32| 78.0 + (i + 1.0) * 240.0 - 19.0;
+    let close_x = |i: f32| inset + (i + 1.0) * 240.0 - 19.0;
     // Two tabs are at their 240 px maximum; the + button follows them.
-    let plus_x = 78.0 + 2.0 * 240.0 + 20.0;
+    let plus_x = inset + 2.0 * 240.0 + 20.0;
     let s = run(
         &page("a.html"),
         &format!(
