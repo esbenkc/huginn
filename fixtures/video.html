@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Video posters</title>
+<style>
+  body { margin: 0; }
+  video { position: absolute; top: 100px; }
+</style>
+</head>
+<body>
+  <h1>Video posters</h1>
+  <!-- A 4:1 poster in a 100x100 video: contained, 100x25, centered. -->
+  <video poster="assets/wide.png" width="100" height="100" style="left: 0"></video>
+  <!-- No size: the poster's natural size, 40x10. -->
+  <video poster="assets/wide.png" style="left: 200px"></video>
+  <!-- Width only: the poster's aspect ratio gives the height, 80x20. -->
+  <video poster="assets/wide.png" width="80" style="left: 300px"></video>
+</body>
+</html>

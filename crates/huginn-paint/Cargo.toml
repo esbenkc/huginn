@@ -1,0 +1,19 @@
+[package]
+name = "huginn-paint"
+description = "Display list and CPU rasterizer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+huginn-layout.workspace = true
+huginn-style.workspace = true
+huginn-net.workspace = true
+vello_cpu.workspace = true
+png.workspace = true
+glifo.workspace = true
+
+[dev-dependencies]
+huginn-dom.workspace = true

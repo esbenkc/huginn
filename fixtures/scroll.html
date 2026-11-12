@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Element scrolling</title>
+<style>
+  body { margin: 0 }
+  #s { position: relative; width: 200px; height: 100px; overflow-y: auto }
+  #s div { height: 20px }
+  #head { position: sticky; top: 0; background: yellow }
+  #check { width: 50px; height: 50px; background: red }
+</style>
+</head>
+<body>
+<div id="s">
+  <div id="head"></div>
+  <div style="background: #f00"></div>
+  <div style="background: #f80"></div>
+  <div style="background: #ff0"></div>
+  <div style="background: #8f0"></div>
+  <div style="background: #0f0"></div>
+  <div style="background: #0f8"></div>
+  <div id="cur" style="background: #0ff"></div>
+  <div style="background: #08f"></div>
+  <div style="background: #00f"></div>
+  <div style="background: #80f"></div>
+</div>
+<div id="check"></div>
+<script>
+  // 11 rows of 20px in a 100px scroller: it scrolls 0..120.
+  const s = document.getElementById('s');
+  const cur = document.getElementById('cur');
+  s.scrollTop = 1000;
+  const clamped = s.scrollTop === 120 && s.scrollHeight === 220;
+  // Like a sidebar showing the current entry: offsetTop does not change with scrolling.
+  s.scrollTo({ top: cur.offsetTop - 40 });
+  const ok = clamped && s.scrollTop === 100 && cur.offsetTop === 140 && cur.getBoundingClientRect().top === 40;
+  document.getElementById('check').style.background = ok ? 'blue' : 'red';
+</script>
+</body>
+</html>

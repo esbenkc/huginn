@@ -1,0 +1,235 @@
+diff --git a/Libraries/LibWeb/Page/Page.cpp b/Libraries/LibWeb/Page/Page.cpp
+index 1593b879..9d9af798 100644
+--- a/Libraries/LibWeb/Page/Page.cpp
++++ b/Libraries/LibWeb/Page/Page.cpp
+@@ -294,9 +294,9 @@ void Page::navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigab
+         m_mouse_event_tracking_navigable = nullptr;
+ }
+ 
+-void Page::queue_screenshot_task(Optional<UniqueNodeID> node_id)
++void Page::queue_screenshot_task(Optional<UniqueNodeID> node_id, bool viewport_only)
+ {
+-    m_screenshot_tasks.enqueue({ node_id });
++    m_screenshot_tasks.enqueue({ node_id, viewport_only });
+     local_traversable()->set_needs_repaint();
+     client().request_frame();
+ }
+@@ -345,7 +345,8 @@ void Page::process_screenshot_requests()
+             auto const* layout_node = navigable->active_document()->layout_node(read);
+             VERIFY(layout_node && Painting::has_committed_box(*layout_node));
+             auto scrollable_overflow_rect = Painting::scrollable_overflow_rect(*layout_node);
+-            auto rect = enclosing_device_rect(scrollable_overflow_rect.value());
++            // A viewport screenshot paints only what the view shows, like a browser's "visible area" capture.
++            auto rect = enclosing_device_rect(task.viewport_only ? navigable->viewport_rect() : scrollable_overflow_rect.value());
+             auto bitmap_or_error = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, rect.size().to_type<int>());
+             if (bitmap_or_error.is_error()) {
+                 client.page_did_take_screenshot({});
+diff --git a/Libraries/LibWeb/Page/Page.h b/Libraries/LibWeb/Page/Page.h
+index 15d9b112..6d66d43d 100644
+--- a/Libraries/LibWeb/Page/Page.h
++++ b/Libraries/LibWeb/Page/Page.h
+@@ -192,7 +192,7 @@ public:
+     void focused_navigable_changed_in_another_page(HTML::CrossProcessId);
+     void navigable_document_destroyed(Badge<DOM::Document>, HTML::LocalNavigable&);
+ 
+-    void queue_screenshot_task(Optional<UniqueNodeID> node_id);
++    void queue_screenshot_task(Optional<UniqueNodeID> node_id, bool viewport_only = false);
+     void process_screenshot_requests();
+ 
+     CSSPixelPoint device_to_css_point(DevicePixelPoint) const;
+@@ -573,6 +573,7 @@ private:
+ 
+     struct ScreenshotTask {
+         Optional<UniqueNodeID> node_id;
++        bool viewport_only { false };
+     };
+     Queue<ScreenshotTask> m_screenshot_tasks;
+ 
+diff --git a/Libraries/LibWebView/Application.cpp b/Libraries/LibWebView/Application.cpp
+index c9848681..8ff403ea 100644
+--- a/Libraries/LibWebView/Application.cpp
++++ b/Libraries/LibWebView/Application.cpp
+@@ -291,6 +291,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
+     Optional<double> device_pixel_ratio;
+     Optional<u32> screenshot_delay;
+     Optional<StringView> screenshot_path;
++    bool screenshot_on_load = false;
+     bool new_window = false;
+     bool force_new_process = false;
+     StringView stats_log_directory;
+@@ -366,6 +367,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
+ 
+     args_parser.add_option(screenshot_delay, "Set the number of seconds to wait before taking a screenshot (only supported for headless screenshot mode)", "screenshot-delay", 0, "seconds");
+     args_parser.add_option(screenshot_path, "Save screenshots to the given location (only supported for headless screenshot mode)", "screenshot-path", 0, "path");
++    args_parser.add_option(screenshot_on_load, "Take a viewport screenshot when the page's load event fires, instead of a full-page screenshot after a delay (only supported for headless screenshot mode)", "screenshot-on-load");
+     args_parser.add_option(window_width, "Set viewport width in pixels (default: 800) (currently only supported for headless mode)", "window-width", 0, "pixels");
+     args_parser.add_option(window_height, "Set viewport height in pixels (default: 600) (currently only supported for headless mode)", "window-height", 0, "pixels");
+     args_parser.add_option(device_pixel_ratio, "Set the device pixel ratio (default: 1) (only supported for headless terminal mode)", "device-pixel-ratio", 0, "ratio");
+@@ -554,6 +556,7 @@ ErrorOr<void> Application::initialize(Main::Arguments const& arguments)
+         m_browser_options.screenshot_delay = *screenshot_delay;
+     if (screenshot_path.has_value())
+         m_browser_options.screenshot_path = *screenshot_path;
++    m_browser_options.screenshot_on_load = screenshot_on_load;
+     if (window_width.has_value())
+         m_browser_options.window_width = *window_width;
+     if (window_height.has_value())
+@@ -2150,6 +2153,27 @@ static NonnullRefPtr<Core::Timer> load_page_for_screenshot_and_exit(Core::EventL
+     return timer;
+ }
+ 
++static void load_page_for_viewport_screenshot_on_load_and_exit(Core::EventLoop& event_loop, HeadlessWebView& view, URL::URL const& url)
++{
++    view.on_load_finish = [&view, &event_loop, requested = false](URL::URL const& loaded_url) mutable {
++        // Ignore the initial about:blank, and any load that finishes after the screenshot was requested.
++        if (requested || loaded_url.scheme() == "about"sv)
++            return;
++        requested = true;
++        view.take_viewport_screenshot()
++            ->when_resolved([&event_loop](auto const& path) {
++                outln("Saved screenshot to: {}", path);
++                event_loop.quit(0);
++            })
++            .when_rejected([&event_loop](auto const& error) {
++                warnln("Unable to take screenshot: {}", error);
++                event_loop.quit(1);
++            });
++    };
++
++    view.load(url);
++}
++
+ static void load_page_for_info_and_exit(Core::EventLoop& event_loop, HeadlessWebView& view, URL::URL const& url, WebView::PageInfoType type)
+ {
+     view.on_load_finish = [&view, &event_loop, url, type](auto const& loaded_url) {
+@@ -2201,7 +2225,10 @@ ErrorOr<int> Application::execute()
+ 
+             switch (*m_browser_options.headless_mode) {
+             case HeadlessMode::Screenshot:
+-                screenshot_timer = load_page_for_screenshot_and_exit(*m_event_loop, *view, m_browser_options.urls.first(), m_browser_options.screenshot_delay);
++                if (m_browser_options.screenshot_on_load)
++                    load_page_for_viewport_screenshot_on_load_and_exit(*m_event_loop, *view, m_browser_options.urls.first());
++                else
++                    screenshot_timer = load_page_for_screenshot_and_exit(*m_event_loop, *view, m_browser_options.urls.first(), m_browser_options.screenshot_delay);
+                 break;
+             case HeadlessMode::LayoutTree:
+                 load_page_for_info_and_exit(*m_event_loop, *view, m_browser_options.urls.first(), WebView::PageInfoType::LayoutTree);
+diff --git a/Libraries/LibWebView/Options.h b/Libraries/LibWebView/Options.h
+index f2e3116e..e535fa22 100644
+--- a/Libraries/LibWebView/Options.h
++++ b/Libraries/LibWebView/Options.h
+@@ -96,6 +96,7 @@ struct BrowserOptions {
+     Optional<HeadlessMode> headless_mode;
+     Optional<ByteString> screenshot_path {};
+     u32 screenshot_delay { 1 };
++    bool screenshot_on_load { false };
+     int window_width { 800 };
+     int window_height { 600 };
+     double device_pixel_ratio { 1.0 };
+diff --git a/Libraries/LibWebView/ViewImplementation.cpp b/Libraries/LibWebView/ViewImplementation.cpp
+index 59a3f35b..5b4ccf55 100644
+--- a/Libraries/LibWebView/ViewImplementation.cpp
++++ b/Libraries/LibWebView/ViewImplementation.cpp
+@@ -4871,6 +4871,18 @@ NonnullRefPtr<Core::Promise<LexicalPath>> ViewImplementation::take_dom_node_scre
+     return promise;
+ }
+ 
++// Paints the viewport fresh in WebContent, so it reflects the current document state rather than the last displayed frame.
++NonnullRefPtr<Core::Promise<LexicalPath>> ViewImplementation::take_viewport_screenshot()
++{
++    if (m_pending_screenshot)
++        return Core::Promise<LexicalPath>::rejected(Error::from_string_literal("A screenshot request is already in progress"));
++
++    auto promise = Core::Promise<LexicalPath>::construct();
++    m_pending_screenshot = promise;
++    page().async_take_viewport_screenshot();
++    return promise;
++}
++
+ void ViewImplementation::did_receive_screenshot(Badge<WebContentPage>, Gfx::ShareableBitmap const& screenshot)
+ {
+     // A renderer answers a screenshot request; any other screenshot it sends is misbehavior.
+diff --git a/Libraries/LibWebView/ViewImplementation.h b/Libraries/LibWebView/ViewImplementation.h
+index aef42cea..1e28012c 100644
+--- a/Libraries/LibWebView/ViewImplementation.h
++++ b/Libraries/LibWebView/ViewImplementation.h
+@@ -589,6 +589,7 @@ public:
+     void take_and_save_screenshot(ScreenshotType);
+     void save_screenshot(Gfx::Bitmap const&);
+     NonnullRefPtr<Core::Promise<LexicalPath>> take_dom_node_screenshot(Web::UniqueNodeID);
++    NonnullRefPtr<Core::Promise<LexicalPath>> take_viewport_screenshot();
+     virtual void did_receive_screenshot(Badge<WebContentPage>, Gfx::ShareableBitmap const&);
+ 
+     NonnullRefPtr<Core::Promise<String>> request_internal_page_info(PageInfoType);
+diff --git a/Services/WebContent/ConnectionFromClient.cpp b/Services/WebContent/ConnectionFromClient.cpp
+index 6f97034c..f536afbf 100644
+--- a/Services/WebContent/ConnectionFromClient.cpp
++++ b/Services/WebContent/ConnectionFromClient.cpp
+@@ -2674,6 +2674,15 @@ void ConnectionFromClient::take_document_screenshot(Web::PageId page_id)
+     page->queue_screenshot_task({});
+ }
+ 
++void ConnectionFromClient::take_viewport_screenshot(Web::PageId page_id)
++{
++    auto page = this->page(page_id);
++    if (!page.has_value())
++        return;
++
++    page->queue_screenshot_task({}, true);
++}
++
+ void ConnectionFromClient::take_dom_node_screenshot(Web::PageId page_id, Web::UniqueNodeID node_id)
+ {
+     auto page = this->page(page_id);
+diff --git a/Services/WebContent/ConnectionFromClient.h b/Services/WebContent/ConnectionFromClient.h
+index c6a8cc89..c665cecb 100644
+--- a/Services/WebContent/ConnectionFromClient.h
++++ b/Services/WebContent/ConnectionFromClient.h
+@@ -320,6 +320,7 @@ private:
+     virtual void toggle_media_controls_state(Web::PageId page_id) override;
+ 
+     virtual void take_document_screenshot(Web::PageId page_id) override;
++    virtual void take_viewport_screenshot(Web::PageId page_id) override;
+     virtual void take_dom_node_screenshot(Web::PageId page_id, Web::UniqueNodeID node_id) override;
+ 
+     virtual void request_internal_page_info(Web::PageId page_id, WebView::PageInfoType) override;
+diff --git a/Services/WebContent/PageClient.cpp b/Services/WebContent/PageClient.cpp
+index 2c38cef4..4b443eeb 100644
+--- a/Services/WebContent/PageClient.cpp
++++ b/Services/WebContent/PageClient.cpp
+@@ -2825,9 +2825,9 @@ Web::Compositor::CompositorHost const* PageClient::compositor_host() const
+     return m_owner.compositor_host();
+ }
+ 
+-void PageClient::queue_screenshot_task(Optional<Web::UniqueNodeID> node_id)
++void PageClient::queue_screenshot_task(Optional<Web::UniqueNodeID> node_id, bool viewport_only)
+ {
+-    page().queue_screenshot_task(node_id);
++    page().queue_screenshot_task(node_id, viewport_only);
+ }
+ 
+ }
+diff --git a/Services/WebContent/PageClient.h b/Services/WebContent/PageClient.h
+index 77b32a3a..b88e7fa8 100644
+--- a/Services/WebContent/PageClient.h
++++ b/Services/WebContent/PageClient.h
+@@ -153,7 +153,7 @@ public:
+     virtual Web::Compositor::CompositorHost* compositor_host() override;
+     virtual Web::Compositor::CompositorHost const* compositor_host() const override;
+ 
+-    void queue_screenshot_task(Optional<Web::UniqueNodeID> node_id);
++    void queue_screenshot_task(Optional<Web::UniqueNodeID> node_id, bool viewport_only = false);
+     void send_current_needs_beforeunload_check();
+     void set_ongoing_navigation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id);
+     void navigate_to_a_fragment(Web::HTML::CrossProcessId navigable_id, URL::URL const&, Web::HTML::HistoryHandlingBehavior, Web::HTML::UserNavigationInvolvement, Utf16String navigation_id);
+diff --git a/Services/WebContent/WebContentServer.ipc b/Services/WebContent/WebContentServer.ipc
+index 9bcc765d..d529a501 100644
+--- a/Services/WebContent/WebContentServer.ipc
++++ b/Services/WebContent/WebContentServer.ipc
+@@ -234,6 +234,7 @@ endpoint WebContentServer routed by Web::PageId page_id
+     remove_dom_node(Web::PageId page_id, Web::UniqueNodeID node_id) =|
+ 
+     take_document_screenshot(Web::PageId page_id) =|
++    take_viewport_screenshot(Web::PageId page_id) =|
+     take_dom_node_screenshot(Web::PageId page_id, Web::UniqueNodeID node_id) =|
+ 
+     request_internal_page_info(Web::PageId page_id, WebView::PageInfoType type) =|

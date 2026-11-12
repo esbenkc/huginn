@@ -1,0 +1,20 @@
+# Build output (every CARGO_TARGET_DIR is target-<name>)
+target*/
+
+# Screenshots and renders; only test fixtures and README images are tracked
+*.png
+!fixtures/**/*.png
+!crates/huginn-shell/tests/pages/*.png
+!docs/img/*.png
+*.pdf
+
+# Benchmark: third-party page snapshots, browsers, raw results stay local
+bench/corpus/
+bench/browsers/
+bench/node_modules/
+bench/.venv/
+bench/results/*
+!bench/results/*.md
+__pycache__/
+
+.DS_Store

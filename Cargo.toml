@@ -1,0 +1,125 @@
+[workspace]
+members = [
+    "crates/huginn-dom",
+    "crates/huginn-style",
+    "crates/huginn-layout",
+    "crates/huginn-paint",
+    "crates/huginn-net",
+    "crates/huginn-js",
+    "crates/huginn-shell",
+]
+resolver = "3"
+# Vendored crates with Huginn fixes; not workspace members.
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Our crates
+huginn-dom = { path = "crates/huginn-dom" }
+huginn-style = { path = "crates/huginn-style" }
+huginn-layout = { path = "crates/huginn-layout" }
+huginn-paint = { path = "crates/huginn-paint" }
+huginn-net = { path = "crates/huginn-net" }
+huginn-js = { path = "crates/huginn-js" }
+
+# HTML parsing (Servo). markup5ever 0.40 and stylo 0.24 share web_atoms 0.3,
+# so DOM names are already the atoms Stylo matches against.
+html5ever = "0.40.1"
+markup5ever = "0.40.0"
+
+# CSS tokenizer (Servo). Same major as stylo 0.24.
+cssparser = "0.38"
+# CSS engine (Servo's Stylo): cascade, selectors, computed values. huginn-style
+# runs its sequential traversal only (no rayon pool). See ARCHITECTURE.md.
+style = { package = "stylo", version = "0.24.0" }
+style_traits = { package = "stylo_traits", version = "0.24.0" }
+style_dom = { package = "stylo_dom", version = "0.24.0" }
+style_config = { package = "stylo_static_prefs", version = "0.24.0" }
+selectors = "0.43.0"
+euclid = "0.22"
+app_units = "0.7"
+
+# Layout
+taffy = { version = "0.15.1", default-features = false, features = [
+    "std",
+    "taffy_tree",
+    "flexbox",
+    "grid",
+    "block_layout",
+    "float_layout",
+    "calc",
+    "content_size",
+] }
+parley = { version = "0.12.0", default-features = false, features = ["system"] }
+
+# Paint
+vello_cpu = { version = "0.4.0", default-features = false, features = ["std", "text", "u8_pipeline"] }
+png = "0.18"
+# Glyph run settings (synthetic bold) that vello_cpu does not re-export. Same version vello_cpu uses.
+glifo = { version = "0.5.0", default-features = false, features = ["std"] }
+# Pixel buffer type shared by decoded images and the rasterizer (same crate vello_cpu uses).
+vello_common = { version = "0.4.0", default-features = false, features = ["std"] }
+
+# Images
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+
+# Networking
+ureq = { version = "3.5.1", default-features = false, features = ["rustls", "gzip", "brotli"] }
+url = "2.5"
+data-url = "0.3"
+# Text decoding for non-UTF-8 documents and stylesheets (WHATWG Encoding Standard).
+encoding_rs = "0.8"
+
+# Web fonts: WOFF and WOFF2 to TrueType/OpenType (pure Rust, as in Blitz).
+wuff = { version = "0.2.10", default-features = false, features = ["brotli", "z"] }
+
+# SVG images: parse (usvg, re-exported by resvg) and rasterize (resvg on
+# tiny-skia). No text, no system fonts: font discovery would cost tens of ms
+# and MBs on every page.
+resvg = { version = "0.50", default-features = false }
+
+# JavaScript (huginn-js, behind its `v8` feature)
+v8 = { version = "152.2.0", default-features = false, features = ["use_custom_libcxx"] }
+
+# Misc
+serde_json = "1"
+
+# Window for `huginn open`: winit for the event loop, softbuffer to show
+# CPU-rasterized pixels (no GPU device: far less memory than wgpu). macOS only
+# today; Linux would need the `x11`/`wayland` features of both.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+softbuffer = { version = "0.4.8", default-features = false }
+miniz_oxide = "0.8"
+
+# Taffy 0.15.1 with Huginn fixes. Each change is marked `huginn:` in
+# vendor/taffy/src; list them with `grep -rn huginn: vendor/taffy/src`.
+[patch.crates-io]
+taffy = { path = "vendor/taffy" }
+
+[profile.release]
+debug = false
+codegen-units = 16
+lto = "thin"
+panic = "unwind"
+
+# Release build used for the benchmark: maximum speed, smallest binary.
+[profile.bench-release]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# Fast developer build for fidelity checks while CPU is scarce: no LTO, incremental, many codegen units.
+# Timing and memory numbers MUST come from bench-release, never from this profile.
+[profile.fastdev]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 256
+incremental = true

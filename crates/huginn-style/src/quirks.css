@@ -1,0 +1,24 @@
+/* Quirks-mode additions to the UA sheet (HTML Standard, "Rendering",
+   quirks mode), with Chrome's values. Added by StyleEngine::compute only
+   for documents in quirks mode (no doctype). */
+
+/* Floated images get 3px margins. */
+img[align=left i] { margin-right: 3px; }
+img[align=right i] { margin-left: 3px; }
+
+/* Tables do not inherit text styles from the page (font-family does). */
+table {
+  white-space: normal;
+  line-height: normal;
+  font-weight: normal;
+  font-size: medium;
+  font-variant: normal;
+  font-style: normal;
+  text-align: start;
+}
+
+/* Text fields use border-box sizing. */
+input:not([type=image i]), textarea { box-sizing: border-box; }
+
+/* Forms keep a bottom margin. */
+form { margin-block-end: 1em; }

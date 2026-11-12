@@ -1,0 +1,543 @@
+// ------------------------------------------------------------------- URL --
+
+const URL_PARTS = ['href', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin'];
+
+function formEncode(s) {
+  return encodeURIComponent(s).replace(/%20/g, '+').replace(/[!'()~]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+}
+function formDecode(s) {
+  try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch (e) { return s; }
+}
+class URLSearchParams {
+  constructor(init) {
+    defProp(this, '_list', { value: [], writable: true });
+    defProp(this, '_url', { value: null, writable: true });
+    if (init === undefined || init === null) return;
+    if (typeof init === 'object') {
+      if (init instanceof URLSearchParams) this._list = init._list.map(p => p.slice());
+      else if (typeof init[Symbol.iterator] === 'function') for (const [k, v] of init) this._list.push([String(k), String(v)]);
+      else for (const k of Object.keys(init)) this._list.push([k, String(init[k])]);
+    } else {
+      this._parse(String(init));
+    }
+  }
+  _parse(s) {
+    this._list = [];
+    if (s.startsWith('?')) s = s.slice(1);
+    for (const part of s.split('&')) {
+      if (!part) continue;
+      const i = part.indexOf('=');
+      this._list.push(i >= 0 ? [formDecode(part.slice(0, i)), formDecode(part.slice(i + 1))] : [formDecode(part), '']);
+    }
+  }
+  _update() { if (this._url) { const s = this.toString(); this._url._setPart('search', s ? '?' + s : ''); } }
+  get size() { return this._list.length; }
+  append(k, v) { this._list.push([String(k), String(v)]); this._update(); }
+  delete(k, v) { k = String(k); this._list = this._list.filter(p => p[0] !== k || (v !== undefined && p[1] !== String(v))); this._update(); }
+  get(k) { k = String(k); const p = this._list.find(p => p[0] === k); return p ? p[1] : null; }
+  getAll(k) { k = String(k); return this._list.filter(p => p[0] === k).map(p => p[1]); }
+  has(k, v) { k = String(k); return this._list.some(p => p[0] === k && (v === undefined || p[1] === String(v))); }
+  set(k, v) {
+    k = String(k); v = String(v);
+    const i = this._list.findIndex(p => p[0] === k);
+    if (i < 0) this._list.push([k, v]);
+    else { this._list[i][1] = v; this._list = this._list.filter((p, j) => j <= i || p[0] !== k); }
+    this._update();
+  }
+  sort() { this._list.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)); this._update(); }
+  forEach(cb, t) { for (const [k, v] of this._list) cb.call(t, v, k, this); }
+  keys() { return this._list.map(p => p[0]).values(); }
+  values() { return this._list.map(p => p[1]).values(); }
+  entries() { return this._list.map(p => p.slice()).values(); }
+  [Symbol.iterator]() { return this.entries(); }
+  toString() { return this._list.map(p => formEncode(p[0]) + '=' + formEncode(p[1])).join('&'); }
+}
+expose(URLSearchParams);
+
+// Parsing is done natively with the WHATWG `url` crate.
+class URL {
+  constructor(url, base) {
+    let b = '';
+    if (base !== undefined && base !== null) {
+      const bp = N.url(String(base), 'about:invalid-base');
+      if (!bp) throw new TypeError("Failed to construct 'URL': Invalid base URL");
+      b = bp[0];
+    }
+    const p = N.url(String(url), b || 'about:invalid-base');
+    if (!p) throw new TypeError("Failed to construct 'URL': Invalid URL");
+    defProp(this, '_p', { value: p, writable: true });
+    defProp(this, '_sp', { value: null, writable: true });
+  }
+  static canParse(url, base) { try { new URL(url, base); return true; } catch (e) { return false; } }
+  static parse(url, base) { try { return new URL(url, base); } catch (e) { return null; } }
+  static createObjectURL() { return 'blob:' + N.docUrl() + '#' + Math.random().toString(36).slice(2); }
+  static revokeObjectURL() {}
+  _setPart(k, v) {
+    const p = N.urlSet(this._p[0], k, String(v));
+    if (p) this._p = p;
+  }
+  get searchParams() {
+    if (!this._sp) { this._sp = new URLSearchParams(this._p[8]); this._sp._url = this; }
+    return this._sp;
+  }
+  toString() { return this._p[0]; }
+  toJSON() { return this._p[0]; }
+}
+URL_PARTS.forEach((k, i) => {
+  defProp(URL.prototype, k, {
+    get() { return this._p[i]; },
+    set(v) {
+      if (k === 'origin') return;
+      if (k === 'href') {
+        const p = N.url(String(v), 'about:invalid-base');
+        if (!p) throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL");
+        this._p = p;
+      } else {
+        this._setPart(k, v);
+      }
+      if (this._sp && (k === 'href' || k === 'search')) this._sp._parse(this._p[8]);
+    },
+    configurable: true,
+    enumerable: true,
+  });
+});
+expose(URL);
+defProp(G, 'webkitURL', { value: URL, writable: true, configurable: true });
+
+// ------------------------------------------------------------- encoding --
+
+class TextEncoder {
+  get encoding() { return 'utf-8'; }
+  encode(s) {
+    s = s === undefined ? '' : String(s);
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+      let c = s.charCodeAt(i);
+      if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+        const d = s.charCodeAt(i + 1);
+        if (d >= 0xdc00 && d < 0xe000) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+        else c = 0xfffd;
+      } else if (c >= 0xd800 && c < 0xe000) c = 0xfffd;
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return new Uint8Array(out);
+  }
+  encodeInto(s, dest) {
+    const b = this.encode(s);
+    const n = Math.min(b.length, dest.length);
+    dest.set(b.subarray(0, n));
+    return { read: s.length, written: n };
+  }
+}
+expose(TextEncoder);
+class TextDecoder {
+  constructor(label, options) {
+    this.encoding = String(label || 'utf-8').toLowerCase().replace(/^utf8$/, 'utf-8');
+    this.fatal = !!(options && options.fatal);
+    this.ignoreBOM = !!(options && options.ignoreBOM);
+  }
+  decode(input) {
+    if (input === undefined) return '';
+    const b = input instanceof ArrayBuffer ? new Uint8Array(input) : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    if (this.encoding !== 'utf-8') {
+      let s = '';
+      for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+      return s;
+    }
+    let s = '';
+    let i = (!this.ignoreBOM && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) ? 3 : 0;
+    const chunk = [];
+    const flush = () => { s += String.fromCharCode.apply(null, chunk); chunk.length = 0; };
+    while (i < b.length) {
+      const c = b[i++];
+      let cp;
+      if (c < 0x80) cp = c;
+      else if (c >= 0xc2 && c < 0xe0 && i < b.length) cp = ((c & 31) << 6) | (b[i++] & 63);
+      else if (c >= 0xe0 && c < 0xf0 && i + 1 < b.length) { cp = ((c & 15) << 12) | ((b[i] & 63) << 6) | (b[i + 1] & 63); i += 2; }
+      else if (c >= 0xf0 && c < 0xf5 && i + 2 < b.length) { cp = ((c & 7) << 18) | ((b[i] & 63) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63); i += 3; }
+      else { if (this.fatal) throw new TypeError('The encoded data was not valid.'); cp = 0xfffd; }
+      if (cp >= 0x10000) { cp -= 0x10000; chunk.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 1023)); }
+      else chunk.push(cp);
+      if (chunk.length > 8000) flush();
+    }
+    flush();
+    return s;
+  }
+}
+expose(TextDecoder);
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function btoa(s) {
+  s = String(s);
+  let out = '';
+  for (let i = 0; i < s.length; i += 3) {
+    const a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
+    if (a > 255 || b > 255 || c > 255) throw domErr('InvalidCharacterError', 'The string to be encoded contains characters outside of the Latin1 range.');
+    const n = (a << 16) | ((b || 0) << 8) | (c || 0);
+    out += B64[n >> 18] + B64[(n >> 12) & 63] + (i + 1 < s.length ? B64[(n >> 6) & 63] : '=') + (i + 2 < s.length ? B64[n & 63] : '=');
+  }
+  return out;
+}
+function atob(s) {
+  s = String(s).replace(/[\t\n\f\r ]/g, '');
+  if (s.length % 4 === 0) s = s.replace(/==?$/, '');
+  if (s.length % 4 === 1 || /[^A-Za-z0-9+/]/.test(s)) throw domErr('InvalidCharacterError', 'The string to be decoded is not correctly encoded.');
+  let out = '';
+  let bits = 0, acc = 0;
+  for (let i = 0; i < s.length; i++) {
+    acc = (acc << 6) | B64.indexOf(s[i]);
+    bits += 6;
+    if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 255); }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- blobs --
+
+function bytesOf(part) {
+  if (part instanceof Blob) return part._bytes;
+  if (part instanceof ArrayBuffer) return new Uint8Array(part);
+  if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
+  return new TextEncoder().encode(String(part));
+}
+class Blob {
+  constructor(parts, options) {
+    const chunks = (parts || []).map(bytesOf);
+    const total = chunks.reduce((n, c) => n + c.length, 0);
+    const bytes = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) { bytes.set(c, off); off += c.length; }
+    defProp(this, '_bytes', { value: bytes });
+    this.type = options && options.type ? String(options.type).toLowerCase() : '';
+  }
+  get size() { return this._bytes.length; }
+  slice(start, end, type) { const b = new Blob([], { type }); defProp(b, '_bytes', { value: this._bytes.slice(start, end) }); return b; }
+  text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
+  arrayBuffer() { return Promise.resolve(this._bytes.slice().buffer); }
+  bytes() { return Promise.resolve(this._bytes.slice()); }
+  stream() { throw domErr('NotSupportedError', 'streams are not supported'); }
+}
+expose(Blob);
+class File extends Blob {
+  constructor(parts, name, options) { super(parts, options); this.name = String(name); this.lastModified = (options && options.lastModified) || Date.now(); }
+}
+expose(File);
+class FileReader extends EventTarget {
+  constructor() { super(); this.readyState = 0; this.result = null; this.error = null; }
+  _read(blob, conv) {
+    this.readyState = 1;
+    queueTask(() => {
+      this.result = conv(blob);
+      this.readyState = 2;
+      dispatch(this, new ProgressEvent('load'));
+      dispatch(this, new ProgressEvent('loadend'));
+    });
+  }
+  readAsText(b) { this._read(b, x => new TextDecoder().decode(x._bytes)); }
+  readAsArrayBuffer(b) { this._read(b, x => x._bytes.slice().buffer); }
+  readAsDataURL(b) {
+    this._read(b, x => {
+      let s = '';
+      for (const c of x._bytes) s += String.fromCharCode(c);
+      return 'data:' + (x.type || 'application/octet-stream') + ';base64,' + btoa(s);
+    });
+  }
+  readAsBinaryString(b) { this._read(b, x => { let s = ''; for (const c of x._bytes) s += String.fromCharCode(c); return s; }); }
+  abort() {}
+}
+addHandlerProps(FileReader.prototype, ['loadstart', 'loadend', 'progress']);
+expose(FileReader);
+class FormData {
+  constructor(form) {
+    defProp(this, '_list', { value: [] });
+    if (form && form.elements) {
+      for (const el of form.elements) {
+        if (!el.name || el.disabled) continue;
+        if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) continue;
+        this._list.push([el.name, el.value]);
+      }
+    }
+  }
+  append(k, v) { this._list.push([String(k), v instanceof Blob ? v : String(v)]); }
+  delete(k) { for (let i = this._list.length - 1; i >= 0; i--) if (this._list[i][0] === k) this._list.splice(i, 1); }
+  get(k) { const p = this._list.find(p => p[0] === k); return p ? p[1] : null; }
+  getAll(k) { return this._list.filter(p => p[0] === k).map(p => p[1]); }
+  has(k) { return this._list.some(p => p[0] === k); }
+  set(k, v) { this.delete(k); this.append(k, v); }
+  forEach(cb, t) { for (const [k, v] of this._list) cb.call(t, v, k, this); }
+  keys() { return this._list.map(p => p[0]).values(); }
+  values() { return this._list.map(p => p[1]).values(); }
+  entries() { return this._list.map(p => p.slice()).values(); }
+  [Symbol.iterator]() { return this.entries(); }
+}
+expose(FormData);
+
+// ---------------------------------------------------------- fetch and XHR --
+// Requests are served synchronously by the shell's loader (same origin only;
+// anything else fails like a network error), and the result is delivered in
+// a later task, like a fast network.
+
+function nativeFetch(url, method) {
+  const r = N.fetch(String(url), String(method || 'GET').toUpperCase());
+  return r ? { status: +r[0], url: r[1], type: r[2], body: r[3] } : null;
+}
+const STATUS_TEXT = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' };
+
+class Headers {
+  constructor(init) {
+    defProp(this, '_map', { value: new Map() });
+    if (!init) return;
+    if (init instanceof Headers) init.forEach((v, k) => this.append(k, v));
+    else if (typeof init[Symbol.iterator] === 'function') for (const [k, v] of init) this.append(k, v);
+    else for (const k of Object.keys(init)) this.append(k, init[k]);
+  }
+  append(k, v) { k = String(k).toLowerCase(); const o = this._map.get(k); this._map.set(k, o === undefined ? String(v) : o + ', ' + v); }
+  set(k, v) { this._map.set(String(k).toLowerCase(), String(v)); }
+  get(k) { const v = this._map.get(String(k).toLowerCase()); return v === undefined ? null : v; }
+  getSetCookie() { return []; }
+  has(k) { return this._map.has(String(k).toLowerCase()); }
+  delete(k) { this._map.delete(String(k).toLowerCase()); }
+  forEach(cb, t) { for (const [k, v] of this._map) cb.call(t, v, k, this); }
+  keys() { return this._map.keys(); }
+  values() { return this._map.values(); }
+  entries() { return this._map.entries(); }
+  [Symbol.iterator]() { return this._map.entries(); }
+}
+expose(Headers);
+
+class Body {
+  _text() { return this._body === null ? '' : this._body; }
+  _consume() {
+    if (this.bodyUsed) return Promise.reject(new TypeError('body stream already read'));
+    defProp(this, 'bodyUsed', { value: true });
+    return Promise.resolve(this._text());
+  }
+  text() { return this._consume(); }
+  json() { return this._consume().then(t => JSON.parse(t)); }
+  arrayBuffer() { return this._consume().then(t => new TextEncoder().encode(t).buffer); }
+  bytes() { return this._consume().then(t => new TextEncoder().encode(t)); }
+  blob() { return this._consume().then(t => new Blob([t], { type: this.headers.get('content-type') || '' })); }
+  formData() { return this._consume().then(t => { const f = new FormData(); new URLSearchParams(t).forEach((v, k) => f.append(k, v)); return f; }); }
+  get body() { return null; }
+}
+Body.prototype.bodyUsed = false;
+class Request extends Body {
+  constructor(input, init) {
+    super();
+    init = init || {};
+    const src = input instanceof Request ? input : null;
+    this.url = src ? src.url : new URL(String(input), N.baseUrl()).href;
+    this.method = String(init.method || (src && src.method) || 'GET').toUpperCase();
+    this.headers = new Headers(init.headers || (src && src.headers));
+    this.signal = init.signal || (src && src.signal) || new AbortSignal();
+    this.credentials = init.credentials || 'same-origin';
+    this.mode = init.mode || 'cors';
+    this.cache = init.cache || 'default';
+    this.redirect = init.redirect || 'follow';
+    this.referrer = 'about:client';
+    this.referrerPolicy = init.referrerPolicy || '';
+    this.integrity = init.integrity || '';
+    this.keepalive = !!init.keepalive;
+    defProp(this, '_body', { value: init.body === undefined || init.body === null ? null : String(init.body) });
+  }
+  clone() { return new Request(this); }
+}
+expose(Request);
+class Response extends Body {
+  constructor(body, init) {
+    super();
+    init = init || {};
+    this.status = init.status === undefined ? 200 : Number(init.status);
+    this.statusText = init.statusText === undefined ? (STATUS_TEXT[this.status] || '') : String(init.statusText);
+    this.headers = new Headers(init.headers);
+    this.type = 'default';
+    this.url = '';
+    this.redirected = false;
+    defProp(this, '_body', { value: body === undefined || body === null ? null : typeof body === 'string' ? body : body instanceof Blob ? new TextDecoder().decode(body._bytes) : ArrayBuffer.isView(body) || body instanceof ArrayBuffer ? new TextDecoder().decode(body) : String(body) });
+  }
+  get ok() { return this.status >= 200 && this.status < 300; }
+  clone() { const r = new Response(this._body, this); r.url = this.url; r.type = this.type; return r; }
+  static error() { const r = new Response(null, { status: 0, statusText: '' }); r.type = 'error'; return r; }
+  static json(data, init) {
+    const r = new Response(JSON.stringify(data), init);
+    if (!r.headers.has('content-type')) r.headers.set('content-type', 'application/json');
+    return r;
+  }
+  static redirect(url, status) { return new Response(null, { status: status || 302, headers: { location: String(url) } }); }
+}
+expose(Response);
+
+function fetch(input, init) {
+  let req;
+  try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
+  return new Promise((resolve, reject) => {
+    if (req.signal.aborted) { reject(req.signal.reason); return; }
+    queueTask(() => {
+      if (req.signal.aborted) { reject(req.signal.reason); return; }
+      const r = nativeFetch(req.url, req.method);
+      if (!r) { reject(new TypeError('Failed to fetch')); return; }
+      const res = new Response(r.body, { status: r.status, headers: r.type ? { 'content-type': r.type } : {} });
+      res.url = r.url;
+      res.type = 'basic';
+      resolve(res);
+    });
+  });
+}
+
+class XMLHttpRequest extends EventTarget {
+  constructor() {
+    super();
+    this.readyState = 0;
+    this.status = 0;
+    this.statusText = '';
+    this.responseType = '';
+    this.responseURL = '';
+    this.timeout = 0;
+    this.withCredentials = false;
+    this.upload = new EventTarget();
+    defProp(this, '_req', { value: null, writable: true });
+    defProp(this, '_res', { value: null, writable: true });
+  }
+  open(method, url, async) {
+    this._req = { method: String(method).toUpperCase(), url: new URL(String(url), N.baseUrl()).href, async: async !== false, aborted: false };
+    this._res = null;
+    this.status = 0;
+    this._state(1);
+  }
+  setRequestHeader() {}
+  overrideMimeType() {}
+  getResponseHeader(name) {
+    if (!this._res) return null;
+    return String(name).toLowerCase() === 'content-type' && this._res.type ? this._res.type : null;
+  }
+  getAllResponseHeaders() { return this._res && this._res.type ? 'content-type: ' + this._res.type + '\r\n' : ''; }
+  get responseText() {
+    if (this.responseType !== '' && this.responseType !== 'text') throw domErr('InvalidStateError', 'responseText is only available if responseType is "" or "text"');
+    return this._res ? this._res.body : '';
+  }
+  get responseXML() { return null; }
+  get response() {
+    if (!this._res || this.readyState !== 4) return this.responseType === '' || this.responseType === 'text' ? '' : null;
+    const body = this._res.body;
+    switch (this.responseType) {
+      case 'json': try { return JSON.parse(body); } catch (e) { return null; }
+      case 'arraybuffer': return new TextEncoder().encode(body).buffer;
+      case 'blob': return new Blob([body], { type: this._res.type || '' });
+      case 'document': return detachedDocument(body);
+      default: return body;
+    }
+  }
+  _state(s) { this.readyState = s; dispatch(this, new Event('readystatechange')); }
+  _finish() {
+    const req = this._req;
+    if (!req || req.aborted) return;
+    const r = nativeFetch(req.url, req.method);
+    if (!r) {
+      this._state(4);
+      dispatch(this, new ProgressEvent('error'));
+      dispatch(this, new ProgressEvent('loadend'));
+      return;
+    }
+    this._res = r;
+    this.status = r.status;
+    this.statusText = STATUS_TEXT[r.status] || '';
+    this.responseURL = r.url;
+    this._state(2);
+    this._state(3);
+    this._state(4);
+    const n = r.body.length;
+    dispatch(this, new ProgressEvent('load', { lengthComputable: true, loaded: n, total: n }));
+    dispatch(this, new ProgressEvent('loadend', { lengthComputable: true, loaded: n, total: n }));
+  }
+  send(body) {
+    if (!this._req) throw domErr('InvalidStateError', "The object's state must be OPENED.");
+    dispatch(this, new ProgressEvent('loadstart'));
+    if (this._req.async) queueTask(() => this._finish());
+    else this._finish();
+  }
+  abort() {
+    if (this._req) this._req.aborted = true;
+    if (this.readyState > 0 && this.readyState < 4) {
+      this._state(4);
+      dispatch(this, new ProgressEvent('abort'));
+    }
+    this.readyState = 0;
+  }
+}
+for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
+  defProp(XMLHttpRequest, k, { value: v });
+  defProp(XMLHttpRequest.prototype, k, { value: v });
+}
+addHandlerProps(XMLHttpRequest.prototype, ['readystatechange', 'loadstart', 'loadend', 'progress', 'timeout']);
+expose(XMLHttpRequest);
+expose(class XMLHttpRequestEventTarget extends EventTarget {}, 'XMLHttpRequestEventTarget');
+
+// Connections that never open: scripts get their error/close events.
+class WebSocket extends EventTarget {
+  constructor(url) {
+    super();
+    this.url = String(url);
+    this.readyState = 0;
+    this.protocol = '';
+    this.extensions = '';
+    this.bufferedAmount = 0;
+    this.binaryType = 'blob';
+    queueTask(() => {
+      this.readyState = 3;
+      dispatch(this, new Event('error'));
+      dispatch(this, new CloseEvent('close', { code: 1006, wasClean: false }));
+    });
+  }
+  send() {}
+  close() { this.readyState = 3; }
+}
+for (const [k, v] of [['CONNECTING', 0], ['OPEN', 1], ['CLOSING', 2], ['CLOSED', 3]]) defProp(WebSocket, k, { value: v });
+addHandlerProps(WebSocket.prototype, ['open', 'message', 'close']);
+expose(WebSocket);
+const CloseEvent = eventClass('CloseEvent', Event, { code: 0, reason: '', wasClean: false });
+class EventSource extends EventTarget {
+  constructor(url) {
+    super();
+    this.url = String(url);
+    this.readyState = 0;
+    this.withCredentials = false;
+    queueTask(() => { this.readyState = 2; dispatch(this, new Event('error')); });
+  }
+  close() { this.readyState = 2; }
+}
+addHandlerProps(EventSource.prototype, ['open', 'message']);
+expose(EventSource);
+
+// ------------------------------------------------------------- messaging --
+
+class MessagePort extends EventTarget {
+  constructor() { super(); defProp(this, '_other', { value: null, writable: true }); defProp(this, '_closed', { value: false, writable: true }); }
+  postMessage(data) {
+    const other = this._other;
+    if (!other || this._closed) return;
+    queueTask(() => { if (!other._closed) dispatch(other, new MessageEvent('message', { data })); });
+  }
+  start() {}
+  close() { this._closed = true; }
+}
+addHandlerProps(MessagePort.prototype, ['message', 'messageerror']);
+expose(MessagePort);
+class MessageChannel {
+  constructor() {
+    this.port1 = new MessagePort();
+    this.port2 = new MessagePort();
+    this.port1._other = this.port2;
+    this.port2._other = this.port1;
+  }
+}
+expose(MessageChannel);
+class BroadcastChannel extends EventTarget {
+  constructor(name) { super(); this.name = String(name); }
+  postMessage() {}
+  close() {}
+}
+addHandlerProps(BroadcastChannel.prototype, ['message', 'messageerror']);
+expose(BroadcastChannel);

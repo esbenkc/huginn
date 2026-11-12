@@ -1,0 +1,20 @@
+[package]
+name = "huginn-js"
+description = "JavaScript engine: V8 bindings for the Huginn DOM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Link V8 (the `v8` crate). Its build downloads a prebuilt static library
+# (~40 MB); without the feature Huginn runs no scripts.
+v8 = ["dep:v8"]
+
+[dependencies]
+huginn-dom.workspace = true
+huginn-net.workspace = true
+huginn-style.workspace = true
+url.workspace = true
+v8 = { workspace = true, optional = true }

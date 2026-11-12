@@ -1,0 +1,16 @@
+[package]
+name = "huginn-layout"
+description = "Box tree construction and layout (Taffy + Parley)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+huginn-dom.workspace = true
+huginn-style.workspace = true
+huginn-net.workspace = true
+taffy.workspace = true
+parley.workspace = true
+markup5ever.workspace = true

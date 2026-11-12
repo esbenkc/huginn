@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>hit</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; }
+  li { position: relative; list-style: none; height: 40px; }
+  .toggle { position: absolute; top: 0; left: 0; width: 40px; height: 40px; margin: 0; opacity: 0; }
+  label { display: block; padding-left: 60px; line-height: 40px; }
+</style>
+</head>
+<body>
+<ul style="margin: 0; padding: 0">
+  <li><input class="toggle" type="checkbox" id="t"><label>An item after its toggle</label></li>
+</ul>
+<script>
+  document.getElementById('t').addEventListener('change', (e) => { document.title = 'toggled ' + e.target.checked; });
+</script>
+</body>
+</html>

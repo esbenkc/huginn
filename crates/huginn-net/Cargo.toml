@@ -1,0 +1,18 @@
+[package]
+name = "huginn-net"
+description = "Fetching (http, https, file, data), cache, resource decoding"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ureq.workspace = true
+url.workspace = true
+data-url.workspace = true
+image.workspace = true
+vello_common.workspace = true
+encoding_rs.workspace = true
+wuff.workspace = true
+resvg.workspace = true

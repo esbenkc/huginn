@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Flexbox</title>
+<style>
+  body { margin: 16px; font: 14px/1.4 Helvetica, Arial, sans-serif; background: #f4f4f6; }
+  .row { display: flex; background: #dde3ea; margin-bottom: 12px; padding: 8px; height: 60px; }
+  .box { width: 60px; background: #3f51b5; color: #fff; text-align: center; }
+  .between { justify-content: space-between; }
+  .center { justify-content: center; align-items: center; }
+  .end { justify-content: flex-end; align-items: flex-end; }
+  .grow .box { flex-grow: 1; }
+  .grow .box:nth-child(2) { flex-grow: 2; background: #e91e63; }
+  .wrap { flex-wrap: wrap; height: auto; gap: 8px 12px; }
+  .wrap .box { width: 120px; height: 40px; background: #009688; }
+  .column { flex-direction: column; height: auto; width: 200px; gap: 6px; }
+  .column .box { width: auto; background: #795548; }
+  .nav { display: flex; align-items: center; background: #263238; color: #eceff1; padding: 0 16px; height: 48px; }
+  .nav .logo { font-weight: bold; font-size: 18px; margin-right: auto; }
+  .nav span { margin-left: 20px; }
+</style>
+</head>
+<body>
+  <div class="nav"><div class="logo">Site</div><span>Home</span><span>About</span><span>Contact</span></div>
+  <p>Space between:</p>
+  <div class="row between"><div class="box">1</div><div class="box">2</div><div class="box">3</div></div>
+  <div class="row center"><div class="box">A</div><div class="box">B</div></div>
+  <div class="row end"><div class="box">end</div></div>
+  <div class="row grow"><div class="box">1</div><div class="box">2</div><div class="box">1</div></div>
+  <div class="row wrap">
+    <div class="box">w1</div><div class="box">w2</div><div class="box">w3</div><div class="box">w4</div>
+    <div class="box">w5</div><div class="box">w6</div><div class="box">w7</div><div class="box">w8</div>
+    <div class="box">w9</div><div class="box">w10</div><div class="box">w11</div><div class="box">w12</div>
+  </div>
+  <div class="row column"><div class="box">one</div><div class="box">two</div><div class="box">three</div></div>
+</body>
+</html>

@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>form</title>
+<style>
+  body { margin: 0; font: 16px sans-serif; }
+  .at { position: absolute; left: 10px; margin: 0; }
+  #cb { top: 10px; width: 20px; height: 20px; }
+  #r1 { top: 40px; width: 20px; height: 20px; }
+  #r2 { top: 40px; left: 50px; width: 20px; height: 20px; }
+  #sel { top: 70px; width: 150px; height: 24px; }
+  #q { top: 110px; width: 200px; height: 24px; }
+  #go { top: 150px; width: 80px; height: 30px; }
+  #lab { top: 190px; width: 100px; height: 20px; }
+</style>
+</head>
+<body>
+<form id="f" action="b.html" method="get">
+  <input id="cb" class="at" type="checkbox" name="cb" value="yes">
+  <input id="r1" class="at" type="radio" name="r" value="one" checked>
+  <input id="r2" class="at" type="radio" name="r" value="two">
+  <select id="sel" class="at" name="s">
+    <option value="a">Alpha</option>
+    <option value="b">Beta</option>
+    <option value="c">Gamma</option>
+  </select>
+  <input id="q" class="at" name="q" placeholder="Search">
+  <button id="go" class="at">Go</button>
+  <label id="lab" class="at" for="cb">Toggle</label>
+</form>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const show = (what) => {
+    document.title = what + ' cb=' + $('cb').checked + ' r=' + $('f').querySelector('[name=r]:checked').value +
+      ' s=' + $('sel').value + ' q=' + $('q').value;
+  };
+  for (const id of ['cb', 'r1', 'r2', 'sel']) $(id).addEventListener('change', () => show('change'));
+  $('q').addEventListener('input', () => show('input'));
+</script>
+</body>
+</html>

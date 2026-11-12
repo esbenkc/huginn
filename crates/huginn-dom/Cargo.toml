@@ -1,0 +1,12 @@
+[package]
+name = "huginn-dom"
+description = "Arena DOM and html5ever tree sink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+html5ever.workspace = true
+markup5ever.workspace = true

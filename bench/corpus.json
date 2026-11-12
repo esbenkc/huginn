@@ -1,0 +1,16 @@
+[
+  {"name": "plain",       "port": 8101, "kind": "plain HTML, no JS",            "url": "https://motherfuckingwebsite.com/"},
+  {"name": "hackernews",  "port": 8102, "kind": "simple tables, tiny JS",       "url": "https://news.ycombinator.com/"},
+  {"name": "craigslist",  "port": 8103, "kind": "long server-rendered list",     "url": "https://www.craigslist.org/about/sites"},
+  {"name": "wikipedia",   "port": 8104, "kind": "long article, light JS",       "url": "https://en.wikipedia.org/wiki/Web_browser"},
+  {"name": "mdn",         "port": 8105, "kind": "docs article, medium JS",      "url": "https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/div"},
+  {"name": "github",      "port": 8106, "kind": "repo README, heavy CSS + JS",  "url": "https://github.com/servo/servo"},
+  {"name": "docsrs",      "port": 8107, "kind": "rustdoc crate page",           "url": "https://docs.rs/serde/latest/serde/"},
+  {"name": "rustbook",    "port": 8108, "kind": "mdBook chapter, light JS",     "url": "https://doc.rust-lang.org/book/ch01-00-getting-started.html"},
+  {"name": "kranblog",    "port": 8109, "kind": "personal blog home",           "url": "https://blog.kran.ai/"},
+  {"name": "kranpost",    "port": 8110, "kind": "personal blog post",           "url": "https://blog.kran.ai/the-ai-bubble"},
+  {"name": "juniper",     "port": 8111, "kind": "small company landing page",   "url": "https://juniper.xyz/"},
+  {"name": "bbc",         "port": 8112, "kind": "news article, heavy JS",       "url": "https://www.bbc.com/news/articles/c3x298n87rn2o"},
+  {"name": "tailwind",    "port": 8113, "kind": "CSS-heavy landing page",       "url": "https://tailwindcss.com/"},
+  {"name": "todomvc",     "port": 8114, "kind": "client-rendered React app",    "url": "https://todomvc.com/examples/react/dist/"}
+]

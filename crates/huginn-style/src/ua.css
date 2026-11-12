@@ -1,0 +1,201 @@
+/* Huginn user-agent stylesheet.
+   Written from the "Rendering" section of the HTML Standard
+   (https://html.spec.whatwg.org/multipage/rendering.html), with values that
+   match Chrome's defaults where Chrome differs, for what Huginn renders.
+   Parsed by Stylo. */
+
+html, address, blockquote, body, center, dialog, div, figure, figcaption,
+footer, form, header, hr, legend, listing, main, p, plaintext, pre, search,
+xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, nav, section,
+dl, dd, dt, ol, ul, menu, dir, details, summary, fieldset, optgroup, option,
+frameset, frame {
+  display: block;
+}
+
+[hidden]:not([hidden=until-found i]), area, base, basefont, datalist, head, link, meta,
+noembed, noframes, param, rp, script, style, template, title,
+dialog:not([open]) {
+  display: none;
+}
+
+/* huginn-dom parses with scripting enabled (html5ever's default, and what Chrome
+   does), so <noscript> holds raw text that must never render. */
+noscript { display: none !important; }
+
+input[type=hidden i] { display: none !important; }
+
+slot { display: contents; }
+
+html { color: black; }
+body { margin: 8px; }
+
+address, blockquote, center, dialog, div, figure, figcaption, footer, form,
+header, hr, legend, listing, main, p, plaintext, pre, search, xmp {
+  margin-block: 0;
+}
+
+p, blockquote, figure, listing, plaintext, pre, xmp, dl {
+  margin-block: 1em;
+}
+blockquote, figure { margin-inline: 40px; }
+dd { margin-inline-start: 40px; }
+
+address, cite, dfn, em, i, var { font-style: italic; }
+b, strong { font-weight: bolder; }
+code, kbd, pre, samp, tt, listing, plaintext, xmp { font-family: monospace; }
+pre, listing, plaintext, xmp { white-space: pre; }
+big { font-size: larger; }
+small { font-size: smaller; }
+sub { vertical-align: sub; font-size: smaller; }
+sup { vertical-align: super; font-size: smaller; }
+s, strike, del { text-decoration: line-through; }
+u, ins { text-decoration: underline; }
+abbr[title], acronym[title] { text-decoration: dotted underline; }
+mark { background-color: #ffff00; color: black; }
+center { text-align: -webkit-center; }
+nobr { white-space: nowrap; }
+q::before { content: open-quote; }
+q::after { content: close-quote; }
+bdi, output { unicode-bidi: isolate; }
+bdo { unicode-bidi: bidi-override; }
+
+a:any-link { color: #0000ee; text-decoration: underline; cursor: pointer; }
+
+h1 { margin-block: 0.67em; font-size: 2em; font-weight: bold; }
+h2 { margin-block: 0.83em; font-size: 1.5em; font-weight: bold; }
+h3 { margin-block: 1em; font-size: 1.17em; font-weight: bold; }
+h4 { margin-block: 1.33em; font-size: 1em; font-weight: bold; }
+h5 { margin-block: 1.67em; font-size: 0.83em; font-weight: bold; }
+h6 { margin-block: 2.33em; font-size: 0.67em; font-weight: bold; }
+
+/* Chrome shrinks h1 inside sectioning elements. */
+:is(article, aside, nav, section) h1 { margin-block: 0.83em; font-size: 1.5em; }
+:is(article, aside, nav, section) :is(article, aside, nav, section) h1 { margin-block: 1em; font-size: 1.17em; }
+
+dir, dd, dl, dt, menu, ol, ul { display: block; }
+li { display: list-item; text-align: match-parent; }
+dir, menu, ol, ul { margin-block: 1em; padding-inline-start: 40px; }
+dir, menu, ul { list-style-type: disc; }
+ol { list-style-type: decimal; }
+:is(dir, dl, menu, ol, ul) :is(dir, dl, menu, ol, ul) { margin-block: 0; }
+:is(dir, menu, ol, ul) :is(dir, menu, ul) { list-style-type: circle; }
+:is(dir, menu, ol, ul) :is(dir, menu, ol, ul) :is(dir, menu, ul) { list-style-type: square; }
+
+table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box; text-indent: initial; border-color: gray; }
+caption { display: table-caption; text-align: -webkit-center; }
+colgroup { display: table-column-group; }
+col { display: table-column; }
+thead { display: table-header-group; vertical-align: middle; border-color: inherit; }
+tbody { display: table-row-group; vertical-align: middle; border-color: inherit; }
+tfoot { display: table-footer-group; vertical-align: middle; border-color: inherit; }
+tr { display: table-row; vertical-align: inherit; border-color: inherit; }
+td, th { display: table-cell; vertical-align: inherit; padding: 1px; }
+th { font-weight: bold; text-align: -webkit-center; }
+
+hr {
+  color: gray;
+  border-style: inset;
+  border-width: 1px;
+  margin-block: 0.5em;
+  margin-inline: auto;
+  overflow: hidden;
+}
+
+fieldset {
+  margin-inline: 2px;
+  border: 2px groove rgb(192, 192, 192);
+  padding-block: 0.35em 0.625em;
+  padding-inline: 0.75em;
+  min-inline-size: min-content;
+}
+legend { padding-inline: 2px; }
+
+details > summary:first-of-type { display: list-item; list-style: disclosure-closed inside; }
+details[open] > summary:first-of-type { list-style-type: disclosure-open; }
+
+img, video, canvas, svg, iframe, embed, object, audio { display: inline; }
+iframe { border: 2px inset; }
+video { object-fit: contain; }
+svg:not(:root) { overflow: hidden; }
+marquee { display: inline-block; }
+
+/* Form controls (Chrome on macOS, light scheme). */
+input, select, button, textarea, meter, progress {
+  display: inline-block;
+}
+input, select, textarea, button {
+  font-family: system-ui;
+  font-size: 13.333px;
+  font-weight: normal;
+  font-style: normal;
+  letter-spacing: normal;
+  word-spacing: normal;
+  line-height: normal;
+  text-transform: none;
+  text-indent: 0;
+  text-shadow: none;
+  text-align: start;
+  color: black;
+}
+input {
+  padding: 1px 2px;
+  border: 2px inset rgb(118, 118, 118);
+  background-color: white;
+}
+/* Checkboxes and radio buttons drawn like Chrome's light controls: a grey
+   frame, filled with the accent blue when checked. */
+input:is([type=checkbox i], [type=radio i]) {
+  box-sizing: border-box;
+  margin: 3px 3px 3px 4px;
+  padding: 0;
+  border: 1px solid rgb(118, 118, 118);
+  border-radius: 2px;
+  background-color: white;
+  width: 13px;
+  height: 13px;
+}
+input[type=radio i] { border-radius: 50%; margin: 3px 3px 0 5px; }
+input[type=checkbox i]:checked {
+  border-color: rgb(0, 117, 255);
+  background: rgb(0, 117, 255) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 11 11'%3E%3Cpath d='M2.2 5.7 4.4 7.9 8.9 3.2' fill='none' stroke='white' stroke-width='1.8'/%3E%3C/svg%3E") no-repeat;
+}
+input[type=radio i]:checked {
+  border-color: rgb(0, 117, 255);
+  background: radial-gradient(circle, rgb(0, 117, 255) 3.5px, white 4px);
+}
+input:is([type=button i], [type=submit i], [type=reset i]), button {
+  padding: 1px 6px;
+  border: 2px outset rgb(118, 118, 118);
+  background-color: rgb(239, 239, 239);
+  text-align: center;
+  box-sizing: border-box;
+  border-radius: 0;
+}
+textarea {
+  font-family: monospace;
+  white-space: pre-wrap;
+  padding: 2px;
+  border: 1px solid rgb(118, 118, 118);
+  background-color: white;
+}
+/* A drop-down shows its selected option (huginn-layout) and a chevron. */
+select {
+  box-sizing: border-box;
+  border: 1px solid rgb(118, 118, 118);
+  border-radius: 0;
+  padding-right: 20px;
+  background: white url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23333' stroke-width='1.4'/%3E%3C/svg%3E") no-repeat right 6px center;
+}
+select:not([multiple]) > option, select:not([multiple]) > optgroup { display: none; }
+option { font-weight: normal; padding-inline: 2px; min-block-size: 1.2em; }
+
+/* Keyboard focus ring (Chrome: `outline: auto 1px -webkit-focus-ring-color`,
+   drawn as a 2 px dark ring). Text fields focused by a script show it too. */
+:focus-visible { outline: 2px solid rgb(16, 16, 16); outline-offset: 1px; }
+input:focus-visible, textarea:focus-visible, select:focus-visible { outline-offset: 0; }
+
+ruby { display: inline; }
+rt { font-size: 50%; }
+
+[dir=rtl i] { direction: rtl; }
+[dir=ltr i] { direction: ltr; }

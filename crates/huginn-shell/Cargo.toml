@@ -1,0 +1,35 @@
+[package]
+name = "huginn-shell"
+description = "The huginn binary: render and open"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "huginn"
+path = "src/main.rs"
+
+[features]
+# Run page scripts with V8 (see huginn-js). On by default; build with
+# `--no-default-features` for a browser that never runs scripts.
+default = ["v8"]
+v8 = ["huginn-js/v8"]
+
+[dependencies]
+huginn-dom.workspace = true
+huginn-style.workspace = true
+huginn-layout.workspace = true
+huginn-paint.workspace = true
+huginn-net.workspace = true
+huginn-js.workspace = true
+url.workspace = true
+serde_json.workspace = true
+winit.workspace = true
+softbuffer.workspace = true
+miniz_oxide.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+png.workspace = true
