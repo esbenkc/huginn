@@ -670,6 +670,39 @@ mod tests {
     }
 
     #[test]
+    fn transparent_gradient_layer_shows_the_layer_under_it() {
+        // The sprite idiom: a transparent gradient over the image. The image
+        // layer is drawn with its own position and repeat.
+        let s = style_of(
+            ".s { background-image: linear-gradient(transparent, transparent), url(sprite.svg);
+                  background-repeat: repeat, no-repeat; background-position: 5px 6px, 0 -304px }",
+            "<span id=s class=s>x</span>",
+            "s",
+        );
+        assert_eq!(
+            s.background_image,
+            Some(BackgroundImage::Url(Arc::from("file:///t/sprite.svg")))
+        );
+        assert_eq!(s.background_repeat, BackgroundRepeat::NoRepeat);
+        assert_eq!(
+            s.background_position,
+            (LengthPercentage::Px(0.0), LengthPercentage::Px(-304.0))
+        );
+        // A gradient that paints is the top layer; a single-value list repeats.
+        let s = style_of(
+            ".s { background-image: linear-gradient(red, transparent), url(a.png);
+                  background-repeat: no-repeat }",
+            "<span id=s class=s>x</span>",
+            "s",
+        );
+        assert!(matches!(
+            s.background_image,
+            Some(BackgroundImage::LinearGradient(_))
+        ));
+        assert_eq!(s.background_repeat, BackgroundRepeat::NoRepeat);
+    }
+
+    #[test]
     fn inheritance_and_ua_defaults() {
         let s = style_of(
             "body { color: rgb(1, 2, 3) }",

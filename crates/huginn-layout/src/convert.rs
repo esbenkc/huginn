@@ -359,7 +359,7 @@ fn breadth_min(b: TrackBreadth) -> tf::MinTrackSizingFunction {
             tf::MinTrackSizingFunction::length(c.px)
         }
         TrackBreadth::Length(LengthPercentage::Calc(c)) => {
-            tf::MinTrackSizingFunction::percent(c.percent / 100.0)
+            tf::MinTrackSizingFunction::calc(calc_handle(c))
         }
         // A flexible minimum is invalid CSS; `auto` is the closest.
         TrackBreadth::Fr(_) | TrackBreadth::Auto => tf::MinTrackSizingFunction::auto(),
@@ -378,7 +378,7 @@ fn breadth_max(b: TrackBreadth) -> tf::MaxTrackSizingFunction {
             tf::MaxTrackSizingFunction::length(c.px)
         }
         TrackBreadth::Length(LengthPercentage::Calc(c)) => {
-            tf::MaxTrackSizingFunction::percent(c.percent / 100.0)
+            tf::MaxTrackSizingFunction::calc(calc_handle(c))
         }
         TrackBreadth::Fr(f) => tf::MaxTrackSizingFunction::fr(f),
         TrackBreadth::Auto => tf::MaxTrackSizingFunction::auto(),

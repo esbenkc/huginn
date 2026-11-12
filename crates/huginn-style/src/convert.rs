@@ -280,6 +280,16 @@ fn image_layer(cx: &Cx, img: &c::Image, s: &ComputedValues) -> Option<Background
     }
 }
 
+/// A gradient whose color stops are all fully transparent paints nothing.
+fn is_transparent(l: &BackgroundImage) -> bool {
+    match l {
+        BackgroundImage::LinearGradient(g) | BackgroundImage::RadialGradient(g) => {
+            g.stops.iter().all(|s| s.color.a == 0)
+        }
+        BackgroundImage::Url(_) => false,
+    }
+}
+
 /// `background-repeat` / `mask-repeat` (first layer).
 fn repeat(r: Option<&c::BackgroundRepeat>) -> BackgroundRepeat {
     use style::values::specified::background::BackgroundRepeatKeyword as K;
@@ -519,6 +529,23 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
     let list = s.get_list();
 
     let resolve = |col: &c::Color| color(&s.resolve_color(col));
+    // The topmost background layer that paints something. A gradient whose
+    // stops are all transparent draws nothing (the common
+    // `linear-gradient(transparent, transparent), url(sprite.svg)` fallback),
+    // so the layer under it shows. Its repeat, size and position are the
+    // entries for that layer; shorter lists repeat (CSS Backgrounds 3, 2.2).
+    let (bg_layer, bg_image) = bg
+        .background_image
+        .0
+        .iter()
+        .enumerate()
+        .find_map(|(i, img)| {
+            image_layer(cx, img, s)
+                .filter(|l| !is_transparent(l))
+                .map(|l| (i, Some(l)))
+        })
+        .unwrap_or((0, None));
+    let nth = |len: usize| (len > 0).then(|| bg_layer % len);
 
     let mut out = ComputedStyle {
         display: display(bx.display),
@@ -615,12 +642,10 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
             bottom_left: cx.lp(&border.border_bottom_left_radius.0.width.0),
         },
         background_color: resolve(&bg.background_color),
-        background_image: bg
-            .background_image
-            .0
-            .iter()
-            .find_map(|img| image_layer(cx, img, s)),
-        background_repeat: repeat(bg.background_repeat.0.first()),
+        background_image: bg_image,
+        background_repeat: repeat(
+            nth(bg.background_repeat.0.len()).map(|i| &bg.background_repeat.0[i]),
+        ),
         mask: {
             let svg = s.get_svg();
             svg.mask_image
@@ -757,16 +782,17 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
         text_decoration_color: resolve(&text.text_decoration_color),
         vertical_align: vertical_align(s),
         content: Content::None,
-        background_size: size(cx, bg.background_size.0.first()),
+        background_size: size(
+            cx,
+            nth(bg.background_size.0.len()).map(|i| &bg.background_size.0[i]),
+        ),
         background_position: (
-            bg.background_position_x
-                .0
-                .first()
-                .map_or(LengthPercentage::Percent(0.0), |x| cx.lp(x)),
-            bg.background_position_y
-                .0
-                .first()
-                .map_or(LengthPercentage::Percent(0.0), |y| cx.lp(y)),
+            nth(bg.background_position_x.0.len()).map_or(LengthPercentage::Percent(0.0), |i| {
+                cx.lp(&bg.background_position_x.0[i])
+            }),
+            nth(bg.background_position_y.0.len()).map_or(LengthPercentage::Percent(0.0), |i| {
+                cx.lp(&bg.background_position_y.0[i])
+            }),
         ),
         box_shadow: {
             let list = &effects.box_shadow.0;

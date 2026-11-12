@@ -522,6 +522,12 @@ impl Builder<'_, '_> {
                 }
             }
             self.flush_run(&mut run, &style, decor, &mut children);
+            if matches!(
+                style.display,
+                Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid
+            ) {
+                self.apply_order(&mut children);
+            }
             self.container(node, style.clone(), children)
         };
         if let Some(text) = marker
@@ -540,6 +546,28 @@ impl Builder<'_, '_> {
             self.wrap_button_content(id);
         }
         id
+    }
+
+    /// CSS Flexbox 1, section 5.4 (and CSS Grid 1, section 4): flex and grid
+    /// items are laid out and painted in "order-modified document order",
+    /// a stable sort by `order`. Out-of-flow children are not items: they
+    /// keep their places, so positioned boxes still paint in tree order.
+    fn apply_order(&self, children: &mut [tf::NodeId]) {
+        let key = |id: tf::NodeId| {
+            let s = &self.tree.node(id).style;
+            (!is_out_of_flow(s)).then_some(s.order)
+        };
+        if children.iter().all(|&c| key(c).is_none_or(|o| o == 0)) {
+            return;
+        }
+        let slots: Vec<usize> = (0..children.len())
+            .filter(|&i| key(children[i]).is_some())
+            .collect();
+        let mut items: Vec<tf::NodeId> = slots.iter().map(|&i| children[i]).collect();
+        items.sort_by_key(|&c| key(c));
+        for (slot, item) in slots.into_iter().zip(items) {
+            children[slot] = item;
+        }
     }
 
     /// HTML 15.5.4 (button layout): the content of a button goes in an

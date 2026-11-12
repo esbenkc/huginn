@@ -47,18 +47,34 @@ where
         }
         SizingMode::InherentSize => {
             let aspect_ratio = style.aspect_ratio();
-            let style_size = style
-                .size()
-                .maybe_resolve(parent_size, &resolve_calc_value)
-                .maybe_apply_aspect_ratio(aspect_ratio)
-                .maybe_add(box_sizing_adjustment);
-            let style_min_size = style
-                .min_size()
-                .maybe_resolve(parent_size, &resolve_calc_value)
-                .maybe_apply_aspect_ratio(aspect_ratio)
-                .maybe_add(box_sizing_adjustment);
-            let style_max_size =
-                style.max_size().maybe_resolve(parent_size, &resolve_calc_value).maybe_add(box_sizing_adjustment);
+            let raw_size = style.size().maybe_resolve(parent_size, &resolve_calc_value);
+            let raw_min_size = style.min_size().maybe_resolve(parent_size, &resolve_calc_value);
+            let raw_max_size = style.max_size().maybe_resolve(parent_size, &resolve_calc_value);
+            // huginn: the ratio transfers the *used* size of the definite axis, after its
+            // min/max clamp (CSS Sizing 4, section 5.1): `width: 720px; max-width: 100%;
+            // height: auto` in a 182px box is 182 x 102, not 182 x 405.
+            let raw_size = match aspect_ratio {
+                Some(ratio) => Size {
+                    width: raw_size.width.or_else(|| {
+                        raw_size.height.map(|h| h.maybe_clamp(raw_min_size.height, raw_max_size.height) * ratio)
+                    }),
+                    height: raw_size.height.or_else(|| {
+                        raw_size.width.map(|w| w.maybe_clamp(raw_min_size.width, raw_max_size.width) / ratio)
+                    }),
+                },
+                None => raw_size,
+            };
+            let style_size = raw_size.maybe_add(box_sizing_adjustment);
+            // huginn: a minimum transferred through the ratio is capped by the maximum of its
+            // axis (CSS Sizing 4, section 5.1): `min-height: 200px; max-width: 100%` does not
+            // widen an image past its container.
+            let transferred_min = raw_min_size.maybe_apply_aspect_ratio(aspect_ratio);
+            let style_min_size = Size {
+                width: raw_min_size.width.or(transferred_min.width.maybe_min(raw_max_size.width)),
+                height: raw_min_size.height.or(transferred_min.height.maybe_min(raw_max_size.height)),
+            }
+            .maybe_add(box_sizing_adjustment);
+            let style_max_size = raw_max_size.maybe_add(box_sizing_adjustment);
 
             let node_size = known_dimensions.or(style_size);
             (node_size, style_min_size, style_max_size, aspect_ratio)

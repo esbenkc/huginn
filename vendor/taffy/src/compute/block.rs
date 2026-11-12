@@ -1087,9 +1087,14 @@ fn determine_content_based_container_width(
                 if item.is_in_same_bfc { Line::TRUE } else { Line::FALSE },
             )
         });
-        // huginn: compressible replaced elements under a min-content constraint.
-        let width = match (available_width, item.min_content_width_cap) {
+        // huginn: compressible replaced elements under a min-content constraint. Under a
+        // definite one their contribution is fit-content, whose min-content is the capped
+        // width: a `width: 100%` image does not widen a shrink-to-fit box past the space.
+        let width = match (available_width.maybe_sub(item_x_margin_sum), item.min_content_width_cap) {
             (AvailableSpace::MinContent, Some((cap, floor))) => width.min(cap).max(floor),
+            (AvailableSpace::Definite(available), Some((cap, floor))) => {
+                width.min(available.max(width.min(cap).max(floor)))
+            }
             _ => width,
         };
 

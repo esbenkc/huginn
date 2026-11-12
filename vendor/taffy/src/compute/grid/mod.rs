@@ -433,7 +433,53 @@ pub fn compute_grid_layout<Tree: LayoutGridContainer>(
         },
         has_baseline_aligned_item,
     );
-    let initial_column_sum = columns.iter().map(|track| track.base_size).sum::<f32>();
+    let mut initial_column_sum = columns.iter().map(|track| track.base_size).sum::<f32>();
+
+    // huginn: an auto-width grid container in a definite available width (a float, an
+    // absolutely positioned box, a grid item with auto margins) is fit-content sized:
+    // min(max-content, max(min-content, available)). The pass above found the max-content
+    // width (flexible tracks expand to their content). If that overflows, size the columns
+    // under a min-content constraint, then again with the container's width fixed at the
+    // fit-content width, so `1fr` tracks fill the space instead of overflowing it.
+    if let (None, AvailableSpace::Definite(available)) = (inner_node_size.width, available_grid_space.width) {
+        if initial_column_sum > available + 0.01 {
+            let clear_width_caches = |items: &mut [GridItem]| {
+                items.iter_mut().for_each(|item| {
+                    item.grid_area_size_cache = None;
+                    item.min_content_contribution_cache.width = None;
+                    item.max_content_contribution_cache.width = None;
+                    item.minimum_contribution_cache.width = None;
+                })
+            };
+            let mut size_columns = |tree: &mut Tree, items: &mut [GridItem], space, inner| {
+                clear_width_caches(items);
+                track_sizing_algorithm(
+                    tree,
+                    AbstractAxis::Inline,
+                    inner_min_size.get(AbstractAxis::Inline),
+                    inner_max_size.get(AbstractAxis::Inline),
+                    justify_content,
+                    align_content,
+                    space,
+                    inner,
+                    &mut columns,
+                    &mut rows,
+                    items,
+                    |track: &GridTrack, parent_size: Option<f32>, tree: &Tree| {
+                        track.max_track_sizing_function.definite_value(parent_size, |val, basis| tree.calc(val, basis))
+                    },
+                    has_baseline_aligned_item,
+                );
+                columns.iter().map(|track| track.base_size).sum::<f32>()
+            };
+            let min_content_space = Size { width: AvailableSpace::MinContent, ..available_grid_space };
+            let min_content_width = size_columns(tree, &mut items, min_content_space, inner_node_size);
+            let width = f32_max(min_content_width, available)
+                .maybe_clamp(inner_min_size.width, inner_max_size.width);
+            inner_node_size.width = Some(width);
+            initial_column_sum = size_columns(tree, &mut items, available_grid_space, inner_node_size);
+        }
+    }
     inner_node_size.width = inner_node_size.width.or_else(|| initial_column_sum.into());
 
     // If only the container's width has been requested then we can skip sizing the rows entirely (which avoids
