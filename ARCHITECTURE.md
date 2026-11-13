@@ -108,14 +108,14 @@ network; Linux only, `null` elsewhere). `--no-js` (or `HUGINN_NO_JS=1`) turns sc
 The browser is called **Huginn** in everything a user sees (window titles,
 `huginn://` pages), and the binary is `huginn`.
 
-Files: `window.rs` (winit and softbuffer, one native window per browser
+Files: `window.rs` (winit and softbuffer, or `glass.rs` on macOS, one native window per browser
 window), `session.rs` (all windows and what they share), `browser.rs` (one
 window: tabs, tab strip, toolbar, input routing, frame), `tab.rs` (one tab:
 engine thread, history, page layer, zoom, discarding), `tabstrip.rs`,
 `toolbar.rs`, `shortcuts.rs` (window chords), `internal_pages.rs`
 (`huginn://newtab`, `history`, `bookmarks`, address bar input), `engine.rs`
 (the per-tab engine thread), `headless.rs` (the command driver), `input.rs`,
-`ui.rs`, `clipboard.rs`. In-page modules plug in through fixed hooks:
+`ui.rs`, `theme.rs` (colours, font stack, the acrylic material), `clipboard.rs`. In-page modules plug in through fixed hooks:
 `interact/` (selection, find, focus, menus, save, print) and `live.rs` (live
 JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
 
@@ -150,17 +150,38 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
   pipeline (`ui::render_snippet`) with the window's own `LayoutEngine`,
   rendered again only when what they show changes. The strip is in the
   title bar area (transparent title bar, full-size content view, room for
-  the traffic lights): tabs with favicon (`<link rel=icon>` or
-  `/favicon.ico`, fetched once per session by a short thread; a CSS globe
-  otherwise), title and close button (active and hovered tabs), a + button.
-  Tabs shrink from 240 px to 36 px. Loading tabs show a blue spinner drawn
-  on top each animation frame. The toolbar has back, forward, reload (stop
-  while loading) and the address field with a lock (https), "Not secure"
-  (http), "File" or "Huginn" chip, the zoom level and a bookmark star.
-  Private windows have a dark strip and a "Private" badge.
+  the traffic lights): flat square tabs split by 1 px hairlines, with
+  favicon (`<link rel=icon>` or `/favicon.ico`, fetched once per session by
+  a short thread; an accent asterisk otherwise), monospace title and close
+  button (active and hovered tabs), a square + button. The active tab has a
+  2 px accent rule and no hairline under it. Tabs shrink from 240 px to
+  36 px. Loading tabs show a 2 x 2 square spinner that steps every 120 ms,
+  and a thin accent bar sweeps under the toolbar; both are drawn on top each
+  animation frame. The toolbar has back, forward, reload (stop while
+  loading) and the square address field with a dot (https), "NOT SECURE"
+  (http), "FILE" or "HUGINN" chip, the host brighter than scheme and path,
+  the zoom level and a bookmark star.
+- **Look.** "Forest Mono" (`theme.rs`): dark green, square, monospace (the
+  first installed of PP Neue Montreal Mono, ABC Diatype Mono, JetBrains Mono,
+  SF Mono, Menlo), a mint accent; private windows use a cool blue accent and
+  a "PRIVATE" badge. Menus, the `<select>` popup, the find bar, the status
+  bubble, internal pages, view-source and the error page share it. Web
+  pages are untouched.
 - **Display.** softbuffer hands each CPU frame to a `CALayer`. No GPU
   device is created. The event loop sleeps (`ControlFlow::Wait`); it only
   wakes on a timer while a spinner animates.
+- **Acrylic (macOS).** Unless `HUGINN_OPAQUE_UI=1`, the window is
+  transparent: an `NSVisualEffectView` (behind-window blur) sits under the
+  content view and `glass.rs` shows frames in its own `CALayer` as
+  premultiplied BGRA (softbuffer drops alpha). Frame pixels carry the
+  transparency in the top byte (`ui::Pixels`), so opaque pixels stay plain
+  0RGB. The strip and toolbar are one translucent slab over the blur with
+  a lit top edge, a dark bottom edge and faint electronics inside (traces,
+  chips, ribbon wires, one chartreuse part, one red LED), an SVG seeded by
+  the window size and rendered once per size. `huginn:` pages rasterize on
+  a transparent canvas, so the blur shows through them; the new tab page
+  puts its mark in an acrylic slab. Headless runs and Linux use the opaque
+  look.
 - **Internal pages.** `huginn://newtab` (wordmark and tiles of bookmarks and
   recent sites), `huginn://history` (this session's visits of normal
   windows), `huginn://bookmarks`. The UI makes their HTML; the engine loads
