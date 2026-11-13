@@ -15,7 +15,10 @@
 //!
 //! On platforms other than macOS, the full system collection is used (on
 //! Linux: fontconfig's fonts, generic families and fallbacks), and the
-//! macOS-only parts of Blink's metrics (the ascent hack) are off.
+//! macOS-only parts of Blink's metrics (the ascent hack) are off. On Linux a
+//! generic family is fontconfig's first few matches, and a character they
+//! lack comes from the fallback list of its script (the vendored Fontique,
+//! `vendor/fontique/HUGINN.md`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

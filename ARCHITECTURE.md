@@ -457,7 +457,7 @@ Versions are the ones in `Cargo.lock`.
 | markup5ever / web_atoms | 0.40.0 / 0.3.0 | huginn-dom, huginn-style | Interned names and the `TreeSink` interface. Same atoms as Stylo 0.24. |
 | cssparser | 0.38.0 | huginn-style | Servo's CSS tokenizer and parser toolkit. Same major version as Stylo 0.24. |
 | taffy | 0.15.1 | huginn-layout | Block, flex, grid and float layout. Also used by Blitz and Bevy. Features: `block_layout`, `flexbox`, `grid`, `float_layout`, `calc`, `content_size`. |
-| parley (fontique, harfrust, skrifa) | 0.12.0 | huginn-layout | Text shaping, bidi, line breaking, font fallback and system font discovery (CoreText on macOS). |
+| parley (fontique, harfrust, skrifa) | 0.12.0 | huginn-layout | Text shaping, bidi, line breaking, font fallback and system font discovery (CoreText on macOS, fontconfig on Linux). Fontique is vendored with a change to its fontconfig backend: `vendor/fontique/HUGINN.md`. |
 | vello_cpu / vello_common | 0.4.0 | huginn-paint, huginn-net | CPU vector rasterizer from the Linebender project. Paths, rounded rects, clips, glyphs, images. No GPU needed for headless screenshots. |
 | png | 0.18.1 | huginn-paint | PNG encoding, fast compression. |
 | image | 0.25.10 | huginn-net | PNG, JPEG, GIF, WebP, BMP and ICO decoding, and the area-average downscale for big images shown small. |

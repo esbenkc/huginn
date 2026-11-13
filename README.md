@@ -129,7 +129,7 @@ Missing or incomplete:
 - **No sandbox and no site isolation.** Pages run in the same process as the
   browser. Do not use Huginn where security matters.
 - macOS on Apple silicon and Linux on x86-64 only. On Linux, font discovery
-  is not lazy yet (each start scans the system fonts, tens of ms).
+  is not lazy yet (each start loads fontconfig's font list, about 13 ms).
 - No developer tools, extensions, settings page or bookmarks bar.
 - No CSS animations or transitions, no `@container`, no `@media print`.
 - Style and layout run in full after each change, not incrementally.
