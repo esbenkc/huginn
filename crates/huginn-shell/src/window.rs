@@ -203,27 +203,24 @@ impl App {
             el.create_window(attrs)
                 .map_err(|e| format!("cannot create window: {e}"))?,
         );
-        #[cfg(target_os = "macos")]
-        let glass = crate::theme::material();
-        #[cfg(not(target_os = "macos"))]
-        let glass = false;
-        let surface = if glass {
-            #[cfg(target_os = "macos")]
-            {
-                Surface::Glass(crate::glass::GlassSurface::new(&window)?)
-            }
-            #[cfg(not(target_os = "macos"))]
-            unreachable!("the material is macOS only")
-        } else {
+        let soft = |window: &Rc<Window>| -> Result<Surface, String> {
             let context =
                 softbuffer::Context::new(window.clone()).map_err(|e| format!("softbuffer: {e}"))?;
             let surface = softbuffer::Surface::new(&context, window.clone())
                 .map_err(|e| format!("softbuffer: {e}"))?;
-            Surface::Soft {
+            Ok(Surface::Soft {
                 surface,
                 _context: context,
-            }
+            })
         };
+        #[cfg(target_os = "macos")]
+        let surface = if crate::theme::material() {
+            Surface::Glass(crate::glass::GlassSurface::new(&window)?)
+        } else {
+            soft(&window)?
+        };
+        #[cfg(not(target_os = "macos"))]
+        let surface = soft(&window)?;
         let mut win = Win {
             surface,
             window,
