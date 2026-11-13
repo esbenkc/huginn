@@ -322,7 +322,7 @@ pub(crate) fn text_align(a: TextAlign) -> parley::Alignment {
 }
 
 /// Text decorations in effect, propagated from decorating ancestors.
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub(crate) struct Decor {
     pub underline: Option<Color>,
     pub line_through: Option<Color>,

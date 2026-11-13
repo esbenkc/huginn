@@ -314,6 +314,9 @@ impl LayoutEngine {
     pub fn layout(&mut self, input: &LayoutInput<'_>) -> LayoutTree;
     /// Also build `LayoutTree::text_index` (off by default; the window turns it on).
     pub fn set_text_index(&mut self, on: bool);
+    /// Keep the shaped text of each pass for the next one (off by default; the
+    /// window turns it on). The result of `layout` is the same with it on or off.
+    pub fn set_shape_cache(&mut self, on: bool);
 }
 
 pub struct BoxId(pub u32);                   // index into LayoutTree::boxes

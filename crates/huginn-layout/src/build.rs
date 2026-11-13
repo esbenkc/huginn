@@ -101,6 +101,18 @@ pub(crate) fn layout(engine: &mut LayoutEngine, input: &LayoutInput<'_>) -> Layo
         },
     );
     crate::emit::emit(&mut b.tree, root, input, &mut out);
+    if let Some(shapes) = &mut b.engine.shapes {
+        // Give the shaped text of this pass to the next one.
+        for n in &mut b.tree.nodes {
+            if let Kind::Ifc(ifc) = &mut n.kind
+                && let Some(ticket) = ifc.shape.take()
+            {
+                let layout = std::mem::take(&mut ifc.layout);
+                shapes.give(ticket, layout, ifc.text.take());
+            }
+        }
+        shapes.end_pass();
+    }
     if let Some(index) = &mut out.text_index {
         // Kept for the page's lifetime: no growth slack.
         index.text.shrink_to_fit();
@@ -868,15 +880,29 @@ impl Builder<'_, '_> {
             fonts,
             text: lcx,
             text_index,
-            ..
+            shapes,
         } = &mut *self.engine;
         let keep_text = *text_index;
-        let mut tb = lcx.tree_builder(&mut fonts.ctx, 1.0, true, &root_ts);
+        // The same text with the same styles and fonts as in the last pass:
+        // take its shaped layout and skip the text builder (`shape.rs`).
+        let mut cached = None;
+        let mut ticket = None;
+        if let Some(shapes) = shapes.as_mut() {
+            let (key, sig) = shape_key(doc, &evs, &style, decor);
+            let (hit, t) = shapes.take(key, sig, fonts.epoch, keep_text);
+            cached = hit;
+            ticket = Some(t);
+        }
+        let mut tb = cached
+            .is_none()
+            .then(|| lcx.tree_builder(&mut fonts.ctx, 1.0, true, &root_ts));
         // Soft wrap opportunities as in Chrome: Blink decides pairs of
         // printable ASCII characters with its own table (no break after '/'
         // in a URL or path, but after '-' and '?') and breaks after every
         // space run; UAX #14 decides the rest.
-        tb.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
+        if let Some(tb) = &mut tb {
+            tb.set_line_break_override(Some(parley::CHROMIUM_LINE_BREAK_OVERRIDE));
+        }
         // (span index, decorations in effect)
         let mut stack: Vec<(u32, Decor)> = vec![(0, decor)];
         let mut next_atomic = 0usize;
@@ -898,14 +924,18 @@ impl Builder<'_, '_> {
                         opacity,
                     });
                     let d = cur_decor.extend(s);
-                    let opsz = optical_sizing(s);
-                    let mut ts = text_style(s, &d, fam, lh.0, si, false, &opsz);
-                    if opacity < 1.0 {
-                        fade(&mut ts, opacity);
+                    if let Some(tb) = &mut tb {
+                        let opsz = optical_sizing(s);
+                        let mut ts = text_style(s, &d, fam, lh.0, si, false, &opsz);
+                        if opacity < 1.0 {
+                            fade(&mut ts, opacity);
+                        }
+                        tb.push_style_span(ts);
                     }
-                    tb.push_style_span(ts);
                     if span_has_edges(s).0 {
-                        tb.push_inline_box(spacer(items.len()));
+                        if let Some(tb) = &mut tb {
+                            tb.push_inline_box(spacer(items.len()));
+                        }
                         items.push(IItem::SpanStart(si));
                     }
                     stack.push((si, d));
@@ -913,24 +943,36 @@ impl Builder<'_, '_> {
                 Ev::Close => {
                     let s = &spans[cur as usize].style;
                     if span_has_edges(s).1 {
-                        tb.push_inline_box(spacer(items.len()));
+                        if let Some(tb) = &mut tb {
+                            tb.push_inline_box(spacer(items.len()));
+                        }
                         items.push(IItem::SpanEnd(cur));
                     }
-                    tb.pop_style_span();
+                    if let Some(tb) = &mut tb {
+                        tb.pop_style_span();
+                    }
                     stack.pop();
                 }
                 Ev::Text(n) => {
-                    let t = doc.text(*n).unwrap_or("");
-                    push_transformed(&mut tb, t, spans[cur as usize].style.text_transform);
+                    if let Some(tb) = &mut tb {
+                        let t = doc.text(*n).unwrap_or("");
+                        push_transformed(tb, t, spans[cur as usize].style.text_transform);
+                    }
                 }
-                Ev::Str(t, s) => push_transformed(&mut tb, t, s.text_transform),
+                Ev::Str(t, s) => {
+                    if let Some(tb) = &mut tb {
+                        push_transformed(tb, t, s.text_transform);
+                    }
+                }
                 Ev::Br(s) => {
-                    let opsz = optical_sizing(s);
-                    let mut ts = text_style(s, &cur_decor, fam, lh.0, cur, false, &opsz);
-                    ts.white_space_collapse = parley::WhiteSpaceCollapse::Preserve;
-                    tb.push_style_span(ts);
-                    tb.push_text("\n");
-                    tb.pop_style_span();
+                    if let Some(tb) = &mut tb {
+                        let opsz = optical_sizing(s);
+                        let mut ts = text_style(s, &cur_decor, fam, lh.0, cur, false, &opsz);
+                        ts.white_space_collapse = parley::WhiteSpaceCollapse::Preserve;
+                        tb.push_style_span(ts);
+                        tb.push_text("\n");
+                        tb.pop_style_span();
+                    }
                 }
                 Ev::Atomic(_, s) => {
                     let child = atomic_ids[next_atomic];
@@ -950,15 +992,17 @@ impl Builder<'_, '_> {
                             k = sp.parent;
                         }
                     }
-                    tb.push_inline_box(parley::InlineBox {
-                        id: items.len() as u64,
-                        kind: parley::InlineBoxKind::InFlow,
-                        index: 0,
-                        width: 0.0,
-                        height: 0.0,
-                        baseline: None,
-                        vertical_align: vertical_align(s.vertical_align),
-                    });
+                    if let Some(tb) = &mut tb {
+                        tb.push_inline_box(parley::InlineBox {
+                            id: items.len() as u64,
+                            kind: parley::InlineBoxKind::InFlow,
+                            index: 0,
+                            width: 0.0,
+                            height: 0.0,
+                            baseline: None,
+                            vertical_align: vertical_align(s.vertical_align),
+                        });
+                    }
                     items.push(IItem::Atomic {
                         child,
                         span: cur,
@@ -970,10 +1014,12 @@ impl Builder<'_, '_> {
                     next_atomic += 1;
                     // A zero-size marker: where the box would have been in the
                     // line is its static position (CSS 2.1, section 10.3.7).
-                    tb.push_inline_box(parley::InlineBox {
-                        kind: parley::InlineBoxKind::OutOfFlow,
-                        ..spacer(items.len())
-                    });
+                    if let Some(tb) = &mut tb {
+                        tb.push_inline_box(parley::InlineBox {
+                            kind: parley::InlineBoxKind::OutOfFlow,
+                            ..spacer(items.len())
+                        });
+                    }
                     items.push(IItem::Oof {
                         child,
                         block_level: !s.original_display.is_inline_level(),
@@ -981,7 +1027,14 @@ impl Builder<'_, '_> {
                 }
             }
         }
-        let (layout, text) = tb.build();
+        let (layout, text) = match (tb, cached) {
+            (Some(tb), _) => {
+                let (layout, text) = tb.build();
+                (layout, keep_text.then_some(text))
+            }
+            (None, Some(hit)) => hit,
+            (None, None) => unreachable!("no text builder and no cached layout"),
+        };
         let ifc = Ifc {
             layout,
             spans,
@@ -991,7 +1044,8 @@ impl Builder<'_, '_> {
             breaks: 0,
             final_breaks: 0,
             final_balance: None,
-            text: keep_text.then_some(text),
+            text,
+            shape: ticket,
         };
         let ts = taffy_style(&style, true);
         self.tree.push(new_node(
@@ -1423,6 +1477,57 @@ fn table_spacing(s: &ComputedStyle) -> (f32, f32) {
 /// we keep the full width inside (the cells drop their outer borders).
 fn collapsed_table_border(_s: &ComputedStyle) -> Option<Edges<f32>> {
     None
+}
+
+/// The shape cache key and signature of an inline formatting context: its
+/// text and event order (the key), and the styles shaping reads.
+fn shape_key(
+    doc: &huginn_dom::Document,
+    evs: &[Ev],
+    root: &Arc<ComputedStyle>,
+    decor: Decor,
+) -> (u128, crate::shape::Sig) {
+    use crate::shape::SigEv;
+    let mut h = crate::shape::KeyHasher::new();
+    let sig_evs = evs
+        .iter()
+        .map(|ev| match ev {
+            Ev::Open(_, s) => {
+                h.mark(1);
+                SigEv::Open(s.clone())
+            }
+            Ev::Close => {
+                h.mark(2);
+                SigEv::Close
+            }
+            Ev::Text(n) => {
+                h.text(3, doc.text(*n).unwrap_or(""));
+                SigEv::Text
+            }
+            Ev::Str(t, s) => {
+                h.text(4, t);
+                SigEv::Str(s.clone())
+            }
+            Ev::Br(s) => {
+                h.mark(5);
+                SigEv::Br(s.clone())
+            }
+            Ev::Atomic(_, s) => {
+                h.mark(6);
+                SigEv::Atomic(s.vertical_align)
+            }
+            Ev::Oof(..) => {
+                h.mark(7);
+                SigEv::Oof
+            }
+        })
+        .collect();
+    let sig = crate::shape::Sig {
+        root: root.clone(),
+        decor,
+        evs: sig_evs,
+    };
+    (h.finish(), sig)
 }
 
 fn push_transformed(tb: &mut parley::TreeBuilder<'_, Brush>, t: &str, tt: TextTransform) {

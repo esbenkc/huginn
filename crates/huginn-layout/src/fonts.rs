@@ -43,6 +43,10 @@ pub(crate) struct Fonts {
     generics: u32,
     /// Fallback classes ([`FALLBACKS`] indices) already installed.
     fallbacks: u64,
+    /// Goes up whenever the fonts that text can be shaped with change: a
+    /// font file or web font is registered, a generic family or a fallback
+    /// is set. Text shaped at another epoch may be out of date.
+    pub epoch: u64,
     /// (family list pointer, weight, style) -> vertical metrics of the
     /// list's first available font, for `line-height: normal`.
     vmetrics: HashMap<(usize, u32, u8), Option<VMetrics>>,
@@ -321,6 +325,7 @@ impl Fonts {
             lists: HashMap::new(),
             generics: 0,
             fallbacks: 0,
+            epoch: 0,
             vmetrics: HashMap::new(),
         }
     }
@@ -496,6 +501,7 @@ impl Fonts {
 
     /// Drop resolved lists (a web font was registered: names may resolve now).
     pub fn forget_lists(&mut self) {
+        self.epoch += 1;
         self.lists.clear();
         self.vmetrics.clear();
     }
@@ -513,6 +519,7 @@ impl Fonts {
                 && self.fallbacks & (1 << class) == 0
             {
                 self.fallbacks |= 1 << class;
+                self.epoch += 1;
                 let fb = &FALLBACKS[class];
                 let ids: Vec<FamilyId> = fb.families.iter().filter_map(|f| self.load(f)).collect();
                 for s in fb.scripts {
@@ -550,6 +557,7 @@ impl Fonts {
         }
         if !paths.is_empty() {
             self.ctx.collection.load_fonts_from_paths(paths);
+            self.epoch += 1;
         }
         self.ctx.collection.family_id(name)
     }
@@ -578,6 +586,7 @@ impl Fonts {
             self.ctx
                 .collection
                 .set_generic_families(g, std::iter::once(id));
+            self.epoch += 1;
         }
     }
 }
