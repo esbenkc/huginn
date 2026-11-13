@@ -303,7 +303,11 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   change used by some rule (`StyleEngine::uses_state`), restyles (picking up
   added stylesheets), loads images that became needed
   (`resources::load_added`) and lays out again (`Relaid` with links and
-  title). Style and layout are full passes, not incremental.
+  title). Style and layout are full passes, not incremental, with one
+  exception: the tab's layout engine keeps the shaped text of each inline
+  formatting context from one pass to the next (`huginn-layout/src/shape.rs`),
+  so a pass shapes only text whose content, styles or fonts changed.
+  Shaping was 45 to 90 % of a pass. `HUGINN_SHAPE_CACHE=0` turns it off.
 - **Requests from scripts.** `location.href/assign/replace/reload`,
   `form.submit()`, `requestSubmit()`, `a.click()` become
   `HostRequest::Navigate`; `javascript:` URLs run in the page.

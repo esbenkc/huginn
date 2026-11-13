@@ -20,6 +20,7 @@ mod convert;
 mod emit;
 mod fonts;
 mod inline;
+mod shape;
 mod table;
 mod tree;
 
@@ -407,6 +408,8 @@ pub struct LayoutEngine {
     text: parley::LayoutContext<inline::Brush>,
     /// Build [`LayoutTree::text_index`].
     text_index: bool,
+    /// Shaped text of the last pass, when the cache is on (`shape.rs`).
+    shapes: Option<shape::ShapeCache>,
 }
 
 impl Default for LayoutEngine {
@@ -423,6 +426,20 @@ impl LayoutEngine {
             fonts: fonts::Fonts::new(),
             text: parley::LayoutContext::new(),
             text_index: false,
+            shapes: None,
+        }
+    }
+
+    /// Keep the shaped text of each pass for the next one (off by default).
+    /// A page that is laid out again after a small change then shapes only
+    /// the text that changed. It costs the memory of one copy of the shaped
+    /// text, so turn it on only for an engine that lays out the same page
+    /// many times.
+    pub fn set_shape_cache(&mut self, on: bool) {
+        match (on, &self.shapes) {
+            (true, None) => self.shapes = Some(shape::ShapeCache::default()),
+            (false, Some(_)) => self.shapes = None,
+            _ => {}
         }
     }
 
