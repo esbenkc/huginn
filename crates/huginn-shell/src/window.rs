@@ -238,6 +238,7 @@ impl Win {
             return Ok(());
         }
         b.compose(&mut buffer);
+        let _span = crate::perf::span("present");
         buffer.present().map_err(|e| format!("softbuffer: {e}"))
     }
 

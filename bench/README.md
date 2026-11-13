@@ -24,6 +24,7 @@ will differ from ours.
 | `check_corpus.py` | screenshots live vs local in Chrome, lists 404s per page, writes `corpus/check.png` (`--reuse-live`: no internet) |
 | `procmem.py` | samples memory of a whole process tree via libproc |
 | `bench.py` | the benchmark harness |
+| `perf.py` | time per phase for one Huginn binary: page loads and scripted interaction (scroll, hover, typing, script changes, resize). No other browser and no corpus needed; runs on Linux and macOS |
 | `fidelity.py` | quick developer check: renders corpus pages with one Huginn binary and prints SSIM against the Chrome reference (no timing claims) |
 | `WIN.md` | the win formula |
 | `ladybird-screenshot-on-load.patch` | the local Ladybird patch (see below; BSD-2-Clause, like Ladybird) |
@@ -80,6 +81,30 @@ reference screenshots in `results/ref/chrome/<page>.png`.
 `bench.py` starts `serve.py` itself if the corpus ports are not already open.
 To serve by hand: `python3 serve.py [--log-misses] [page ...]`. Each page is then at the
 `local_url` in its `corpus/<name>/manifest.json`, for example `http://127.0.0.1:8104/wiki/Web_browser`.
+
+## Time per phase (`perf.py`)
+
+`bench.py` answers "is Huginn ahead of Ladybird". `perf.py` answers "where
+does Huginn spend its time, and did this change help". It needs only Python 3
+and a Huginn binary.
+
+```sh
+cargo build --profile bench-release -p huginn-shell
+python3 bench/perf.py --label before          # writes results/perf-<date>-before.md
+# ... change the code, build again ...
+python3 bench/perf.py --label after
+```
+
+- **Load.** `huginn render` of each URL in `corpus.json` (or the targets you
+  pass), 5 cold runs. Pages come from the live network, so `fetch` and `total`
+  are noisy. Compare `cpu`: every phase but `fetch`, minus the time scripts
+  waited for the network. Peak RSS is the kernel's figure for the process.
+- **Interaction.** Synthetic pages driven with `huginn open --commands`, no
+  window. One row per scenario with the median, 95th percentile and maximum
+  time of one step, per phase (see ARCHITECTURE.md, "Timing").
+
+Run both binaries on the same machine, one after the other, with nothing else
+running. `perf.py` has no fidelity check: run the tests and `fidelity.py` too.
 
 ## How each browser is run
 

@@ -22,8 +22,12 @@
 //! - `clipboard <text>`: put text on the clipboard
 //! - `prefetch`: do idle work until there is none (prints how many strips)
 //! - `shot <png>`: compose a frame of the focused window and save it
+//! - `frame`: compose a frame of the focused window and drop it (what a
+//!   redraw costs, without the window system)
 //! - `state`: print the session state as one JSON line (the focused
 //!   window's active tab, its `tabs`, `windows`, ...)
+//! - `perf` / `perf reset`: print the phase timings so far as one JSON line
+//!   (`perf.rs`), or forget them
 //!
 //! `huginn open <url> --script "<commands>"` runs the same commands in the
 //! real window (`window.rs`), plus `capture <png>` (a `screencapture` of the
@@ -140,6 +144,16 @@ pub fn apply(s: &mut Session, cmd: &str, scale: f32) -> Result<Step, String> {
             println!("{}", s.state());
             return Ok(Step::Next);
         }
+        // `perf`: one JSON line with the phase timings so far (`perf.rs`).
+        // `perf reset`: forget them, to time only what follows.
+        "perf" => {
+            if rest == "reset" {
+                crate::perf::reset();
+            } else {
+                println!("{}", serde_json::json!({ "perf": crate::perf::report() }));
+            }
+            return Ok(Step::Next);
+        }
         "window" => {
             let i: usize = rest.parse().map_err(|_| bad())?;
             if i >= s.windows.len() {
@@ -238,6 +252,11 @@ pub fn apply(s: &mut Session, cmd: &str, scale: f32) -> Result<Step, String> {
                 }
             }
             println!("{}", serde_json::json!({ "prefetched": n }));
+        }
+        "frame" => {
+            let mut frame = frame_for(w);
+            w.compose(&mut frame);
+            w.take_dirty();
         }
         "shot" => {
             let mut frame = frame_for(w);

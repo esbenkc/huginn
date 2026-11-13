@@ -75,7 +75,12 @@ shell picks up stylesheets and images that scripts added, then styles and
 lays out once. Geometry queries during scripts (`getBoundingClientRect`,
 `offsetWidth`, `getComputedStyle`) run style and layout on demand, within a
 400 ms budget. The JSON line then also has `script_ms`, `scripts` and
-`js_errors`. `--no-js` (or `HUGINN_NO_JS=1`) turns scripts off.
+`js_errors`, and the script phase in parts: `script_run_ms` (the scripts
+the parser found), `script_events_ms` (DOMContentLoaded and load),
+`script_timers_ms` (timers while the page settles), `script_layout_ms` and
+`script_layouts` (style and layout that scripts asked for), and
+`script_wait_ms` (time the thread waited instead of running, mostly for the
+network; Linux only, `null` elsewhere). `--no-js` (or `HUGINN_NO_JS=1`) turns scripts off.
 
 ## Threading
 
@@ -312,6 +317,20 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   access (`form.q`), `form.reset()` restoring defaults, IME, multi-line
   caret by clicks in wrapped textareas, `<select multiple>`, drag and drop,
   `contenteditable`. XHR/fetch after load block the tab's engine thread.
+
+## Timing (`perf.rs`)
+
+`crates/huginn-shell/src/perf.rs` records how long the phases take while the
+window runs: `style` and `layout` (engine threads), `update` (one whole page
+update after input or a script), `raster` (one strip), `compose` (one frame)
+and `present`. It keeps the count, the total, the maximum and the last 512
+durations per phase. The `perf` command of the command driver prints them as
+one JSON line (median and 95th percentile); `perf reset` forgets them. The
+`frame` command composes a frame without a window. `bench/perf.py` uses these
+to time scrolling, hover, typing, script changes and resizing on synthetic
+pages.
+
+`HUGINN_V8_FLAGS` replaces the V8 flags, to measure other settings.
 
 ## Memory strategy
 

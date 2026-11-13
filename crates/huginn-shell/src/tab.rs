@@ -131,6 +131,7 @@ impl Strips {
                 width: width as f32 / scale,
                 height: self.rows as f32 / scale,
             };
+            let _span = crate::perf::span("raster");
             let list = huginn_paint::build_display_list(tree, Some(region));
             let px = Pixels::from_rgba(raster.rasterize(&list, region, scale));
             while self.count() >= self.budget {

@@ -18,6 +18,7 @@ mod interact;
 mod internal_pages;
 mod live;
 mod livepage;
+mod perf;
 mod pipeline;
 mod resources;
 mod scripts;

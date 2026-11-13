@@ -433,6 +433,7 @@ impl LivePage {
                 state.focus != old.focus || state.focus_visible != old.focus_visible,
             );
         if page.doc.generation() != self.shown_generation || state_dirty {
+            let _span = crate::perf::span("update");
             page.restyle_dom(&self.loader);
             page.load_added(&self.loader, &mut self.tried);
             let tree = page.layout(layout, viewport);
