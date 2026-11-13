@@ -567,13 +567,15 @@ impl CookieJar {
     pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool;
     pub fn header_for(&self, url: &Url, cx: CookieContext) -> Option<String>;
     pub fn set_from_header(&self, url: &Url, set_cookie: &str, cx: CookieContext);
-    pub fn document_cookie(&self, url: &Url) -> String;           // no HttpOnly
-    pub fn set_document_cookie(&self, url: &Url, value: &str);    // cannot set or replace HttpOnly
+    pub fn document_cookie(&self, url: &Url, top_level: &Url) -> String;   // no HttpOnly; a cross-site frame sees its partition
+    pub fn set_document_cookie(&self, url: &Url, top_level: &Url, value: &str);   // cannot set or replace HttpOnly
 }
-pub struct CookieContext { pub allows: SameSite, pub top_level: bool }   // SAME_SITE const
+pub struct CookieContext<'a> { pub allows: SameSite, pub top_level: bool,
+                               pub partition: Option<&'a str> }   // third party: top-level site_key; SAME_SITE const
 pub enum SameSite { None, Lax, Strict }
 pub fn registrable_domain(host: &str) -> &str;   // eTLD+1 (Public Suffix List)
 pub fn same_site(a: &Url, b: &Url) -> bool;      // schemeful
+pub fn site_key(url: &Url) -> Option<String>;    // "scheme://registrable-domain"; None for opaque origins
 pub enum ReferrerPolicy { .., StrictOriginWhenCrossOrigin /* default */, .. }   // parse_token, parse_header
 pub fn referrer_for(source: &Url, policy: ReferrerPolicy, target: &Url) -> Option<String>;
 pub fn parse_target(target: &str) -> Result<Url, NetError>;    // URL or file path
@@ -634,6 +636,16 @@ Invariants:
   client's origin), only if `SameSite` allows: same-site requests carry
   all, cross-site top-level `GET` navigations `Lax` and `None`, other
   cross-site requests `None` only. Scripts never see `Set-Cookie`.
+- Third-party requests (not navigations, to another site than the client)
+  read and write the client's cookie partition only, never the third
+  party's first-party cookies. Navigations started by a page (same tab,
+  new tab, new window, forms) carry the page as initiator; only the
+  browser UI navigates without one, and a cross-site redirect makes the
+  rest of such a chain cross-site.
+- Requests from a page on a public address, other than top-level
+  navigations, never connect to loopback or private addresses (checked on
+  the resolved addresses). `localhost` and `*.localhost` resolve to
+  loopback only.
 - Pixmaps are premultiplied RGBA8 (vello's storage), at most 65535 px per
   side. `DecodedImage::width()/height()` are the natural size in CSS px; the
   pixmap size can differ, so layout uses `width()` and paint scales by

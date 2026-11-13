@@ -41,9 +41,10 @@ pub enum SameSite {
 }
 
 /// How a request relates to the site of the document that made it, for
-/// `SameSite` (RFC 6265bis, "same-site and cross-site requests").
+/// `SameSite` (RFC 6265bis, "same-site and cross-site requests"), and which
+/// cookie partition it uses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CookieContext {
+pub struct CookieContext<'a> {
     /// The strictest `SameSite` value whose cookies the request carries:
     /// `Strict` for same-site requests, `Lax` for a cross-site top-level
     /// navigation with a safe method, `None` for other cross-site requests.
@@ -51,13 +52,20 @@ pub struct CookieContext {
     /// The request navigates the top-level document: its `Set-Cookie`
     /// headers are accepted whatever the site of the page that started it.
     pub top_level: bool,
+    /// Third-party context: the top-level site ([`site_key`]) whose
+    /// partition the request reads and writes. `None`: first-party cookies.
+    /// A third party never sees its first-party cookies, and each
+    /// top-level site sees its own copy of the third party's cookies
+    /// (like Firefox's Total Cookie Protection).
+    pub partition: Option<&'a str>,
 }
 
-impl CookieContext {
+impl CookieContext<'_> {
     /// A same-site request (or one the user started from the browser UI).
-    pub const SAME_SITE: CookieContext = CookieContext {
+    pub const SAME_SITE: CookieContext<'static> = CookieContext {
         allows: SameSite::Strict,
         top_level: false,
+        partition: None,
     };
 
     fn admits(self, cookie: SameSite) -> bool {
@@ -84,6 +92,8 @@ struct Cookie {
     /// Unique, increasing: creation order (microseconds since the epoch).
     created: u64,
     last_access: u64,
+    /// Top-level site of a third-party cookie ([`CookieContext::partition`]).
+    partition: Option<String>,
 }
 
 #[derive(Default)]
@@ -217,15 +227,23 @@ impl CookieJar {
         self.set(url, set_cookie, cx, true);
     }
 
-    /// `document.cookie` of a top-level document at `url`.
-    pub fn document_cookie(&self, url: &Url) -> String {
-        self.get(url, CookieContext::SAME_SITE, false)
-            .unwrap_or_default()
+    /// `document.cookie` of a document at `url` shown in a page whose
+    /// top-level document is at `top_level` (the same URL for the page
+    /// itself). A cross-site frame sees only its partition.
+    pub fn document_cookie(&self, url: &Url, top_level: &Url) -> String {
+        let key = site_key(top_level);
+        match document_context(url, top_level, key.as_deref()) {
+            Some(cx) => self.get(url, cx, false).unwrap_or_default(),
+            None => String::new(),
+        }
     }
 
-    /// `document.cookie = value` in a top-level document at `url`.
-    pub fn set_document_cookie(&self, url: &Url, value: &str) {
-        self.set(url, value, CookieContext::SAME_SITE, false);
+    /// `document.cookie = value` in a document at `url` under `top_level`.
+    pub fn set_document_cookie(&self, url: &Url, top_level: &Url, value: &str) {
+        let key = site_key(top_level);
+        if let Some(cx) = document_context(url, top_level, key.as_deref()) {
+            self.set(url, value, cx, false);
+        }
     }
 
     fn get(&self, url: &Url, cx: CookieContext, http: bool) -> Option<String> {
@@ -256,7 +274,8 @@ impl CookieJar {
                     expired = true;
                     continue;
                 }
-                if (c.host_only && c.domain != host)
+                if c.partition.as_deref() != cx.partition
+                    || (c.host_only && c.domain != host)
                     || !path_matches(path, &c.path)
                     || (c.secure && !secure)
                     || (c.http_only && !http)
@@ -355,10 +374,12 @@ impl CookieJar {
         let mut created = stamp;
         let list = s.by_domain.entry(domain.clone()).or_default();
         let mut removed_persistent = false;
-        if let Some(i) = list
-            .iter()
-            .position(|c| c.name == parsed.name && c.host_only == host_only && c.path == path)
-        {
+        if let Some(i) = list.iter().position(|c| {
+            c.name == parsed.name
+                && c.host_only == host_only
+                && c.path == path
+                && c.partition.as_deref() == cx.partition
+        }) {
             if list[i].http_only && !http {
                 return;
             }
@@ -389,6 +410,7 @@ impl CookieJar {
             same_site: parsed.same_site,
             created,
             last_access: stamp,
+            partition: cx.partition.map(str::to_owned),
         };
         if cookie.expires.is_some() || removed_persistent {
             s.dirty = true;
@@ -472,6 +494,8 @@ impl Store {
             if !over_site && self.count <= MAX_TOTAL {
                 return;
             }
+            // RFC 6265bis 5.7: non-secure cookies go before secure ones,
+            // then the least recently used.
             let victim = self
                 .by_domain
                 .iter()
@@ -479,9 +503,9 @@ impl Store {
                 .flat_map(|(d, l)| {
                     l.iter()
                         .enumerate()
-                        .map(move |(i, c)| (d, i, c.last_access))
+                        .map(move |(i, c)| (d, i, (c.secure, c.last_access)))
                 })
-                .min_by_key(|&(_, _, t)| t)
+                .min_by_key(|&(_, _, k)| k)
                 .map(|(d, i, _)| (d.clone(), i));
             let Some((d, i)) = victim else { return };
             let list = self.by_domain.get_mut(&d).expect("victim bucket");
@@ -567,6 +591,32 @@ pub fn registrable_domain(host: &str) -> &str {
         return host;
     }
     psl::domain_str(host).unwrap_or(host)
+}
+
+/// The site of a top-level document as a partition key:
+/// `scheme://registrable-domain`. `None` for opaque origins (`file:`,
+/// `data:`): their third-party requests carry no cookies.
+pub fn site_key(url: &Url) -> Option<String> {
+    let host = cookie_site_host(url)?;
+    Some(format!("{}://{}", url.scheme(), registrable_domain(&host)))
+}
+
+/// The cookie context of `document.cookie` for a document at `url` under a
+/// top-level document at `top_level` (partition key `key`). `None`: no
+/// cookies (a cross-site frame under an opaque top-level origin).
+fn document_context<'a>(
+    url: &Url,
+    top_level: &Url,
+    key: Option<&'a str>,
+) -> Option<CookieContext<'a>> {
+    if url == top_level || same_site(url, top_level) {
+        return Some(CookieContext::SAME_SITE);
+    }
+    Some(CookieContext {
+        allows: SameSite::None,
+        top_level: false,
+        partition: Some(key?),
+    })
 }
 
 /// Schemeful same-site: same scheme and registrable domain. Opaque origins
@@ -817,7 +867,7 @@ fn serialize(s: &Store, now: i64) -> String {
             SameSite::Strict => "strict",
         };
         out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             c.domain,
             u8::from(c.host_only),
             escape(&c.path),
@@ -827,6 +877,7 @@ fn serialize(s: &Store, now: i64) -> String {
             same_site,
             c.created,
             c.last_access,
+            escape(c.partition.as_deref().unwrap_or("")),
             escape(&c.name),
             escape(&c.value),
         ));
@@ -846,6 +897,7 @@ fn deserialize(line: &str) -> Option<Cookie> {
         same_site,
         created,
         last,
+        partition,
         name,
         value,
     ] = f.as_slice()
@@ -868,27 +920,65 @@ fn deserialize(line: &str) -> Option<Cookie> {
         },
         created: created.parse().ok()?,
         last_access: last.parse().ok()?,
+        partition: (!partition.is_empty()).then(|| unescape(partition)),
     })
 }
 
+/// Write `text` to `path` readable by the owner only: a new, uniquely named
+/// temporary file (never an existing file or a symlink), then a rename. A
+/// missing profile directory is created owner-only.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.exists()
+    {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{n}.tmp", std::process::id()));
+    let tmp = path.with_file_name(name);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc_o_nofollow());
     }
     let mut f = opts.open(&tmp)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path)
+    let r = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// `O_NOFOLLOW` without a libc dependency.
+#[cfg(unix)]
+fn libc_o_nofollow() -> i32 {
+    if cfg!(target_os = "linux") {
+        0o400000
+    } else {
+        0x0100
+    }
 }
 
 #[cfg(test)]
@@ -903,10 +993,12 @@ mod tests {
     const CROSS: CookieContext = CookieContext {
         allows: SameSite::None,
         top_level: false,
+        partition: None,
     };
     const CROSS_NAV: CookieContext = CookieContext {
         allows: SameSite::Lax,
         top_level: true,
+        partition: None,
     };
 
     #[test]
@@ -1024,13 +1116,13 @@ mod tests {
         );
         assert_eq!(jar.header_for(&http, SAME), None);
         jar.set_from_header(&https, "h=1; HttpOnly", SAME);
-        assert_eq!(jar.document_cookie(&https), "s=1");
-        jar.set_document_cookie(&https, "h=2");
+        assert_eq!(jar.document_cookie(&https, &https), "s=1");
+        jar.set_document_cookie(&https, &https, "h=2");
         assert!(
             jar.header_for(&https, SAME).unwrap().contains("h=1"),
             "script cannot overwrite HttpOnly"
         );
-        jar.set_document_cookie(&https, "j=1; HttpOnly");
+        jar.set_document_cookie(&https, &https, "j=1; HttpOnly");
         assert!(!jar.header_for(&https, SAME).unwrap().contains("j="));
         jar.set_from_header(
             &https,
@@ -1102,11 +1194,14 @@ mod tests {
         assert_eq!(jar.len(), 1);
         jar.set_from_header(&url, "a=; Max-Age=0", SAME);
         assert_eq!(jar.header_for(&url, SAME), None);
-        jar.set_document_cookie(&url, "b=1; expires=Thu, 01 Jan 1970 00:00:00 GMT");
+        jar.set_document_cookie(&url, &url, "b=1; expires=Thu, 01 Jan 1970 00:00:00 GMT");
         assert_eq!(jar.len(), 0);
         // No cookies outside http(s).
-        jar.set_document_cookie(&u("file:///tmp/x.html"), "c=1");
-        assert_eq!(jar.document_cookie(&u("file:///tmp/x.html")), "");
+        jar.set_document_cookie(&u("file:///tmp/x.html"), &u("file:///tmp/x.html"), "c=1");
+        assert_eq!(
+            jar.document_cookie(&u("file:///tmp/x.html"), &u("file:///tmp/x.html")),
+            ""
+        );
         assert_eq!(jar.len(), 0);
     }
 
@@ -1120,6 +1215,111 @@ mod tests {
         assert_eq!(jar.len(), MAX_PER_SITE);
         let all = jar.header_for(&url, SAME).unwrap();
         assert!(!all.contains("c0=") && all.contains(&format!("c{}=", MAX_PER_SITE + 4)));
+    }
+
+    #[test]
+    fn insecure_flood_cannot_evict_a_secure_cookie() {
+        let jar = CookieJar::in_memory();
+        let https = u("https://example.com/");
+        let http = u("http://example.com/");
+        jar.set_from_header(&https, "session=good; Secure", SAME);
+        for i in 0..MAX_PER_SITE + 5 {
+            jar.set_from_header(&http, &format!("junk{i}=1"), SAME);
+        }
+        jar.set_from_header(&http, "session=evil", SAME);
+        assert_eq!(jar.len(), MAX_PER_SITE);
+        let sent = jar.header_for(&https, SAME).unwrap();
+        assert!(sent.contains("session=good") && !sent.contains("session=evil"));
+    }
+
+    #[test]
+    fn third_party_cookies_are_partitioned_by_top_level_site() {
+        let jar = CookieJar::in_memory();
+        let tracker = u("https://tracker.example/pixel");
+        let a = site_key(&u("https://news.a.com/story")).unwrap();
+        let b = site_key(&u("https://shop.b.com/")).unwrap();
+        assert_eq!(a, "https://a.com");
+        fn under(k: &str) -> CookieContext<'_> {
+            CookieContext {
+                allows: SameSite::None,
+                top_level: false,
+                partition: Some(k),
+            }
+        }
+        // First-party visit sets the tracker's own cookie.
+        jar.set_from_header(&tracker, "id=first; SameSite=None; Secure", SAME);
+        // Embedded under a.com: the first-party cookie is not visible.
+        assert_eq!(jar.header_for(&tracker, under(&a)), None);
+        jar.set_from_header(&tracker, "id=in-a; SameSite=None; Secure", under(&a));
+        assert_eq!(
+            jar.header_for(&tracker, under(&a)).as_deref(),
+            Some("id=in-a")
+        );
+        // Under b.com it is another, empty partition.
+        assert_eq!(jar.header_for(&tracker, under(&b)), None);
+        // The first-party cookie is untouched.
+        assert_eq!(jar.header_for(&tracker, SAME).as_deref(), Some("id=first"));
+        // document.cookie in a cross-site frame sees only its partition.
+        let top_a = u("https://news.a.com/story");
+        assert_eq!(jar.document_cookie(&tracker, &top_a), "id=in-a");
+        jar.set_document_cookie(&tracker, &top_a, "js=1; SameSite=None; Secure");
+        assert_eq!(jar.document_cookie(&tracker, &top_a), "id=in-a; js=1");
+        assert_eq!(jar.document_cookie(&tracker, &tracker), "id=first");
+        // Under an opaque top-level origin a third party gets no cookies.
+        assert_eq!(jar.document_cookie(&tracker, &u("file:///x.html")), "");
+    }
+
+    #[test]
+    fn partitions_survive_save_and_load() {
+        let dir = std::env::temp_dir().join(format!("huginn-cookies-part-{}", std::process::id()));
+        let path = dir.join("cookies.tsv");
+        let tracker = u("https://tracker.example/");
+        let cx = CookieContext {
+            allows: SameSite::None,
+            top_level: false,
+            partition: Some("https://a.com"),
+        };
+        let jar = CookieJar::persistent(path.clone());
+        jar.set_from_header(&tracker, "p=1; Max-Age=60; SameSite=None; Secure", cx);
+        jar.save().unwrap();
+        let jar = CookieJar::persistent(path);
+        assert_eq!(jar.header_for(&tracker, cx).as_deref(), Some("p=1"));
+        assert_eq!(jar.header_for(&tracker, SAME), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_makes_an_owner_only_dir_and_file_and_follows_no_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("huginn-cookies-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("profile");
+        let path = dir.join("cookies.tsv");
+        let jar = CookieJar::persistent(path.clone());
+        jar.set_from_header(&u("https://example.com/"), "a=1; Max-Age=60", SAME);
+        jar.save().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        // A world-readable file planted at the old fixed temp name, a
+        // symlink to it, and a world-readable cookies.tsv change nothing.
+        let planted = root.join("planted");
+        std::fs::write(&planted, "x").unwrap();
+        std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::os::unix::fs::symlink(&planted, dir.join("cookies.tmp")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        jar.set_from_header(&u("https://example.com/"), "b=1; Max-Age=60", SAME);
+        jar.save().unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&planted).unwrap(), "x");
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1147,7 +1347,7 @@ mod tests {
         let jar = CookieJar::persistent(path.clone());
         assert_eq!(jar.header_for(&url, SAME).as_deref(), Some("keep=a%b\tc"));
         assert_eq!(
-            jar.document_cookie(&url),
+            jar.document_cookie(&url, &url),
             "",
             "HttpOnly survives the round trip"
         );

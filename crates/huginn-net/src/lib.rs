@@ -45,7 +45,7 @@ mod svg;
 pub mod ua;
 
 pub use charset::{decode_html, decode_text};
-pub use cookies::{CookieContext, CookieJar, SameSite, registrable_domain, same_site};
+pub use cookies::{CookieContext, CookieJar, SameSite, registrable_domain, same_site, site_key};
 pub use font::{FontFormat, decode_font, font_format, size_adjust_font};
 pub use media::{Screen, media_matches, parse_length};
 pub use referrer::{ReferrerPolicy, referrer_for};
@@ -294,9 +294,17 @@ const MAX_REDIRECTS: usize = 20;
 /// `Referer` of its [`Client`], the document it fetches for.
 pub struct Loader {
     agent: ureq::Agent,
+    /// Same agent, but its resolver drops loopback and private addresses:
+    /// subresources and script requests of a public page (Local Network
+    /// Access). Made on first use.
+    public_agent: std::sync::OnceLock<ureq::Agent>,
+    config: ureq::config::Config,
+    loopback_only: bool,
     cache: Mutex<HashMap<Url, Arc<Resource>>>,
     cookies: Arc<CookieJar>,
     client: RwLock<Option<Client>>,
+    /// Whether the client document is on a public address (cached).
+    client_public: parking_lot::Mutex<Option<bool>>,
 }
 
 impl Default for Loader {
@@ -363,21 +371,52 @@ impl Loader {
             .max_redirects(0)
             .allow_non_standard_methods(true)
             .build();
-        let agent = if loopback_only {
-            ureq::Agent::with_parts(
-                config,
-                ureq::unversioned::transport::DefaultConnector::default(),
-                LoopbackOnly::default(),
-            )
-        } else {
-            ureq::Agent::new_with_config(config)
-        };
+        let agent = ureq::Agent::with_parts(
+            config.clone(),
+            ureq::unversioned::transport::DefaultConnector::default(),
+            HostResolver {
+                loopback_only,
+                ..HostResolver::default()
+            },
+        );
         Loader {
             agent,
+            public_agent: std::sync::OnceLock::new(),
+            config,
+            loopback_only,
             cache: Mutex::new(HashMap::new()),
             cookies,
             client: RwLock::new(None),
+            client_public: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// The agent for a request: requests from a public page that are not
+    /// top-level navigations may not reach loopback or private addresses
+    /// (Local Network Access). The check is on the resolved addresses, so
+    /// DNS rebinding cannot get around it.
+    fn agent_for(&self, mode: Mode, client: Option<&Client>) -> &ureq::Agent {
+        if mode == Mode::Navigate || self.loopback_only {
+            return &self.agent;
+        }
+        let Some(c) = client else { return &self.agent };
+        let public = *self
+            .client_public
+            .lock()
+            .get_or_insert_with(|| is_public_url(&c.url));
+        if !public {
+            return &self.agent;
+        }
+        self.public_agent.get_or_init(|| {
+            ureq::Agent::with_parts(
+                self.config.clone(),
+                ureq::unversioned::transport::DefaultConnector::default(),
+                HostResolver {
+                    public_only: true,
+                    ..HostResolver::default()
+                },
+            )
+        })
     }
 
     /// The cookie jar requests use (and `document.cookie` reads).
@@ -389,6 +428,7 @@ impl Loader {
     /// final URL (and `Referrer-Policy`) is known.
     pub fn set_client(&self, client: Option<Client>) {
         *self.client.write() = client;
+        *self.client_public.lock() = None;
     }
 
     /// The document this loader fetches for.
@@ -541,7 +581,7 @@ impl Loader {
             ),
             None => ("GET", Vec::new(), None),
         };
-        let res = self.send(Request {
+        let (res, referrer) = self.send_with_referrer(Request {
             url: url.clone(),
             method: method.into(),
             headers,
@@ -553,7 +593,6 @@ impl Loader {
             client: initiator.cloned(),
             any_status: false,
         })?;
-        let referrer = initiator.and_then(|c| referrer_for(&c.url, c.referrer_policy, &res.url));
         Ok((res, referrer))
     }
 
@@ -637,6 +676,8 @@ impl Loader {
                 );
             }
             ResponseType::Opaque | ResponseType::OpaqueRedirect => {
+                // Nothing about the other origin: not even whether it redirected.
+                res.redirected = false;
                 res.status = 0;
                 res.headers = Vec::new();
                 res.content_type = None;
@@ -650,8 +691,24 @@ impl Loader {
     /// Fetch's main fetch for http(s), simplified: mode checks, CORS
     /// preflight, cookies, `Origin`/`Referer`/`Sec-Fetch-*`, and redirects
     /// followed one hop at a time.
-    fn send(&self, mut req: Request<'_>) -> Result<Resource, NetError> {
+    fn send(&self, req: Request<'_>) -> Result<Resource, NetError> {
+        self.send_with_referrer(req).map(|(r, _)| r)
+    }
+
+    /// [`Loader::send`], plus the `Referer` sent on the final hop.
+    fn send_with_referrer(
+        &self,
+        mut req: Request<'_>,
+    ) -> Result<(Resource, Option<String>), NetError> {
         let origin = req.client.as_ref().map(|c| c.url.origin());
+        let agent = self.agent_for(req.mode, req.client.as_ref());
+        // Browser-UI navigations: the site the user asked for. A redirect
+        // to another site makes the rest of the chain cross-site.
+        let first_url = req.url.clone();
+        // Third-party requests use the client's (the top-level page's)
+        // cookie partition.
+        let partition_key = req.client.as_ref().and_then(|c| cookies::site_key(&c.url));
+        let mut sent_referrer: Option<String> = None;
         let mut policy = req
             .client
             .as_ref()
@@ -675,16 +732,14 @@ impl Loader {
                 Some(o) if o.is_tuple() && !tainted_origin => o.ascii_serialization(),
                 _ => "null".to_owned(),
             };
-            if let Some(c) = &req.client {
-                let r = if same_origin {
-                    SiteRelation::SameOrigin
-                } else if same_site(&c.url, &url) {
-                    SiteRelation::SameSite
-                } else {
-                    SiteRelation::CrossSite
-                };
-                relation = relation.max(r);
-            }
+            let r = match &req.client {
+                Some(_) if same_origin => SiteRelation::SameOrigin,
+                Some(c) if same_site(&c.url, &url) => SiteRelation::SameSite,
+                Some(_) => SiteRelation::CrossSite,
+                None if same_site(&first_url, &url) => SiteRelation::SameOrigin,
+                None => SiteRelation::CrossSite,
+            };
+            relation = relation.max(r);
             match req.mode {
                 Mode::SameOrigin if !same_origin => {
                     return Err(NetError::Blocked(format!("{url} is not same-origin")));
@@ -708,23 +763,25 @@ impl Loader {
                             referer.as_deref(),
                             req.credentials == Credentials::Include,
                             relation,
+                            agent,
                         )?;
                     }
                 }
                 _ => {}
             }
+            let third_party = req.mode != Mode::Navigate
+                && req
+                    .client
+                    .as_ref()
+                    .is_some_and(|c| !same_site(&c.url, &url));
             let include_credentials = match req.credentials {
                 Credentials::Include => true,
                 Credentials::SameOrigin => tainting == ResponseType::Basic && same_origin,
                 Credentials::Omit => false,
-            };
+            } && (!third_party || partition_key.is_some());
             let safe_method = matches!(req.method.as_str(), "GET" | "HEAD");
             let cookie_cx = match (&req.mode, &req.client) {
-                (Mode::Navigate, None) => CookieContext {
-                    allows: SameSite::Strict,
-                    top_level: true,
-                },
-                (Mode::Navigate, Some(_)) => CookieContext {
+                (Mode::Navigate, _) => CookieContext {
                     allows: if relation < SiteRelation::CrossSite {
                         SameSite::Strict
                     } else if safe_method {
@@ -733,15 +790,14 @@ impl Loader {
                         SameSite::None
                     },
                     top_level: true,
+                    partition: None,
                 },
-                (_, Some(c)) => CookieContext {
-                    allows: if same_site(&c.url, &url) {
-                        SameSite::Strict
-                    } else {
-                        SameSite::None
-                    },
+                (_, Some(_)) if third_party => CookieContext {
+                    allows: SameSite::None,
                     top_level: false,
+                    partition: partition_key.as_deref(),
                 },
+                (_, Some(_)) => CookieContext::SAME_SITE,
                 (_, None) => CookieContext::SAME_SITE,
             };
 
@@ -771,6 +827,7 @@ impl Loader {
             if referer.is_none() {
                 referrer_source = None;
             }
+            sent_referrer.clone_from(&referer);
             if let Some(r) = &referer {
                 b = b.header("Referer", r.as_str());
             }
@@ -809,6 +866,7 @@ impl Loader {
                     .header(
                         "Sec-Fetch-Site",
                         match (&req.client, relation) {
+                            (None, SiteRelation::CrossSite) => "cross-site",
                             (None, _) => "none",
                             (_, SiteRelation::SameOrigin) => "same-origin",
                             (_, SiteRelation::SameSite) => "same-site",
@@ -836,10 +894,10 @@ impl Loader {
                 .body(req.body.unwrap_or(&[]))
                 .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?;
             let mut resp = if req.body.is_some() {
-                self.agent.run(built)
+                agent.run(built)
             } else {
                 let (parts, _) = built.into_parts();
-                self.agent.run(ureq::http::Request::from_parts(parts, ()))
+                agent.run(ureq::http::Request::from_parts(parts, ()))
             }
             .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
 
@@ -881,16 +939,19 @@ impl Loader {
                         return Err(NetError::Blocked(format!("{url}: unexpected redirect")));
                     }
                     RedirectMode::Manual => {
-                        return Ok(Resource {
-                            url,
-                            status: 0,
-                            content_type: None,
-                            charset: None,
-                            headers: Vec::new(),
-                            response_type: ResponseType::OpaqueRedirect,
-                            redirected,
-                            body: Vec::new(),
-                        });
+                        return Ok((
+                            Resource {
+                                url,
+                                status: 0,
+                                content_type: None,
+                                charset: None,
+                                headers: Vec::new(),
+                                response_type: ResponseType::OpaqueRedirect,
+                                redirected,
+                                body: Vec::new(),
+                            },
+                            sent_referrer,
+                        ));
                     }
                     RedirectMode::Follow => {}
                 }
@@ -959,16 +1020,19 @@ impl Loader {
                     .read_to_end(&mut body)
                     .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
             }
-            return Ok(Resource {
-                url,
-                status,
-                content_type,
-                charset,
-                headers,
-                response_type: tainting,
-                redirected,
-                body,
-            });
+            return Ok((
+                Resource {
+                    url,
+                    status,
+                    content_type,
+                    charset,
+                    headers,
+                    response_type: tainting,
+                    redirected,
+                    body,
+                },
+                sent_referrer,
+            ));
         }
         Err(NetError::Transport(format!(
             "{}: too many redirects",
@@ -988,6 +1052,7 @@ impl Loader {
         referer: Option<&str>,
         credentials: bool,
         relation: SiteRelation,
+        agent: &ureq::Agent,
     ) -> Result<(), NetError> {
         let mut b = ureq::http::Request::builder()
             .method("OPTIONS")
@@ -1020,8 +1085,7 @@ impl Loader {
         let built = b
             .body(())
             .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?;
-        let resp = self
-            .agent
+        let resp = agent
             .run(built)
             .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
         let headers: Vec<(String, String)> = resp
@@ -1100,23 +1164,118 @@ fn charset_param(content_type: &str) -> Option<&str> {
     })
 }
 
-/// Resolves only loopback hosts; everything else is "host not found".
+/// Resolves hosts for the loader. `localhost` and `*.localhost` always go
+/// to loopback (127.0.0.1, then ::1), never to DNS, like Chrome: the cookie
+/// jar treats them as secure. `loopback_only`: other hosts are "host not
+/// found" (no DNS lookup). `public_only`: loopback and private addresses
+/// are dropped from the answer (Local Network Access).
 #[derive(Debug, Default)]
-struct LoopbackOnly(ureq::unversioned::resolver::DefaultResolver);
+struct HostResolver {
+    inner: ureq::unversioned::resolver::DefaultResolver,
+    loopback_only: bool,
+    public_only: bool,
+}
 
-impl ureq::unversioned::resolver::Resolver for LoopbackOnly {
+impl ureq::unversioned::resolver::Resolver for HostResolver {
     fn resolve(
         &self,
         uri: &ureq::http::Uri,
         config: &ureq::config::Config,
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-        match uri.host() {
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1") => {
-                self.0.resolve(uri, config, timeout)
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let host = uri.host().unwrap_or("");
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if host == "localhost" || host.ends_with(".localhost") {
+            if self.public_only {
+                return Err(ureq::Error::HostNotFound);
             }
-            _ => Err(ureq::Error::HostNotFound),
+            let port = uri
+                .port_u16()
+                .unwrap_or(if uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    80
+                });
+            let mut out = self.empty();
+            out.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+            out.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
+            return Ok(out);
         }
+        if self.loopback_only && !matches!(host.as_str(), "127.0.0.1" | "::1") {
+            return Err(ureq::Error::HostNotFound);
+        }
+        let addrs = self.inner.resolve(uri, config, timeout)?;
+        if !self.public_only {
+            return Ok(addrs);
+        }
+        let mut out = self.empty();
+        for a in addrs.iter().filter(|a| !is_local_ip(a.ip())) {
+            out.push(*a);
+        }
+        if out.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        Ok(out)
+    }
+}
+
+/// A loopback, private, link-local or otherwise non-public address
+/// (Local Network Access's "local" and "private" address spaces).
+fn is_local_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_loopback()
+                || a.is_private()
+                || a.is_link_local()
+                || a.is_unspecified()
+                || a.is_broadcast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return is_local_ip(IpAddr::V4(v4));
+            }
+            let s = a.segments();
+            a.is_loopback()
+                || a.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Whether a document URL is on a public address. Loopback and private IP
+/// literals and `localhost` are not; other host names are resolved (the
+/// document was just fetched, so this hits the system cache). `file:` and
+/// other non-network documents count as local.
+fn is_public_url(url: &Url) -> bool {
+    use std::net::ToSocketAddrs;
+    match url.host() {
+        Some(url::Host::Ipv4(a)) => !is_local_ip(a.into()),
+        Some(url::Host::Ipv6(a)) => !is_local_ip(a.into()),
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            if d == "localhost" || d.ends_with(".localhost") {
+                return false;
+            }
+            let port = url.port_or_known_default().unwrap_or(80);
+            match (d.as_str(), port).to_socket_addrs() {
+                Ok(addrs) => {
+                    let addrs: Vec<_> = addrs.collect();
+                    addrs.is_empty() || addrs.iter().any(|a| !is_local_ip(a.ip()))
+                }
+                Err(_) => true,
+            }
+        }
+        None => false,
     }
 }
 
@@ -1490,7 +1649,9 @@ mod tests {
         assert_eq!(r.response_type, ResponseType::Opaque);
         let log = seen.lock().unwrap().clone();
         let last = log.last().unwrap();
-        assert_eq!(last.header("cookie"), Some("tp=1"));
+        // The first-party SameSite=None cookie stays out of third-party
+        // requests (cookies are partitioned by top-level site).
+        assert_eq!(last.header("cookie"), None);
         assert_eq!(last.header("referer"), Some("http://localhost:1/"));
         assert_eq!(last.header("sec-fetch-site"), Some("cross-site"));
         assert_eq!(last.header("origin"), None);
@@ -1578,6 +1739,11 @@ mod tests {
         let r = loader.fetch_for_script(req).unwrap();
         assert_eq!((r.status, r.response_type), (0, ResponseType::Opaque));
         assert!(r.body.is_empty() && r.headers.is_empty());
+        // ... and does not tell whether it redirected.
+        let mut req = script(&at("/hop"), "GET", Credentials::Include);
+        req.mode = Mode::NoCors;
+        let r = loader.fetch_for_script(req).unwrap();
+        assert!(!r.redirected && r.response_type == ResponseType::Opaque);
         // same-origin mode refuses other origins outright.
         let mut req = script(&at("/open"), "GET", Credentials::Include);
         req.mode = Mode::SameOrigin;
@@ -1607,12 +1773,17 @@ mod tests {
             }
         });
         let loader = Loader::new();
-        // A cookie for the API's site that a credentialed request carries.
+        // A cookie the API set while embedded in this page (its partition),
+        // which a credentialed request carries.
         let api = Url::parse(&format!("http://127.0.0.1:{port}/api")).unwrap();
         loader.cookies().set_from_header(
             &api,
             "k=1; SameSite=None; Secure",
-            CookieContext::SAME_SITE,
+            CookieContext {
+                allows: SameSite::None,
+                top_level: false,
+                partition: Some("http://localhost"),
+            },
         );
         loader.set_client(Some(Client::new(
             Url::parse("http://localhost:9/").unwrap(),
@@ -1661,6 +1832,156 @@ mod tests {
             None,
             "forbidden headers are dropped"
         );
+    }
+
+    /// A server for the security tests: `/hop` redirects to `/echo` on
+    /// 127.0.0.1, `/strip` redirects with `Referrer-Policy: no-referrer`,
+    /// `/set` sets a first-party cookie, `/cors-set` and `/cors-echo` answer
+    /// credentialed CORS; everything else echoes the `Cookie` header.
+    fn security_server() -> (u16, Arc<Mutex<Vec<Seen>>>) {
+        let port = Arc::new(Mutex::new(0u16));
+        let p = port.clone();
+        let (n, log) = serve(move |r| {
+            let port = *p.lock().unwrap();
+            let allow = format!(
+                "Access-Control-Allow-Origin: {}\nAccess-Control-Allow-Credentials: true",
+                r.header("origin").unwrap_or("")
+            );
+            let cookie = r.header("cookie").unwrap_or("").to_owned();
+            match r.path.as_str() {
+                "/hop" => format!("302 Found\nLocation: http://127.0.0.1:{port}/echo"),
+                "/strip" => "302 Found\nLocation: /echo\nReferrer-Policy: no-referrer".into(),
+                "/set" => {
+                    "200 OK\nSet-Cookie: first=1; SameSite=None; Secure; Path=/\n\nset".into()
+                }
+                "/cors-set" => format!(
+                    "200 OK\n{allow}\nSet-Cookie: part=1; SameSite=None; Secure; Path=/\n\nset"
+                ),
+                "/cors-echo" => format!("200 OK\n{allow}\n\n{cookie}"),
+                _ => format!("200 OK\n\n{cookie}"),
+            }
+        });
+        *port.lock().unwrap() = n;
+        (n, log)
+    }
+
+    #[test]
+    fn browser_navigations_lose_strict_cookies_after_a_cross_site_redirect() {
+        let (port, seen) = security_server();
+        let loader = Loader::new();
+        let echo = Url::parse(&format!("http://127.0.0.1:{port}/echo")).unwrap();
+        for c in ["s=1; SameSite=Strict; Path=/", "l=1; Path=/"] {
+            loader
+                .cookies()
+                .set_from_header(&echo, c, CookieContext::SAME_SITE);
+        }
+        // Typed into the address bar: same site, all cookies, `none`.
+        let (r, _) = loader.navigate(&echo, None, None).unwrap();
+        assert_eq!(r.body, b"s=1; l=1");
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(last.header("sec-fetch-site"), Some("none"));
+        assert_eq!(last.header("sec-fetch-user"), Some("?1"));
+        // Typed, but it redirects from another site (localhost): the chain
+        // is cross-site from then on, so Strict cookies stay home.
+        let hop = Url::parse(&format!("http://localhost:{port}/hop")).unwrap();
+        let (r, _) = loader.navigate(&hop, None, None).unwrap();
+        assert_eq!(r.body, b"l=1");
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(last.header("sec-fetch-site"), Some("cross-site"));
+        // Started by a page of another site: Lax only, and never `none`/`?1`.
+        let page = Client::new(Url::parse("http://localhost:1/").unwrap());
+        let (r, _) = loader.navigate(&echo, None, Some(&page)).unwrap();
+        assert_eq!(r.body, b"l=1");
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!(last.header("sec-fetch-site"), Some("cross-site"));
+        assert_eq!(last.header("sec-fetch-user"), None);
+    }
+
+    #[test]
+    fn document_referrer_is_the_referer_actually_sent() {
+        let (port, seen) = security_server();
+        let loader = Loader::new();
+        let mut page = Client::new(Url::parse("http://localhost:1/mail?id=secret").unwrap());
+        page.referrer_policy = ReferrerPolicy::UnsafeUrl;
+        let strip = Url::parse(&format!("http://127.0.0.1:{port}/strip")).unwrap();
+        let (r, referrer) = loader.navigate(&strip, None, Some(&page)).unwrap();
+        assert_eq!(r.url.path(), "/echo");
+        assert_eq!(referrer, None);
+        let log = seen.lock().unwrap().clone();
+        assert_eq!(
+            log[0].header("referer"),
+            Some("http://localhost:1/mail?id=secret")
+        );
+        assert_eq!(log[1].header("referer"), None);
+    }
+
+    #[test]
+    fn localhost_subdomains_resolve_to_loopback_without_dns() {
+        let (port, seen) = security_server();
+        let loader = Loader::build(false, Arc::new(CookieJar::in_memory()));
+        let url = Url::parse(&format!("http://app.localhost:{port}/x")).unwrap();
+        loader.fetch(&url, ResourceKind::Other).unwrap();
+        let log = seen.lock().unwrap();
+        assert_eq!(
+            log[0].header("host"),
+            Some(format!("app.localhost:{port}").as_str())
+        );
+    }
+
+    #[test]
+    fn public_pages_cannot_reach_local_addresses() {
+        let (port, seen) = security_server();
+        let loader = Loader::build(false, Arc::new(CookieJar::in_memory()));
+        // A page on a public address (an IP literal: no DNS in the test).
+        let page = Client::new(Url::parse("http://93.184.215.14/").unwrap());
+        loader.set_client(Some(page.clone()));
+        let local = format!("http://127.0.0.1:{port}");
+        let mut req = script(&format!("{local}/cors-echo"), "POST", Credentials::Include);
+        req.mode = Mode::NoCors;
+        assert!(loader.fetch_for_script(req).is_err());
+        let img = Url::parse(&format!("{local}/pixel.png")).unwrap();
+        assert!(loader.fetch_uncached(&img, ResourceKind::Image).is_err());
+        let named = Url::parse(&format!("http://app.localhost:{port}/x")).unwrap();
+        assert!(loader.fetch(&named, ResourceKind::Script).is_err());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing reached the local server"
+        );
+        // A top-level navigation to a local address is still allowed.
+        assert!(loader.navigate(&img, None, Some(&page)).is_ok());
+        // Local pages may use local servers.
+        loader.set_client(Some(Client::new(
+            Url::parse("http://localhost:9/").unwrap(),
+        )));
+        assert!(loader.fetch_uncached(&img, ResourceKind::Image).is_ok());
+    }
+
+    #[test]
+    fn third_party_requests_use_the_top_level_sites_cookie_partition() {
+        let (port, seen) = security_server();
+        let loader = Loader::new();
+        let at = |p: &str| format!("http://127.0.0.1:{port}{p}");
+        // A first-party visit sets the third party's own cookie.
+        loader
+            .navigate(&Url::parse(&at("/set")).unwrap(), None, None)
+            .unwrap();
+        let fetch = |top: &str, path: &str| {
+            loader.set_client(Some(Client::new(Url::parse(top).unwrap())));
+            let r = loader.fetch_for_script(script(&at(path), "GET", Credentials::Include));
+            String::from_utf8(r.unwrap().body).unwrap()
+        };
+        // Embedded in a.localhost: the first-party cookie is not sent.
+        assert_eq!(fetch("http://a.localhost:9/", "/cors-echo"), "");
+        fetch("http://a.localhost:9/", "/cors-set");
+        assert_eq!(fetch("http://a.localhost:9/", "/cors-echo"), "part=1");
+        // Embedded in b.localhost: another, empty partition.
+        assert_eq!(fetch("http://b.localhost:9/", "/cors-echo"), "");
+        // First party again: only its own cookie.
+        let (r, _) = loader
+            .navigate(&Url::parse(&at("/echo")).unwrap(), None, None)
+            .unwrap();
+        assert_eq!(r.body, b"first=1");
+        assert!(seen.lock().unwrap().len() >= 6);
     }
 
     #[test]
