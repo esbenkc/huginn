@@ -115,6 +115,7 @@ impl Page {
 
     /// Lay out for `viewport` (the styles must be computed for the same viewport).
     pub fn layout(&self, layout_engine: &mut LayoutEngine, viewport: Viewport) -> LayoutTree {
+        let _span = crate::perf::span("layout");
         layout_engine.layout(&LayoutInput {
             document: &self.doc,
             styles: &self.styles,
@@ -130,6 +131,7 @@ impl Page {
     /// Recompute styles for a new viewport (media queries, vw/vh).
     pub fn restyle(&mut self, viewport: Viewport) {
         self.style_engine.set_viewport(viewport);
+        let _span = crate::perf::span("style");
         self.styles = self.style_engine.compute(&self.doc);
     }
 
@@ -147,6 +149,7 @@ impl Page {
             add_sheets(&mut self.style_engine, loader, &sheets[skip..], &self.base);
             self.sheets = sheets;
         }
+        let _span = crate::perf::span("style");
         self.styles = self.style_engine.compute(&self.doc);
     }
 
@@ -234,6 +237,19 @@ pub fn render(opts: &RenderOptions, start: Instant) -> Result<String, String> {
         "script_ms": ms(page.script_time),
         "scripts": page.js_report.scripts,
         "js_errors": page.js_report.errors,
+        // The script phase in parts: by stage (parser-found scripts, the
+        // DOMContentLoaded and load events, timers), then the style and
+        // layout that scripts asked for, and the time the thread waited
+        // instead of running (null where the system does not say).
+        "script_run_ms": ms(page.js_report.run_time),
+        "script_events_ms": ms(page.js_report.events_time),
+        "script_timers_ms": ms(page.js_report.timers_time),
+        "script_layout_ms": ms(page.js_report.layout_time),
+        "script_layouts": page.js_report.layouts,
+        "script_wait_ms": page.js_report.cpu_time.map(|cpu| {
+            let r = &page.js_report;
+            ms((r.run_time + r.events_time + r.timers_time).saturating_sub(cpu))
+        }),
         "total_ms": ms(start.elapsed()),
         "nodes": page.doc.len(),
         "styled": page.styles.styled_count(),

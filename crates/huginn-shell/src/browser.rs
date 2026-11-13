@@ -872,6 +872,7 @@ impl Browser {
 
     /// Draw the whole window into `frame` (`width * height` 0RGB pixels).
     pub fn compose(&mut self, frame: &mut [u32]) {
+        let _span = crate::perf::span("compose");
         let (w, h) = (self.width as usize, self.height as usize);
         assert_eq!(frame.len(), w * h, "frame size");
         let width = self.css_width();

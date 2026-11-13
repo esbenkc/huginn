@@ -38,6 +38,17 @@ pub struct ScriptReport {
     pub scripts: usize,
     pub errors: usize,
     pub layouts: usize,
+    /// Time in the parser-found scripts (with their microtasks and `load` events).
+    pub run_time: Duration,
+    /// Time in DOMContentLoaded and the window's `load`.
+    pub events_time: Duration,
+    /// Time in the timers that ran while the page settled.
+    pub timers_time: Duration,
+    /// Time in style and layout that scripts asked for (part of the three above).
+    pub layout_time: Duration,
+    /// Time the thread was on a CPU during the phase, if the system tells
+    /// us. The rest of the phase it waited, mostly for the network.
+    pub cpu_time: Option<Duration>,
 }
 
 /// Run the page's scripts. `sources[i]` is the fetched text and final URL of
@@ -57,6 +68,8 @@ pub fn run(
     settle: bool,
 ) -> ScriptReport {
     let mut report = ScriptReport::default();
+    let phase_start = Instant::now();
+    let cpu_start = crate::perf::thread_cpu();
     let elapsed_ms = || start.elapsed().as_secs_f64() * 1000.0;
     let mut cx = HostContext {
         document: doc,
@@ -122,6 +135,8 @@ pub fn run(
     if report.scripts == 0 {
         return report;
     }
+    report.run_time = phase_start.elapsed();
+    let events_start = Instant::now();
 
     cx.now_ms = elapsed_ms();
     let _ = engine.dispatch_event(
@@ -136,6 +151,9 @@ pub fn run(
         &Event::new("load", false, false),
     );
     let _ = engine.run_microtasks(&mut cx);
+
+    report.events_time = events_start.elapsed();
+    let timers_start = Instant::now();
 
     // Settle: jump virtual time to each due timer, without real waiting. The
     // window skips this: its timers run in real time after load.
@@ -158,7 +176,12 @@ pub fn run(
         }
     }
     drop(cx);
+    report.timers_time = timers_start.elapsed();
     report.layouts = layout.passes;
+    report.layout_time = layout.spent;
+    report.cpu_time = cpu_start
+        .zip(crate::perf::thread_cpu())
+        .map(|(a, b)| b.saturating_sub(a));
     report
 }
 

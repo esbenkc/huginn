@@ -59,7 +59,12 @@ fn init_v8() {
         // lazy feedback vectors. On the corpus it cuts the V8 heap by up to
         // half (bbc 58 -> 28 MB) at the same wall time, because page scripts
         // mostly run once.
-        v8::V8::set_flags_from_string("--single-threaded --lite-mode");
+        // `HUGINN_V8_FLAGS` replaces the flags, to measure other settings
+        // (for example `--single-threaded` alone, or with `--jitless`).
+        match std::env::var("HUGINN_V8_FLAGS") {
+            Ok(flags) => v8::V8::set_flags_from_string(&flags),
+            Err(_) => v8::V8::set_flags_from_string("--single-threaded --lite-mode"),
+        }
         v8::V8::initialize_platform(v8::new_single_threaded_default_platform(false).make_shared());
         v8::V8::initialize();
     });
