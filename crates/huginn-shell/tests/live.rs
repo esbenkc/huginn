@@ -159,10 +159,12 @@ fn editing_keys_and_clipboard_in_a_field() {
 
 #[test]
 fn set_interval_runs_in_real_time() {
-    let s = run(&page("timer.html"), "wait; state; sleep 700; state");
+    // A 100 ms interval should tick about 15 times in 1.5 s. Ask for 4 so a slow,
+    // shared CI runner still passes; the point is that timers keep running in real time.
+    let s = run(&page("timer.html"), "wait; state; sleep 1500; state");
     let tick = |v: &Value| title(v).trim_start_matches("tick ").parse::<u32>().unwrap();
     let (a, b) = (tick(&s[0]), tick(&s[1]));
-    assert!(b >= a + 4, "about 7 ticks in 700 ms: {a} -> {b}");
+    assert!(b >= a + 4, "at least 4 ticks in 1500 ms: {a} -> {b}");
 }
 
 #[test]
