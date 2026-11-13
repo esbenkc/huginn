@@ -315,7 +315,7 @@ def main():
     ap.add_argument("--label", default="run")
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--only", choices=["load", "interaction"])
-    ap.add_argument("--v8-flags", help="set HUGINN_V8_FLAGS for the binary")
+    ap.add_argument("--v8-flags", help="set HUGINN_V8_FLAGS for the binary; write it as --v8-flags=--jitless")
     args = ap.parse_args()
 
     binary = str(Path(args.binary).resolve())
