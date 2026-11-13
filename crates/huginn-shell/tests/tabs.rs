@@ -210,7 +210,8 @@ fn private_new_tab_page_shows_no_visited_sites() {
         "normal new tab page lists the visit: {}",
         s[0]
     );
-    assert!(text(&s[1]).contains("Huginn"), "{}", s[1]);
+    // The wordmark is set in capitals (CSS), and selections copy what is shown.
+    assert!(text(&s[1]).to_lowercase().contains("huginn"), "{}", s[1]);
     assert!(
         !text(&s[1]).contains("Page A"),
         "private new tab page lists a visit: {}",

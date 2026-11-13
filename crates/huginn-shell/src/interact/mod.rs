@@ -447,11 +447,12 @@ pub fn draw_window(tab: &mut Tab, c: &mut Canvas) {
         let (w, h) = (px.width as f32 / scale, px.height as f32 / scale);
         c.blit(px, win_w - w - 12.0, win_h - h - 12.0);
     }
+    let private = tab.private;
     if let Some(m) = &mut tab.interact.menu {
         let r = m.menu.rect();
         let px = m
             .pixels
-            .get_or_insert_with(|| render(&m.menu.html(), r.width, r.height, &[], scale).0);
+            .get_or_insert_with(|| render(&m.menu.html(private), r.width, r.height, &[], scale).0);
         c.blit(px, r.x, r.y);
     }
 }
@@ -807,6 +808,8 @@ fn find_bar_rect(tab: &Tab) -> Rect {
 }
 
 fn render_find_bar(tab: &mut Tab, scale: f32) {
+    let accent = crate::theme::accent(tab.private);
+    let selection = crate::theme::selection(tab.private);
     let find = &tab.interact.find;
     let count = if find.query.is_empty() {
         String::new()
@@ -819,9 +822,9 @@ fn render_find_bar(tab: &mut Tab, scale: f32) {
     };
     let none = !find.query.is_empty() && find.matches.is_empty();
     let caret = if find.focused && !find.select_all {
-        "<div style=\"width:1px;height:16px;background:#1a73e8;flex:none\"></div>"
+        format!("<div style=\"width:1.5px;height:16px;background:{accent};flex:none\"></div>")
     } else {
-        ""
+        String::new()
     };
     // Chevrons and the cross are drawn with CSS: no font has all three alike.
     let button = |id: &str, inner: &str| {
@@ -830,8 +833,9 @@ fn render_find_bar(tab: &mut Tab, scale: f32) {
              {inner}</div>"
         )
     };
+    let (muted, line) = (crate::theme::MUTED, crate::theme::HAIRLINE);
     let has = !find.matches.is_empty();
-    let color = if has { "#444" } else { "#bbb" };
+    let color = if has { muted } else { crate::theme::DIM };
     let chevron = |deg: i32, dy: i32| {
         format!(
             "<div style=\"width:7px;height:7px;border-top:1.5px solid {color};border-left:1.5px solid {color};\
@@ -840,7 +844,7 @@ fn render_find_bar(tab: &mut Tab, scale: f32) {
     };
     let bar = |deg: i32| {
         format!(
-            "<div style=\"position:absolute;left:0;top:6px;width:14px;height:1.5px;background:#444;transform:rotate({deg}deg)\"></div>"
+            "<div style=\"position:absolute;left:0;top:6px;width:14px;height:1.5px;background:{muted};transform:rotate({deg}deg)\"></div>"
         )
     };
     let cross = format!(
@@ -849,21 +853,27 @@ fn render_find_bar(tab: &mut Tab, scale: f32) {
         bar(-45)
     );
     let html = format!(
-        "<!doctype html><html><body style=\"margin:0;font:13px system-ui,-apple-system,Helvetica,sans-serif;color:#202124;\
-         background:#fff\"><div style=\"box-sizing:border-box;width:{FIND_W}px;height:{FIND_H}px;background:#fff;\
-         border:1px solid #c7c7c7;border-top:0;border-radius:0 0 8px 8px;display:flex;align-items:center;padding:0 6px 0 12px\">\
-         <div id=field style=\"flex:1;min-width:0;height:30px;display:flex;align-items:center;overflow:hidden;white-space:pre;\
-         background:{}\"><div style=\"flex:none;{}\">{}</div>{caret}</div>\
-         <div style=\"flex:none;color:{};padding:0 10px;font-size:12px\">{}</div>\
-         <div style=\"flex:none;width:1px;height:24px;background:#dadce0;margin-right:4px\"></div>{}{}{}</div></body></html>",
-        if none { "#fce8e6" } else { "#fff" },
+        "<!doctype html><html><body style=\"margin:0;font:13px {};color:{};background:{}\">\
+         <div style=\"box-sizing:border-box;width:{FIND_W}px;height:{FIND_H}px;background:{};\
+         border:1px solid {line};border-top:0;display:flex;align-items:center;padding:0 6px 0 12px\">\
+         <div id=field style=\"flex:1;min-width:0;height:28px;display:flex;align-items:center;overflow:hidden;white-space:pre;\
+         box-sizing:border-box;padding:0 8px;border:1px solid {};background:{}\"><div style=\"flex:none;{}\">{}</div>{caret}</div>\
+         <div style=\"flex:none;color:{};padding:0 10px;font-size:10px;{}\">{}</div>\
+         <div style=\"flex:none;width:1px;height:24px;background:{line};margin-right:4px\"></div>{}{}{}</div></body></html>",
+        crate::theme::FONT,
+        crate::theme::TEXT,
+        crate::theme::TOOLBAR,
+        crate::theme::TOOLBAR,
+        if find.focused { accent } else { line },
+        if none { "#2a1412" } else { crate::theme::STRIP },
         if find.focused && find.select_all {
-            "background:#b4d5fe"
+            format!("background:{selection}")
         } else {
-            ""
+            String::new()
         },
         escape_html(&find.query),
-        if none { "#c5221f" } else { "#5f6368" },
+        if none { crate::theme::WARN } else { muted },
+        crate::theme::LABEL,
         count,
         button("prev", &chevron(45, 2)),
         button("next", &chevron(225, -2)),
@@ -933,7 +943,12 @@ fn open_context_menu(tab: &mut Tab, x: f32, y: f32) {
         } else {
             short
         };
-        add(MenuItem::new("Copy").after_separator(), Action::Copy);
+        add(
+            MenuItem::new("Copy")
+                .after_separator()
+                .shortcut("\u{2318}C"),
+            Action::Copy,
+        );
         if let Some(url) = search_url(s) {
             add(
                 MenuItem::new(format!("Search DuckDuckGo for \u{201c}{short}\u{201d}")),
@@ -949,33 +964,54 @@ fn open_context_menu(tab: &mut Tab, x: f32, y: f32) {
     // (history, save, print, source) are for a click on the page itself.
     if link.is_none() && selected.is_none() {
         add(
-            MenuItem::new("Back").enabled(tab.can_back()),
+            MenuItem::new("Back")
+                .enabled(tab.can_back())
+                .shortcut("\u{2318}["),
             Action::Request(Request::Back),
         );
         add(
-            MenuItem::new("Forward").enabled(tab.can_forward()),
+            MenuItem::new("Forward")
+                .enabled(tab.can_forward())
+                .shortcut("\u{2318}]"),
             Action::Request(Request::Forward),
         );
-        add(MenuItem::new("Reload"), Action::Request(Request::Reload));
         add(
-            MenuItem::new("Save As\u{2026}").after_separator(),
+            MenuItem::new("Reload").shortcut("\u{2318}R"),
+            Action::Request(Request::Reload),
+        );
+        add(
+            MenuItem::new("Save As\u{2026}")
+                .after_separator()
+                .shortcut("\u{2318}S"),
             Action::Save,
         );
-        add(MenuItem::new("Print\u{2026}"), Action::Print);
         add(
-            MenuItem::new("Select All").after_separator(),
+            MenuItem::new("Print\u{2026}").shortcut("\u{2318}P"),
+            Action::Print,
+        );
+        add(
+            MenuItem::new("Select All")
+                .after_separator()
+                .shortcut("\u{2318}A"),
             Action::SelectAll,
         );
         add(
-            MenuItem::new("View Page Source").after_separator(),
+            MenuItem::new("View Page Source")
+                .after_separator()
+                .shortcut("\u{2318}U"),
             Action::Request(Request::ViewSource),
         );
     } else if link.is_none() {
         add(
-            MenuItem::new("Select All").after_separator(),
+            MenuItem::new("Select All")
+                .after_separator()
+                .shortcut("\u{2318}A"),
             Action::SelectAll,
         );
-        add(MenuItem::new("Print\u{2026}"), Action::Print);
+        add(
+            MenuItem::new("Print\u{2026}").shortcut("\u{2318}P"),
+            Action::Print,
+        );
     }
     let (w, h) = tab.page_size();
     let win = (w * tab.zoom, PAGE_TOP + h * tab.zoom);
@@ -1091,9 +1127,13 @@ fn render_notice(text: &str, win_w: f32, scale: f32) -> Pixels {
         .min(win_w - 24.0)
         .max(60.0);
     let html = format!(
-        "<!doctype html><html><body style=\"margin:0;font:13px system-ui,-apple-system,Helvetica,sans-serif\">\
+        "<!doctype html><html><body style=\"margin:0;font:12px {}\">\
          <div style=\"box-sizing:border-box;width:{w}px;height:36px;padding:0 14px;display:flex;align-items:center;\
-         background:#323639;color:#fff;border-radius:8px;white-space:pre;overflow:hidden\">{}</div></body></html>",
+         background:{};color:{};border:1px solid {};white-space:pre;overflow:hidden\">{}</div></body></html>",
+        crate::theme::FONT,
+        crate::theme::TOOLBAR,
+        crate::theme::TEXT,
+        crate::theme::HAIRLINE,
         escape_html(text)
     );
     render(&html, w, 36.0, &[], scale).0

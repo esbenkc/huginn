@@ -1,8 +1,10 @@
-//! The tab strip, drawn like Chrome's light theme: tabs with favicon, title
-//! and close button, the active tab joined to the toolbar, a + button. Tabs
-//! shrink as more are added. It is a small HTML document rendered by our
-//! own pipeline; loading spinners are drawn on top each animation frame, so
-//! the strip itself is only rendered when its content changes.
+//! The tab strip in Forest Mono: flat square tabs with favicon, monospace
+//! title and close button, 1 px hairlines between them, the active tab
+//! lifted by a 2 px accent rule and joined to the toolbar, a square + button.
+//! Tabs shrink as more are added. It is a small HTML document rendered by our
+//! own pipeline (over the acrylic backdrop when the material is on); loading
+//! spinners are drawn on top each animation frame, so the strip itself is
+//! only rendered when its content changes.
 
 use std::time::Instant;
 
@@ -12,7 +14,8 @@ use huginn_paint::CpuRasterizer;
 
 use crate::engine::escape_html;
 use crate::tab::{TABSTRIP_HEIGHT, Tab};
-use crate::ui::{Pixels, blend, render_snippet};
+use crate::theme;
+use crate::ui::{Pixels, blend, render_glass_snippet, render_snippet};
 
 /// Space at the left of the strip: room for the macOS traffic lights, a small
 /// margin where the window has its own title bar.
@@ -121,11 +124,20 @@ impl TabStrip {
     /// Draw the prepared strip into the top rows of `frame`, then the
     /// spinners of loading tabs.
     pub fn draw(&self, tabs: &[Tab], scale: f32, frame: &mut [u32], stride: usize) {
-        let Some((px, _)) = &self.pixels else { return };
+        let Some((px, look)) = &self.pixels else {
+            return;
+        };
         px.blit(frame, stride, 0, 0);
         for (i, t) in tabs.iter().enumerate() {
             if let (Some(since), Some(r)) = (t.loading_since(), self.icons.get(i)) {
-                spinner(frame, stride, *r, scale, since);
+                spinner(
+                    frame,
+                    stride,
+                    *r,
+                    scale,
+                    since,
+                    theme::accent_rgb(look.private),
+                );
             }
         }
     }
@@ -144,41 +156,33 @@ impl TabStrip {
                 images.insert(&favicon_url(i), img.clone());
             }
         }
+        let glass = theme::backdrop(look.width, scale);
+        if let Some(img) = &glass {
+            images.insert(&theme::backdrop_url(), img.clone());
+        }
         let n = tabs.len();
         let w = tab_width(n, look.width);
-        let (strip_bg, plus_color) = if look.private {
-            ("#3c4043", "#e8eaed")
-        } else {
-            ("#dde3ea", "#1f1f1f")
-        };
+        let accent = theme::accent(look.private);
+        let line = theme::HAIRLINE;
         let mut html = String::new();
         for (i, tab) in look.tabs.iter().enumerate() {
             let active = i == look.active;
             let hovered =
                 matches!(look.hover, Some(StripHit::Tab(h) | StripHit::Close(h)) if h == i);
-            // Chrome hides the close button of narrow inactive tabs.
+            // Narrow inactive tabs hide the close button, like Chrome.
             let show_close = active || (hovered && w >= 60.0);
             let show_title = w >= 60.0 || (!show_close && w >= 48.0);
             let bg = if active {
-                "#fff"
+                theme::fill(theme::ACTIVE, 0.6)
             } else if hovered {
-                if look.private { "#4a4c50" } else { "#eef0f3" }
+                theme::fill(theme::HOVER, 0.5)
             } else {
-                "transparent"
+                "transparent".to_owned()
             };
-            let color = if active || !look.private {
-                "#1f1f1f"
+            let color = if active || hovered {
+                theme::TEXT
             } else {
-                "#e8eaed"
-            };
-            // A separator between two inactive, not hovered tabs.
-            let next_plain = i + 1 < n
-                && i + 1 != look.active
-                && !matches!(look.hover, Some(StripHit::Tab(h) | StripHit::Close(h)) if h == i + 1);
-            let sep = if !active && !hovered && next_plain {
-                "#a8abaf"
-            } else {
-                "transparent"
+                theme::MUTED
             };
             let icon = if tab.loading {
                 String::new()
@@ -188,21 +192,16 @@ impl TabStrip {
                     favicon_url(i)
                 )
             } else {
-                globe(if active || !look.private {
-                    "#5f6368"
-                } else {
-                    "#bdc1c6"
-                })
+                asterisk(accent)
             };
             let close = if show_close {
+                let over = matches!(look.hover, Some(StripHit::Close(h)) if h == i);
                 format!(
-                    "<div id=x{i} style=\"width:18px;height:18px;flex-shrink:0;margin-left:4px;border-radius:9px;\
-                     display:flex;align-items:center;justify-content:center;font-size:11px;color:{color};{}\">\u{2715}</div>",
-                    if matches!(look.hover, Some(StripHit::Close(h)) if h == i) {
-                        "background:#d5d8dc"
-                    } else {
-                        ""
-                    }
+                    "<div id=x{i} style=\"width:18px;height:18px;flex-shrink:0;margin-left:4px;display:flex;\
+                     align-items:center;justify-content:center;font-size:15px;line-height:18px;color:{};background:{}\">\
+                     \u{d7}</div>",
+                    if over { theme::TEXT } else { theme::MUTED },
+                    if over { line } else { "transparent" },
                 )
             } else {
                 String::new()
@@ -216,31 +215,76 @@ impl TabStrip {
             } else {
                 "<div style=\"flex-grow:1\"></div>".to_owned()
             };
+            let rule = if active {
+                format!(
+                    "<div style=\"position:absolute;left:0;top:0;width:{w:.2}px;height:2px;background:{accent}\"></div>"
+                )
+            } else {
+                String::new()
+            };
+            let first = if i == 0 {
+                format!(
+                    "<div style=\"position:absolute;left:0;top:0;width:1px;height:40px;background:{line}\"></div>"
+                )
+            } else {
+                String::new()
+            };
             html.push_str(&format!(
-                "<div id=t{i} style=\"position:relative;width:{w:.2}px;height:34px;flex-shrink:0;box-sizing:border-box;\
-                 display:flex;align-items:center;padding:0 {pad}px;background:{bg};border-radius:8px 8px 0 0\">\
-                 <div id=i{i} style=\"width:16px;height:16px;flex-shrink:0\">{icon}</div>{title}{close}\
-                 <div style=\"position:absolute;right:0;top:9px;width:1px;height:16px;background:{sep}\"></div></div>",
+                "<div id=t{i} style=\"position:relative;width:{w:.2}px;height:40px;flex-shrink:0;box-sizing:border-box;\
+                 display:flex;align-items:center;padding:0 {pad}px;background:{bg}\">\
+                 <div id=i{i} style=\"width:16px;height:16px;flex-shrink:0\">{icon}</div>{title}{close}{first}{rule}\
+                 <div style=\"position:absolute;right:0;top:0;width:1px;height:40px;background:{line}\"></div></div>",
                 pad = if w < 60.0 { 6.0 } else { 10.0 },
             ));
         }
-        let plus_bg = if look.hover == Some(StripHit::Plus) {
-            if look.private { "#5f6368" } else { "#c9cfd6" }
-        } else {
-            "transparent"
-        };
+        let plus_over = look.hover == Some(StripHit::Plus);
+        let plus_color = if plus_over { theme::TEXT } else { theme::MUTED };
         let badge = if look.private {
-            "<div style=\"flex-grow:1\"></div><div style=\"align-self:center;margin-right:12px;font-size:12px;\
-             color:#e8eaed;background:#5f6368;border-radius:10px;padding:2px 10px\">Private</div>"
+            format!(
+                "<div style=\"flex-grow:1\"></div><div style=\"align-self:center;margin-right:12px;font-size:10px;\
+                 line-height:12px;{};color:{accent};border:1px solid {accent};padding:3px 8px\">Private</div>",
+                theme::LABEL
+            )
         } else {
-            ""
+            String::new()
+        };
+        // The hairline under the strip, except under the active tab: it
+        // joins the toolbar.
+        let a_left = LEFT_INSET + look.active as f32 * w;
+        let backdrop = if glass.is_some() {
+            format!(
+                "<img src=\"{}\" style=\"position:absolute;left:0;top:0;width:{}px;height:{}px\">",
+                theme::backdrop_url(),
+                look.width,
+                theme::BACKDROP_HEIGHT
+            )
+        } else {
+            String::new()
         };
         let doc = format!(
-            "<!doctype html><html><body style=\"margin:0;background:{strip_bg};font-family:system-ui,-apple-system,\
-             Helvetica,sans-serif\"><div style=\"display:flex;align-items:flex-end;height:40px;\
-             padding-left:{LEFT_INSET}px;box-sizing:border-box\">{html}<div id=plus style=\"width:28px;height:28px;\
-             flex-shrink:0;margin:0 0 3px 6px;border-radius:14px;display:flex;align-items:center;justify-content:center;\
-             font-size:20px;font-weight:300;color:{plus_color};background:{plus_bg}\">+</div>{badge}</div></body></html>"
+            "<!doctype html><html><body style=\"margin:0;background:{};font-family:{}\">{backdrop}\
+             <div style=\"position:relative;display:flex;height:40px;padding-left:{LEFT_INSET}px;box-sizing:border-box\">\
+             {html}<div id=plus style=\"position:relative;width:{PLUS_WIDTH}px;height:40px;flex-shrink:0;display:flex;\
+             align-items:center;justify-content:center;background:{}\"><div style=\"position:relative;width:12px;height:12px\">\
+             <div style=\"position:absolute;left:0;top:5.25px;width:12px;height:1.5px;background:{plus_color}\"></div>\
+             <div style=\"position:absolute;left:5.25px;top:0;width:1.5px;height:12px;background:{plus_color}\"></div></div>\
+             <div style=\"position:absolute;right:0;top:0;width:1px;height:40px;background:{line}\"></div></div>{badge}</div>\
+             <div style=\"position:absolute;left:0;top:39px;width:{a_left:.2}px;height:1px;background:{line}\"></div>\
+             <div style=\"position:absolute;left:{:.2}px;top:39px;width:{:.2}px;height:1px;background:{line}\"></div>\
+             </body></html>",
+            if glass.is_some() {
+                "transparent"
+            } else {
+                theme::STRIP
+            },
+            theme::FONT,
+            if plus_over {
+                theme::fill(theme::HOVER, 0.5)
+            } else {
+                "transparent".to_owned()
+            },
+            a_left + w,
+            (look.width - a_left - w).max(0.0),
         );
         let mut ids: Vec<String> = Vec::with_capacity(n * 3 + 1);
         for i in 0..n {
@@ -254,7 +298,12 @@ impl TabStrip {
         }
         ids.push("plus".into());
         let idr: Vec<&str> = ids.iter().map(String::as_str).collect();
-        let (px, rects) = render_snippet(
+        let render = if glass.is_some() {
+            render_glass_snippet
+        } else {
+            render_snippet
+        };
+        let (px, rects) = render(
             layout,
             raster,
             &doc,
@@ -277,44 +326,35 @@ fn favicon_url(i: usize) -> Url {
     Url::parse(&format!("huginn-favicon:{i}")).expect("valid URL")
 }
 
-/// A globe drawn with CSS: a circle, a meridian ellipse and the equator.
-fn globe(color: &str) -> String {
-    format!(
-        "<div style=\"position:relative;width:16px;height:16px\">\
-         <div style=\"position:absolute;left:1px;top:1px;width:11px;height:11px;border:1.5px solid {color};border-radius:8px\"></div>\
-         <div style=\"position:absolute;left:5px;top:1px;width:3px;height:11px;border:1.5px solid {color};border-radius:4px\"></div>\
-         <div style=\"position:absolute;left:1px;top:7px;width:14px;height:1.5px;background:{color}\"></div></div>"
-    )
+/// The mark for pages without a favicon: an accent asterisk of three bars.
+fn asterisk(color: &str) -> String {
+    let mut s = String::from("<div style=\"position:relative;width:16px;height:16px\">");
+    for deg in [0, 60, 120] {
+        s.push_str(&format!(
+            "<div style=\"position:absolute;left:7px;top:2px;width:2px;height:12px;background:{color};\
+             transform:rotate({deg}deg)\"></div>"
+        ));
+    }
+    s.push_str("</div>");
+    s
 }
 
-/// Chrome's loading throbber: a blue arc turning once a second, in `r` (window CSS px).
-fn spinner(frame: &mut [u32], stride: usize, r: Rect, scale: f32, since: Instant) {
-    let size = 16.0 * scale;
-    let (cx, cy) = ((r.x + 8.0) * scale, (r.y + 8.0) * scale);
-    let radius = 6.5 * scale;
-    let half = 1.0 * scale;
-    let t = since.elapsed().as_secs_f32();
-    let start = (t * std::f32::consts::TAU) % std::f32::consts::TAU;
-    let sweep = std::f32::consts::PI * (1.0 + 0.5 * (t * 2.0).sin());
+/// The loading indicator in the icon box `r` (window CSS px): a 2 x 2 grid
+/// of small squares; the lit one steps clockwise, 90 degrees every 120 ms.
+fn spinner(frame: &mut [u32], stride: usize, r: Rect, scale: f32, since: Instant, rgb: u32) {
+    const CELLS: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+    let lit = (since.elapsed().as_millis() / 120 % 4) as usize;
     let rows = frame.len() / stride;
-    let (x0, y0) = (
-        (cx - size / 2.0).max(0.0) as usize,
-        (cy - size / 2.0).max(0.0) as usize,
-    );
-    for y in y0..((cy + size / 2.0) as usize).min(rows) {
-        for x in x0..((cx + size / 2.0) as usize).min(stride) {
-            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-            let d = (dx * dx + dy * dy).sqrt();
-            let cover = (half + 0.5 - (d - radius).abs()).clamp(0.0, 1.0);
-            if cover <= 0.0 {
-                continue;
+    let d = |v: f32| (v * scale).round().max(0.0) as usize;
+    for (i, (cx, cy)) in CELLS.into_iter().enumerate() {
+        let (x, y) = (r.x + 3.0 + cx * 6.0, r.y + 3.0 + cy * 6.0);
+        let a = if i == lit { 255 } else { 60 };
+        for row in d(y)..d(y + 4.0).min(rows) {
+            for p in
+                &mut frame[row * stride + d(x).min(stride)..row * stride + d(x + 4.0).min(stride)]
+            {
+                *p = blend(*p, rgb, a);
             }
-            let a = (dy.atan2(dx) - start).rem_euclid(std::f32::consts::TAU);
-            if a > sweep {
-                continue;
-            }
-            let p = &mut frame[y * stride + x];
-            *p = blend(*p, 0x000B_57D0, (cover * 255.0) as u32);
         }
     }
 }

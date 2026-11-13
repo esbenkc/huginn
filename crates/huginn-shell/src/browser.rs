@@ -706,6 +706,7 @@ impl Browser {
         let release = ev.kind == MouseKind::Up;
         let cursor = match area {
             Press::Strip(hit) => {
+                self.toolbar.set_hover(None);
                 self.strip_mouse(&ev, hit);
                 CursorKind::Default
             }
@@ -713,6 +714,7 @@ impl Browser {
                 if ev.kind == MouseKind::Down && ev.button == MouseButton::Left {
                     self.toolbar_click(hit);
                 }
+                self.toolbar.set_hover(hit);
                 self.set_strip_hover(None);
                 if hit == Some(ToolbarHit::Field) {
                     CursorKind::Text
@@ -721,6 +723,7 @@ impl Browser {
                 }
             }
             Press::Page => {
+                self.toolbar.set_hover(None);
                 self.set_strip_hover(None);
                 if ev.kind == MouseKind::Down {
                     self.toolbar.blur();
@@ -940,6 +943,27 @@ impl Browser {
             .toolbar
             .pixels(&mut self.layout, &mut self.raster, &info, width, self.scale);
         px.blit(&mut frame[..page_top * w], w, 0, strip_rows);
+        // Loading: a thin accent bar sweeps along the bottom of the toolbar.
+        if let Some(since) = self.tabs[a].loading_since() {
+            let t = since.elapsed().as_secs_f32() % 1.4 / 1.4;
+            let seg = width * 0.25;
+            let mut canvas = Canvas {
+                frame: &mut frame[..page_top * w],
+                width: w,
+                height: page_top,
+                scale: self.scale,
+                clip: (0, strip_rows, w, page_top),
+            };
+            canvas.fill(
+                Rect {
+                    x: t * (width + seg) - seg,
+                    y: PAGE_TOP - 2.0,
+                    width: seg,
+                    height: 2.0,
+                },
+                crate::theme::accent_rgb(self.private),
+            );
+        }
 
         // Window overlays: find bar, menus, popups.
         let mut canvas = Canvas {
@@ -963,6 +987,7 @@ impl Browser {
                 .url()
                 .is_some_and(|u| self.shared.borrow().is_bookmarked(u)),
             zoom: tab.zoom,
+            private: self.private,
         }
     }
 
@@ -988,10 +1013,13 @@ impl Browser {
         let width = self.css_width();
         let html = format!(
             "<body style=\"margin:0\"><div style=\"display:flex\"><div id=s style=\"max-width:{:.0}px;\
-             overflow:hidden;white-space:pre;background:#f8f9fa;border:1px solid #dadce0;border-left:0;\
-             border-bottom:0;border-top-right-radius:6px;padding:3px 8px;font-family:system-ui,sans-serif;\
-             font-size:12px;color:#3c4043\">{}</div></div></body>",
+             overflow:hidden;white-space:pre;background:{};border:1px solid {};border-left:0;\
+             border-bottom:0;padding:4px 8px;font-family:{};font-size:11px;color:{}\">{}</div></div></body>",
             width * 0.6,
+            crate::theme::TOOLBAR,
+            crate::theme::HAIRLINE,
+            crate::theme::FONT,
+            crate::theme::MUTED,
             crate::engine::escape_html(url)
         );
         let images = huginn_net::ImageStore::new();

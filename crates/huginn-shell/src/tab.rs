@@ -42,6 +42,8 @@ pub const LINE_SCROLL: f32 = 40.0;
 /// Height of one raster strip of the page layer, in document CSS px.
 const STRIP_HEIGHT: f32 = 256.0;
 const WHITE: u32 = 0x00FF_FFFF;
+/// A fully see-through pixel (window format: transparency in the top byte).
+const CLEAR: u32 = 0xFF00_0000;
 
 pub type TabId = u64;
 
@@ -100,6 +102,8 @@ struct Strips {
     strips: Vec<Option<(Pixels, u64)>>,
     clock: u64,
     budget: usize,
+    /// Rasterized on a transparent canvas (internal pages over the acrylic).
+    glass: bool,
 }
 
 impl Strips {
@@ -112,11 +116,19 @@ impl Strips {
             // Visible strips (a viewport can touch one more than it covers)
             // plus one prefetched above and one below.
             budget: page_rows.div_ceil(rows) + 3,
+            glass: false,
         }
     }
 
     fn clear(&mut self) {
         self.strips = Vec::new();
+    }
+
+    fn set_glass(&mut self, on: bool) {
+        if on != self.glass {
+            self.glass = on;
+            self.clear();
+        }
     }
 
     fn count(&self) -> usize {
@@ -145,7 +157,10 @@ impl Strips {
                 height: self.rows as f32 / scale,
             };
             let _span = crate::perf::span("raster");
-            let list = huginn_paint::build_display_list(tree, Some(region));
+            let mut list = huginn_paint::build_display_list(tree, Some(region));
+            if self.glass {
+                list.canvas = huginn_style::Color::TRANSPARENT;
+            }
             let px = Pixels::from_rgba(raster.rasterize(&list, region, scale));
             while self.count() >= self.budget {
                 let lru = self
@@ -928,6 +943,7 @@ impl Tab {
     /// Rasterize one strip just outside the viewport if it is missing.
     /// Returns true if it did work (call again when idle).
     pub(crate) fn prefetch(&mut self, raster: &mut CpuRasterizer) -> bool {
+        self.strips.set_glass(self.glass_page());
         let Some(view) = &self.view else { return false };
         if self.dirty || !self.visible {
             return false;
@@ -949,6 +965,12 @@ impl Tab {
         false
     }
 
+    /// Internal pages show the blurred desktop through their background
+    /// when the chrome is acrylic; web pages stay opaque.
+    fn glass_page(&self) -> bool {
+        crate::theme::material() && self.url().is_some_and(|u| u.scheme() == "huginn")
+    }
+
     /// Draw the page area into `frame` rows `top..top + height` (device px).
     pub(crate) fn compose(
         &mut self,
@@ -957,9 +979,11 @@ impl Tab {
         top: usize,
         raster: &mut CpuRasterizer,
     ) {
+        let glass = self.glass_page();
+        self.strips.set_glass(glass);
         let page = &mut frame[top * stride..];
         let page_rows = (page.len() / stride).min(self.height as usize);
-        page[..page_rows * stride].fill(WHITE);
+        page[..page_rows * stride].fill(if glass { CLEAR } else { WHITE });
         let Some(view) = &self.view else { return };
         let scale = self.page_scale();
         let first = (self.scroll * scale).round() as usize;
@@ -1000,8 +1024,8 @@ impl Tab {
         let x0 = x1.saturating_sub((6.0 * self.scale) as usize);
         for y in y0..(y0 + thumb).min(page_rows) {
             for p in &mut page[y * w + x0..y * w + x1] {
-                // 50% black over the page.
-                *p = (*p >> 1) & 0x007F_7F7F;
+                // 50% black over the page (premultiplied: see-through stays so).
+                *p = ((*p >> 1) & 0x007F_7F7F) | (*p & 0xFF00_0000);
             }
         }
     }

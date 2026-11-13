@@ -42,3 +42,11 @@ winit = { workspace = true, features = ["x11", "wayland", "wayland-dlopen", "way
 softbuffer = { workspace = true, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
 # The system clipboard (X11 selections, Wayland data control). Text only.
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+
+# macOS: see-through windows (src/glass.rs): a behind-window blur view and a
+# CALayer that keeps alpha. The same crates softbuffer already builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "objc2"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "objc2", "CGColorSpace", "CGDataProvider", "CGImage"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "CALayer", "CATransaction"] }

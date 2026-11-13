@@ -7,8 +7,11 @@ use huginn_net::{ImageStore, Url};
 use huginn_paint::{CpuRasterizer, Rasterizer, RgbaImage};
 use huginn_style::{StyleEngine, Viewport};
 
-/// Pixels in the window's format: 0RGB `u32`, stored little-endian as
-/// (B, G, R, 0) bytes, so copying a row into the frame is a plain load.
+/// Pixels in the window's format: `u32` with premultiplied RGB in the low
+/// 24 bits and the transparency (255 - alpha) in the top byte, stored
+/// little-endian as (B, G, R, T) bytes, so copying a row into the frame is a
+/// plain load. Opaque pixels are plain 0RGB; only the acrylic chrome and
+/// internal pages on macOS have see-through pixels (`theme::material`).
 pub(crate) struct Pixels {
     pub width: usize,
     pub height: usize,
@@ -16,12 +19,13 @@ pub(crate) struct Pixels {
 }
 
 impl Pixels {
-    /// Converts in place: no second buffer.
+    /// Premultiplied RGBA to the window format. Converts in place: no
+    /// second buffer.
     pub fn from_rgba(img: RgbaImage) -> Pixels {
         let mut data = img.data;
         for p in data.chunks_exact_mut(4) {
             p.swap(0, 2);
-            p[3] = 0;
+            p[3] = 255 - p[3];
         }
         Pixels {
             width: img.width as usize,
@@ -44,7 +48,7 @@ impl Pixels {
     }
 }
 
-/// `src` is (B, G, R, 0) bytes. Pixels past the end of `src` stay as they are.
+/// `src` is (B, G, R, T) bytes. Pixels past the end of `src` stay as they are.
 pub(crate) fn copy_row(dst: &mut [u32], src: &[u8]) {
     for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
         *d = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
@@ -99,6 +103,53 @@ pub(crate) fn render_snippet(
     images: &ImageStore,
     scale: f32,
 ) -> (Pixels, Vec<Rect>) {
+    render(
+        layout,
+        raster,
+        html,
+        (width, height),
+        ids,
+        images,
+        scale,
+        false,
+    )
+}
+
+/// [`render_snippet`] on a transparent canvas: where the snippet paints
+/// nothing, the pixels are see-through (the acrylic chrome).
+pub(crate) fn render_glass_snippet(
+    layout: &mut LayoutEngine,
+    raster: &mut CpuRasterizer,
+    html: &str,
+    width: f32,
+    height: f32,
+    ids: &[&str],
+    images: &ImageStore,
+    scale: f32,
+) -> (Pixels, Vec<Rect>) {
+    render(
+        layout,
+        raster,
+        html,
+        (width, height),
+        ids,
+        images,
+        scale,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render(
+    layout: &mut LayoutEngine,
+    raster: &mut CpuRasterizer,
+    html: &str,
+    (width, height): (f32, f32),
+    ids: &[&str],
+    images: &ImageStore,
+    scale: f32,
+    transparent: bool,
+) -> (Pixels, Vec<Rect>) {
     let (tree, rects) = layout_snippet(layout, html, width, height, ids, images);
     let region = Rect {
         x: 0.0,
@@ -106,7 +157,10 @@ pub(crate) fn render_snippet(
         width,
         height,
     };
-    let list = huginn_paint::build_display_list(&tree, Some(region));
+    let mut list = huginn_paint::build_display_list(&tree, Some(region));
+    if transparent {
+        list.canvas = huginn_style::Color::TRANSPARENT;
+    }
     (
         Pixels::from_rgba(raster.rasterize(&list, region, scale)),
         rects,
@@ -167,7 +221,10 @@ impl Canvas<'_> {
         for y in y0..y1 {
             for p in &mut self.frame[y * self.width + x0..y * self.width + x1] {
                 let d = |shift: u32| (*p >> shift) & 0xFF;
-                *p = ((d(16) * cr / 255) << 16) | ((d(8) * cg / 255) << 8) | (d(0) * cb / 255);
+                *p = (*p & 0xFF00_0000)
+                    | ((d(16) * cr / 255) << 16)
+                    | ((d(8) * cg / 255) << 8)
+                    | (d(0) * cb / 255);
             }
         }
     }
@@ -212,12 +269,14 @@ impl Canvas<'_> {
     }
 }
 
-/// `dst` 0RGB blended with `rgb` at `a`/255.
+/// Opaque `rgb` at `a`/255 over `dst` (window format, so a see-through
+/// `dst` becomes as opaque as the coverage makes it).
 pub(crate) fn blend(dst: u32, rgb: u32, a: u32) -> u32 {
     let mix = |shift: u32| {
         let d = (dst >> shift) & 0xFF;
         let s = (rgb >> shift) & 0xFF;
         ((s * a + d * (255 - a)) / 255) << shift
     };
-    mix(16) | mix(8) | mix(0)
+    // The transparency of `rgb` is 0: the top byte shrinks with coverage.
+    mix(24) | mix(16) | mix(8) | mix(0)
 }

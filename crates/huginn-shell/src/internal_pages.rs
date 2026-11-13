@@ -1,6 +1,8 @@
 //! Internal `huginn:` pages (new tab, history, bookmarks), the bookmarks
 //! file and address bar input. The UI makes the HTML from session data; the
-//! engine loads it like any page but shows it at the `huginn:` URL.
+//! engine loads it like any page but shows it at the `huginn:` URL. The pages
+//! wear the chrome's Forest Mono look; with the acrylic material their
+//! background is see-through and the content sits on clear panels.
 
 use std::path::PathBuf;
 
@@ -8,6 +10,7 @@ use huginn_net::Url;
 
 use crate::engine::escape_html;
 use crate::session::Shared;
+use crate::theme;
 
 pub const NEW_TAB: &str = "huginn://newtab/";
 pub const HISTORY: &str = "huginn://history/";
@@ -32,32 +35,93 @@ pub fn html(u: &Url, shared: &Shared, private: bool) -> Option<String> {
     }
     Some(match u.host_str().unwrap_or("") {
         "newtab" => new_tab(shared, private),
-        "history" => history(shared),
-        "bookmarks" => bookmarks(shared),
+        "history" => history(shared, private),
+        "bookmarks" => bookmarks(shared, private),
         _ => page(
             "Not found",
-            &format!("<h1>Not found</h1><p>{}</p>", escape_html(u.as_str())),
+            &format!(
+                "{}<p>{}</p>",
+                heading("Not found", private),
+                escape_html(u.as_str())
+            ),
+            private,
         ),
     })
 }
 
-fn page(title: &str, body: &str) -> String {
+/// Hairlines on the page: solid, or light over the acrylic.
+fn line() -> &'static str {
+    if theme::material() {
+        "rgba(227,242,234,0.13)"
+    } else {
+        theme::HAIRLINE
+    }
+}
+
+fn page(title: &str, body: &str, private: bool) -> String {
+    let accent = theme::accent(private);
+    let line = line();
+    // Opaque: the strip colour. Acrylic: no background (the blurred desktop
+    // shows) and clear panels with a lit top edge.
+    let (bg, panel, tile) = if theme::material() {
+        (
+            "transparent",
+            "background:rgba(11,26,20,0.58);border:1px solid rgba(227,242,234,0.16);\
+             border-top-color:rgba(255,255,255,0.5);padding:28px 32px",
+            "rgba(11,26,20,0.55)",
+        )
+    } else {
+        (theme::STRIP, "", "transparent")
+    };
     format!(
         "<!doctype html><html><head><title>{}</title><style>\
-         body{{margin:0;font-family:system-ui,-apple-system,Helvetica,sans-serif;color:#202124;background:#fff}}\
-         main{{max-width:760px;margin:0 auto;padding:40px 24px}}\
-         h1{{font-size:24px;font-weight:500;margin:0 0 24px}}\
-         a{{color:#1a0dab;text-decoration:none}}\
-         .row{{display:flex;align-items:baseline;padding:8px 12px;border-bottom:1px solid #eceef1}}\
-         .t{{flex:1;min-width:0;overflow:hidden;white-space:nowrap;font-size:14px}}\
-         .h{{color:#5f6368;font-size:12px;margin-left:16px;white-space:nowrap}}\
-         .empty{{color:#5f6368;font-size:14px}}\
-         .tiles{{display:flex;flex-wrap:wrap;justify-content:center;margin-top:32px}}\
-         .tile{{display:block;width:112px;margin:8px;padding:16px 8px;border-radius:12px;background:#f1f3f4;\
-         text-align:center;font-size:13px;color:#202124;overflow:hidden;white-space:nowrap}}\
+         html{{background:{bg}}}\
+         body{{margin:0;font-family:{font};font-size:13px;color:{text}}}\
+         svg{{display:block}}\
+         main{{max-width:760px;margin:0 auto;padding:48px 24px}}\
+         .panel{{{panel}}}\
+         h1{{display:flex;align-items:center;font-size:11px;font-weight:400;color:{muted};text-transform:uppercase;\
+         letter-spacing:0.14em;margin:0 0 8px;padding-bottom:14px;border-bottom:1px solid {line}}}\
+         h1 svg{{margin-right:10px}}\
+         a{{color:{accent};text-decoration:none}}\
+         .row{{display:flex;align-items:baseline;padding:10px 0;border-bottom:1px solid {line}}}\
+         .t{{flex:1;min-width:0;overflow:hidden;white-space:nowrap}}\
+         .h{{color:{muted};font-size:10px;margin-left:16px;white-space:nowrap;text-transform:uppercase;letter-spacing:0.06em}}\
+         .empty{{color:{muted}}}\
+         .hero{{position:relative;padding-top:24px}}\
+         .slab{{position:relative;width:440px;height:440px;margin:24px auto 0}}\
+         .slab>svg{{position:absolute;left:0;top:0}}\
+         .slab .hero{{padding:44px}}\
+         .flock{{position:absolute;right:44px;top:56px}}\
+         .word{{font-size:56px;line-height:1;letter-spacing:0.32em;text-transform:uppercase;color:{text};margin-top:36px}}\
+         .sub{{font-size:11px;letter-spacing:0.14em;text-transform:uppercase;color:{muted};margin-top:16px}}\
+         .priv{{display:inline-block;font-size:10px;letter-spacing:0.12em;color:{accent};border:1px solid {accent};\
+         padding:3px 8px;margin-top:20px}}\
+         .tiles{{display:flex;flex-wrap:wrap;width:680px;margin:40px auto 0;border-top:1px solid {line};border-left:1px solid {line}}}\
+         .tile{{display:block;width:170px;height:68px;box-sizing:border-box;padding:14px;background:{tile};\
+         border-right:1px solid {line};border-bottom:1px solid {line};overflow:hidden;white-space:nowrap}}\
+         .tt{{display:block;font-size:12px;color:{text};overflow:hidden}}\
+         .th{{display:block;font-size:10px;color:{muted};margin-top:10px;text-transform:uppercase;letter-spacing:0.06em;overflow:hidden}}\
          </style></head><body><main>{body}</main></body></html>",
-        escape_html(title)
+        escape_html(title),
+        font = theme::FONT,
+        text = theme::TEXT,
+        muted = theme::MUTED,
     )
+}
+
+/// A page heading: the accent asterisk and an uppercase label.
+fn heading(label: &str, private: bool) -> String {
+    format!(
+        "<h1>{}<span>{}</span></h1>",
+        theme::asterisk_svg(12, theme::accent(private)),
+        escape_html(label)
+    )
+}
+
+/// Wrap a list page's body in a panel (acrylic) or nothing (opaque).
+fn panel(body: &str) -> String {
+    format!("<div class=panel>{body}</div>")
 }
 
 fn row(url: &Url, title: &str) -> String {
@@ -87,52 +151,68 @@ fn new_tab(shared: &Shared, private: bool) -> String {
             continue;
         }
         seen.push(u);
-        let label = if t.is_empty() {
-            u.host_str().unwrap_or(u.as_str())
-        } else {
-            t
-        };
+        let host = u.host_str().unwrap_or(u.scheme());
+        let label = if t.is_empty() { host } else { t };
         tiles.push_str(&format!(
-            "<a class=tile href=\"{}\">{}</a>",
+            "<a class=tile href=\"{}\"><span class=tt>{}</span><span class=th>{}</span></a>",
             escape_html(u.as_str()),
-            escape_html(label)
+            escape_html(label),
+            escape_html(host)
         ));
     }
-    page(
-        "New Tab",
-        &format!(
-            "<div style=\"text-align:center;margin-top:120px\"><div style=\"font-size:56px;font-weight:600;\
-             letter-spacing:-1px;color:#3c4043\">Huginn</div><div style=\"color:#5f6368;font-size:14px;margin-top:8px\">\
-             {}</div></div><div class=tiles>{tiles}</div>",
-            if private {
-                "Private window: pages you visit are not kept in history"
-            } else {
-                "Search DuckDuckGo or type a URL"
-            }
-        ),
-    )
+    let accent = theme::accent(private);
+    let hero = format!(
+        "<div class=hero>{}<div class=flock>{}</div><div class=word>Huginn</div>{}<div class=sub>{}</div></div>",
+        theme::asterisk_svg(56, accent),
+        theme::flock_svg(150),
+        if private {
+            "<div class=priv>PRIVATE</div>"
+        } else {
+            ""
+        },
+        if private {
+            "Pages you visit are not kept in history"
+        } else {
+            "Search DuckDuckGo or type a URL"
+        }
+    );
+    // Acrylic: the mark sits in a clear slab with electronics inside.
+    let hero = if theme::material() {
+        format!(
+            "<div class=slab>{}{hero}</div>",
+            theme::slab_svg(440, 440, 0x4E45_5754_4142)
+        )
+    } else {
+        hero
+    };
+    let tiles = if tiles.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=tiles>{tiles}</div>")
+    };
+    page("New Tab", &format!("{hero}{tiles}"), private)
 }
 
-fn history(shared: &Shared) -> String {
-    let mut body = String::from("<h1>History</h1>");
+fn history(shared: &Shared, private: bool) -> String {
+    let mut body = heading("History", private);
     if shared.visits.is_empty() {
         body.push_str("<p class=empty>No pages visited in this session.</p>");
     }
     for v in shared.visits.iter().rev() {
         body.push_str(&row(&v.url, &v.title));
     }
-    page("History", &body)
+    page("History", &panel(&body), private)
 }
 
-fn bookmarks(shared: &Shared) -> String {
-    let mut body = String::from("<h1>Bookmarks</h1>");
+fn bookmarks(shared: &Shared, private: bool) -> String {
+    let mut body = heading("Bookmarks", private);
     if shared.bookmarks.is_empty() {
         body.push_str("<p class=empty>No bookmarks yet. Press \u{2318}D on a page to add one.</p>");
     }
     for b in &shared.bookmarks {
         body.push_str(&row(&b.url, &b.title));
     }
-    page("Bookmarks", &body)
+    page("Bookmarks", &panel(&body), private)
 }
 
 /// Address bar input to a URL: full URLs as typed, paths as files, bare

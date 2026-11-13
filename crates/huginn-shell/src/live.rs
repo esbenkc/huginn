@@ -205,11 +205,12 @@ pub fn draw_page(tab: &Tab, c: &mut Canvas) {
 /// Draw over the window: the `<select>` drop-down.
 pub fn draw_window(tab: &mut Tab, c: &mut Canvas) {
     let scale = c.scale;
+    let private = tab.private;
     if let Some(p) = &mut tab.live.select {
         let r = p.menu.rect();
         let px = p
             .pixels
-            .get_or_insert_with(|| render(&p.menu.html(), r.width, r.height, scale));
+            .get_or_insert_with(|| render(&p.menu.html(private), r.width, r.height, scale));
         c.blit(px, r.x, r.y);
     }
 }

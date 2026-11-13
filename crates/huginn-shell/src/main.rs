@@ -12,6 +12,8 @@
 mod browser;
 mod clipboard;
 mod engine;
+#[cfg(target_os = "macos")]
+mod glass;
 mod headless;
 mod input;
 mod interact;
@@ -26,6 +28,7 @@ mod session;
 mod shortcuts;
 mod tab;
 mod tabstrip;
+mod theme;
 mod toolbar;
 mod ui;
 mod window;
