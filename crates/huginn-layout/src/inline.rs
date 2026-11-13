@@ -84,6 +84,8 @@ pub(crate) struct Ifc {
     pub final_balance: Option<(f32, f32)>,
     /// The laid-out text (whitespace collapsed), kept only for the text index.
     pub text: Option<String>,
+    /// Set when the shaped layout goes back to the shape cache after the pass.
+    pub shape: Option<crate::shape::Ticket>,
 }
 
 fn resolve_lpa_zero(v: LengthPercentageAuto, basis: Option<f32>) -> f32 {

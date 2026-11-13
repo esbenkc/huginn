@@ -409,6 +409,10 @@ fn load(
     let mut layout = page.layout_engine.take().unwrap_or_default();
     // Selection, find and copy read the rendered text (render never builds it).
     layout.set_text_index(true);
+    // The page is laid out again after every change: keep its shaped text.
+    // `HUGINN_SHAPE_CACHE=0` turns that off, to tell whether a layout bug
+    // comes from the cache.
+    layout.set_shape_cache(std::env::var_os("HUGINN_SHAPE_CACHE").is_none_or(|v| v != "0"));
     page.register_fonts(&mut layout);
     let tree = page.layout(&mut layout, viewport);
     let shown_at_url = error.is_some() || internal || url.scheme() == "about";
