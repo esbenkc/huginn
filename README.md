@@ -87,7 +87,8 @@ window has the normal title bar, and the shortcuts are Chrome's Linux ones
 cargo build --release -p huginn-shell
 ```
 
-The binary is `target/release/huginn`. `--profile bench-release` gives the
+The binary is `target/release/huginn`. On macOS, `packaging/macos/make-app.sh` wraps it in
+`~/Applications/Huginn.app`, so Spotlight, Launchpad and the Dock can open it. `--profile bench-release` gives the
 fastest binary (fat LTO); use it for benchmark numbers.
 
 ## Use
