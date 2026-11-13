@@ -580,11 +580,15 @@ pub fn escape_html(s: &str) -> String {
 }
 
 fn error_page(url: &Url, error: &str) -> String {
+    use crate::theme::{FONT, HAIRLINE, MUTED, STRIP, TEXT, WARN};
     format!(
         "<!doctype html><title>Cannot load page</title>\
-         <body style=\"margin:64px;font-family:system-ui,sans-serif;color:#333\">\
-         <h1 style=\"font-size:24px;font-weight:600\">This page could not be loaded</h1>\
-         <p style=\"color:#555\">{}</p><p style=\"color:#888;font-size:13px\">{}</p></body>",
+         <body style=\"margin:64px;background:{STRIP};font-family:{FONT};color:{TEXT}\">\
+         <div style=\"font-size:10px;letter-spacing:0.14em;color:{WARN};border:1px solid {WARN};display:inline-block;\
+         padding:3px 8px\">ERROR</div>\
+         <h1 style=\"font-size:20px;font-weight:400;margin:24px 0 16px;padding-bottom:16px;border-bottom:1px solid {HAIRLINE}\">\
+         This page could not be loaded</h1>\
+         <p style=\"color:{TEXT}\">{}</p><p style=\"color:{MUTED};font-size:12px\">{}</p></body>",
         escape_html(url.as_str()),
         escape_html(error)
     )

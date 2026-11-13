@@ -23,13 +23,21 @@ pub fn view_source_html(loader: &Loader, target: &Url) -> Result<String, String>
     let mut out = String::with_capacity(text.len() * 2 + 1024);
     out.push_str("<!doctype html><html><head><meta charset=utf-8><title>view-source:");
     out.push_str(&escape_html(target.as_str()));
-    out.push_str(
-        "</title><style>body{margin:0;font:13px/1.35 Menlo,monospace;color:#000;background:#fff}\
-         div{display:flex;white-space:pre}\
-         b{font-weight:normal;flex:none;width:52px;padding-right:10px;text-align:right;color:#999;\
-         border-right:1px solid #ddd;margin-right:10px}\
-         .t{color:#881280}.n{color:#994500}.v{color:#1a1aa6}.c{color:#236e25}.d{color:#c0c0c0}</style></head><body>",
-    );
+    // Forest Mono: dark, monospace, tags in the accent.
+    out.push_str(&format!(
+        "</title><style>html{{background:{bg}}}body{{margin:0;font:13px/1.4 {font};color:{text}}}\
+         div{{display:flex;white-space:pre}}\
+         b{{font-weight:normal;flex:none;width:52px;padding-right:10px;text-align:right;color:{dim};\
+         border-right:1px solid {line};margin-right:10px}}\
+         .t{{color:{mint}}}.n{{color:#9fd8b8}}.v{{color:#e8c27a}}.c{{color:#5d7a6c}}.d{{color:{muted}}}</style></head><body>",
+        bg = crate::theme::STRIP,
+        font = crate::theme::FONT,
+        text = crate::theme::TEXT,
+        dim = crate::theme::DIM,
+        line = crate::theme::HAIRLINE,
+        mint = crate::theme::MINT,
+        muted = crate::theme::MUTED,
+    ));
     for (i, line) in highlight(&text).split('\n').enumerate() {
         out.push_str(&format!("<div><b>{}</b><span>{}</span></div>", i + 1, line));
     }

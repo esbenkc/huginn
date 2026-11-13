@@ -1,9 +1,11 @@
 //! A drawn menu (context menu, `<select>` dropdown): a small HTML document
-//! rendered by our pipeline, light macOS style. Coordinates are window CSS px.
+//! rendered by our pipeline, a square Forest Mono panel with an accent rule
+//! on the highlighted item. Coordinates are window CSS px.
 
 use huginn_layout::Rect;
 
 use crate::engine::escape_html;
+use crate::theme;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MenuItem {
@@ -12,6 +14,8 @@ pub struct MenuItem {
     /// A line above this item.
     pub separator: bool,
     pub checked: bool,
+    /// The key chord that does the same, shown at the right ("" for none).
+    pub shortcut: &'static str,
 }
 
 impl MenuItem {
@@ -21,6 +25,7 @@ impl MenuItem {
             enabled: true,
             separator: false,
             checked: false,
+            shortcut: "",
         }
     }
 
@@ -31,6 +36,11 @@ impl MenuItem {
 
     pub fn after_separator(mut self) -> MenuItem {
         self.separator = true;
+        self
+    }
+
+    pub fn shortcut(mut self, chord: &'static str) -> MenuItem {
+        self.shortcut = chord;
         self
     }
 }
@@ -47,6 +57,10 @@ pub const ITEM_HEIGHT: f32 = 22.0;
 const SEPARATOR_HEIGHT: f32 = 11.0;
 const PAD_Y: f32 = 5.0;
 const MIN_WIDTH: f32 = 180.0;
+/// Advance of the 12 px monospace label font, and of the 10 px tracked
+/// shortcut labels.
+const CHAR_W: f32 = 7.2;
+const SHORTCUT_CHAR_W: f32 = 6.6;
 
 pub struct Menu {
     pub items: Vec<MenuItem>,
@@ -63,10 +77,17 @@ impl Menu {
     pub fn new(items: Vec<MenuItem>, x: f32, y: f32, win_w: f32, win_h: f32) -> Menu {
         let longest = items
             .iter()
-            .map(|i| i.label.chars().count())
-            .max()
-            .unwrap_or(0) as f32;
-        let width = (longest * 7.2 + 44.0).clamp(MIN_WIDTH, 420.0);
+            .map(|i| {
+                let keys = i.shortcut.chars().count() as f32;
+                i.label.chars().count() as f32 * CHAR_W
+                    + if keys > 0.0 {
+                        keys * SHORTCUT_CHAR_W + 24.0
+                    } else {
+                        0.0
+                    }
+            })
+            .fold(0.0, f32::max);
+        let width = (longest + 44.0).clamp(MIN_WIDTH, 420.0);
         let mut m = Menu {
             items,
             x,
@@ -160,30 +181,51 @@ impl Menu {
         }
     }
 
-    /// The menu as an HTML document `width` x `height` CSS px.
-    pub fn html(&self) -> String {
+    /// The menu as an HTML document `width` x `height` CSS px; `private`
+    /// picks the accent.
+    pub fn html(&self, private: bool) -> String {
+        let accent = theme::accent(private);
         let mut rows = String::new();
         for (i, it) in self.items.iter().enumerate() {
             if it.separator {
-                rows.push_str("<div style=\"height:1px;margin:5px 0;background:#e3e3e3\"></div>");
+                rows.push_str(&format!(
+                    "<div style=\"height:1px;margin:5px 0;background:{}\"></div>",
+                    theme::HAIRLINE
+                ));
             }
-            let (bg, fg) = match (self.hovered == Some(i), it.enabled) {
-                (true, _) => ("#0a63d8", "#fff"),
-                (false, true) => ("transparent", "#1d1d1f"),
-                (false, false) => ("transparent", "#a7a7a7"),
-            };
+            let hovered = self.hovered == Some(i);
+            let fg = if it.enabled { theme::TEXT } else { theme::DIM };
             rows.push_str(&format!(
-                "<div style=\"height:{ITEM_HEIGHT}px;line-height:{ITEM_HEIGHT}px;margin:0 5px;padding:0 10px 0 21px;\
-                 border-radius:4px;background:{bg};color:{fg};white-space:pre;overflow:hidden;position:relative\">\
-                 {}{}</div>",
-                if it.checked { "<span style=\"position:absolute;left:7px\">\u{2713}</span>" } else { "" },
-                escape_html(&it.label)
+                "<div style=\"height:{ITEM_HEIGHT}px;line-height:{ITEM_HEIGHT}px;padding:0 12px 0 22px;display:flex;\
+                 background:{};color:{fg};white-space:pre;overflow:hidden;position:relative\">{}{}\
+                 <div style=\"flex-grow:1;min-width:0;overflow:hidden\">{}</div>\
+                 <div style=\"flex-shrink:0;margin-left:24px;font-size:10px;color:{};{}\">{}</div></div>",
+                if hovered { theme::HOVER } else { "transparent" },
+                if hovered {
+                    format!(
+                        "<div style=\"position:absolute;left:0;top:0;width:2px;height:{ITEM_HEIGHT}px;background:{accent}\"></div>"
+                    )
+                } else {
+                    String::new()
+                },
+                if it.checked {
+                    format!("<span style=\"position:absolute;left:7px;color:{accent}\">\u{2713}</span>")
+                } else {
+                    String::new()
+                },
+                escape_html(&it.label),
+                theme::MUTED,
+                theme::LABEL,
+                escape_html(it.shortcut)
             ));
         }
         format!(
-            "<!doctype html><html><body style=\"margin:0;font:13px system-ui,-apple-system,Helvetica,sans-serif\">\
-             <div style=\"box-sizing:border-box;width:{w}px;height:{h}px;padding:{PAD_Y}px 0;background:#f6f6f6;\
-             border:1px solid #c8c8c8;border-radius:7px;overflow:hidden\">{rows}</div></body></html>",
+            "<!doctype html><html><body style=\"margin:0;font:12px {}\">\
+             <div style=\"box-sizing:border-box;width:{w}px;height:{h}px;padding:{PAD_Y}px 0;background:{};\
+             border:1px solid {};overflow:hidden\">{rows}</div></body></html>",
+            theme::FONT,
+            theme::TOOLBAR,
+            theme::HAIRLINE,
             w = self.width,
             h = self.height(),
         )

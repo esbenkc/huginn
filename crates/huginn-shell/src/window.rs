@@ -33,10 +33,21 @@ use crate::tab::{LINE_SCROLL, TabId};
 
 type UserEvent = (TabId, EngineEvent);
 
+/// Where frames go: softbuffer, or on macOS with the acrylic material our
+/// own layer that keeps alpha (`glass.rs`).
+enum Surface {
+    // Field order is drop order: the surface before its context.
+    Soft {
+        surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
+        _context: softbuffer::Context<Rc<Window>>,
+    },
+    #[cfg(target_os = "macos")]
+    Glass(crate::glass::GlassSurface),
+}
+
 struct Win {
     // Field order is drop order: the surface before the window it draws into.
-    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
-    _context: softbuffer::Context<Rc<Window>>,
+    surface: Surface,
     window: Rc<Window>,
     /// The session's key for this window's `Browser`.
     key: u64,
@@ -88,6 +99,10 @@ pub fn run(
         // Fails only after the event loop exited.
         let _ = proxy.lock().expect("proxy lock").send_event((id, ev));
     });
+    // The acrylic material: macOS windows, unless HUGINN_OPAQUE_UI=1.
+    crate::theme::set_material(
+        cfg!(target_os = "macos") && std::env::var_os("HUGINN_OPAQUE_UI").is_none_or(|v| v != "1"),
+    );
     let session = Session::new(js, notify, (width as f32, height as f32), 1.0, false);
     let mut app = App {
         session,
@@ -182,18 +197,35 @@ impl App {
         let attrs = attrs
             .with_titlebar_transparent(true)
             .with_title_hidden(true)
-            .with_fullsize_content_view(true);
+            .with_fullsize_content_view(true)
+            .with_transparent(crate::theme::material());
         let window = Rc::new(
             el.create_window(attrs)
                 .map_err(|e| format!("cannot create window: {e}"))?,
         );
-        let context =
-            softbuffer::Context::new(window.clone()).map_err(|e| format!("softbuffer: {e}"))?;
-        let surface = softbuffer::Surface::new(&context, window.clone())
-            .map_err(|e| format!("softbuffer: {e}"))?;
+        #[cfg(target_os = "macos")]
+        let glass = crate::theme::material();
+        #[cfg(not(target_os = "macos"))]
+        let glass = false;
+        let surface = if glass {
+            #[cfg(target_os = "macos")]
+            {
+                Surface::Glass(crate::glass::GlassSurface::new(&window)?)
+            }
+            #[cfg(not(target_os = "macos"))]
+            unreachable!("the material is macOS only")
+        } else {
+            let context =
+                softbuffer::Context::new(window.clone()).map_err(|e| format!("softbuffer: {e}"))?;
+            let surface = softbuffer::Surface::new(&context, window.clone())
+                .map_err(|e| format!("softbuffer: {e}"))?;
+            Surface::Soft {
+                surface,
+                _context: context,
+            }
+        };
         let mut win = Win {
             surface,
-            _context: context,
             window,
             key,
             title: String::new(),
@@ -211,8 +243,14 @@ impl Win {
     fn resize_surface(&mut self, session: &mut Session) {
         let size = self.window.inner_size();
         if let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) {
-            // Only fails on platforms without resize support.
-            let _ = self.surface.resize(w, h);
+            match &mut self.surface {
+                // Only fails on platforms without resize support.
+                Surface::Soft { surface, .. } => {
+                    let _ = surface.resize(w, h);
+                }
+                #[cfg(target_os = "macos")]
+                Surface::Glass(g) => g.resize(w.get(), h.get(), self.window.scale_factor()),
+            }
             if let Some(b) = session.window_mut(self.key) {
                 b.resize(w.get(), h.get(), self.window.scale_factor() as f32);
             }
@@ -230,16 +268,30 @@ impl Win {
         if b.size() != (size.width, size.height) {
             return Ok(());
         }
-        let mut buffer = self
-            .surface
-            .buffer_mut()
-            .map_err(|e| format!("softbuffer: {e}"))?;
-        if buffer.len() != size.width as usize * size.height as usize {
-            return Ok(());
+        let pixels = size.width as usize * size.height as usize;
+        match &mut self.surface {
+            Surface::Soft { surface, .. } => {
+                let mut buffer = surface
+                    .buffer_mut()
+                    .map_err(|e| format!("softbuffer: {e}"))?;
+                if buffer.len() != pixels {
+                    return Ok(());
+                }
+                b.compose(&mut buffer);
+                let _span = crate::perf::span("present");
+                buffer.present().map_err(|e| format!("softbuffer: {e}"))
+            }
+            #[cfg(target_os = "macos")]
+            Surface::Glass(g) => {
+                let buffer = g.buffer();
+                if buffer.len() != pixels {
+                    return Ok(());
+                }
+                b.compose(buffer);
+                let _span = crate::perf::span("present");
+                g.present()
+            }
         }
-        b.compose(&mut buffer);
-        let _span = crate::perf::span("present");
-        buffer.present().map_err(|e| format!("softbuffer: {e}"))
     }
 
     fn set_cursor(&mut self, cursor: CursorKind) {
