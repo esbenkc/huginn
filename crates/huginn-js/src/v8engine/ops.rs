@@ -854,14 +854,14 @@ op!(op_fetch(scope, args, rv) {
 // `document.cookie` (no HttpOnly cookies).
 op!(op_cookie(scope, args, rv) {
     let Some(cx) = host(scope) else { return };
-    let c = cx.loader.cookies().document_cookie(cx.document_url);
+    let c = cx.loader.cookies().document_cookie(cx.document_url, cx.document_url);
     set_str(scope, &mut rv, &c);
 });
 
 op!(op_set_cookie(scope, args, rv) {
     let Some(cx) = host(scope) else { return };
     let v = arg_str(scope, &args, 0);
-    cx.loader.cookies().set_document_cookie(cx.document_url, &v);
+    cx.loader.cookies().set_document_cookie(cx.document_url, cx.document_url, &v);
 });
 
 op!(op_referrer(scope, args, rv) {

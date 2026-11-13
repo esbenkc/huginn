@@ -16,6 +16,7 @@ struct Req {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
+    body: String,
 }
 
 impl Req {
@@ -48,6 +49,7 @@ fn serve(
                 method: parts.next().unwrap_or("").to_owned(),
                 path: parts.next().unwrap_or("").to_owned(),
                 headers: Vec::new(),
+                body: String::new(),
             };
             let mut len = 0;
             loop {
@@ -65,6 +67,7 @@ fn serve(
             }
             let mut body = vec![0; len];
             r.read_exact(&mut body).unwrap();
+            req.body = String::from_utf8_lossy(&body).into_owned();
             let (head, body) = handler(&req);
             seen.lock().unwrap().push(req);
             let head = head.replace('\n', "\r\n");
@@ -239,9 +242,10 @@ fn cross_origin_requests_follow_cors() {
 }
 
 #[test]
-fn same_site_cookies_and_referrer_across_sites() {
+fn third_party_cookies_are_partitioned_and_referrer_crosses_sites() {
     // Site B (`localhost`) sets its cookies on a visit, then links to site A
-    // (127.0.0.1), whose page calls B with credentials.
+    // (127.0.0.1), whose page calls B with credentials. B's first-party
+    // cookies, `SameSite=None` included, stay in B's own partition.
     let (a, _) = serve(|_| {
         html(
             "",
@@ -275,8 +279,63 @@ fn same_site_cookies_and_referrer_across_sites() {
     );
     assert_eq!(
         title(&s[0]),
-        format!("B saw [none=1] referrer http://localhost:{b}/")
+        format!("B saw [] referrer http://localhost:{b}/")
     );
+}
+
+#[test]
+fn pages_opening_new_tabs_get_no_strict_cookies_and_keep_form_bodies() {
+    // The victim (127.0.0.1) sets a Strict and a Lax cookie on a visit; its
+    // /echo shows what arrived. The attacker page (localhost) opens it in a
+    // new tab by script: a `target=_blank` link click, or a form submit.
+    let (victim, log) = serve(|r| match r.path.as_str() {
+        "/" => html(
+            "Set-Cookie: s=1; SameSite=Strict; Path=/\nSet-Cookie: l=1; Path=/",
+            "<title>victim</title>",
+        ),
+        _ => html(
+            "",
+            &format!(
+                "<title>[{}] {} {}</title>",
+                r.header("cookie"),
+                r.method,
+                r.body
+            ),
+        ),
+    });
+    let (attacker, _) = serve(move |r| {
+        let echo = format!("http://127.0.0.1:{victim}/echo");
+        let body = if r.path.contains("form") {
+            format!(
+                "<form id=f method=post action='{echo}' target=_blank><input name=a value=1></form>\
+                 <script>document.getElementById('f').submit()</script>"
+            )
+        } else {
+            format!(
+                "<a id=x target=_blank href='{echo}'>x</a><script>document.getElementById('x').click()</script>"
+            )
+        };
+        html("", &body)
+    });
+    for (path, want) in [("/link", "[l=1] GET"), ("/form", "[] POST a=1")] {
+        let s = run(
+            &format!("http://127.0.0.1:{victim}/"),
+            &format!(
+                "wait; key cmd+l; type http://localhost:{attacker}{path}; key enter; wait; sleep 300; state"
+            ),
+            &[],
+        );
+        assert_eq!(s[0]["tabs"].as_array().map(Vec::len), Some(2), "{path}");
+        assert_eq!(title(&s[0]), want, "{path}");
+    }
+    let log = log.lock().unwrap();
+    let echoes: Vec<&Req> = log.iter().filter(|r| r.path == "/echo").collect();
+    assert_eq!(echoes.len(), 2);
+    for r in echoes {
+        assert_eq!(r.header("sec-fetch-site"), "cross-site");
+        assert_eq!(r.header("sec-fetch-user"), "");
+        assert!(r.header("referer").starts_with("http://localhost:"));
+    }
 }
 
 #[test]

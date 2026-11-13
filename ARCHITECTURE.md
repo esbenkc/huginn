@@ -451,6 +451,45 @@ one thread (`n_threads = 1`); images still decode in parallel on the six
 fetch threads. Not supported yet: grid (tiled) AVIF, `irot`/`imir`/`clap`
 transforms, animation (the first frame is shown).
 
+## Cookies and cross-origin requests
+
+`huginn-net` owns the cookie jar (`cookies.rs`, RFC 6265bis), referrer
+policy (`referrer.rs`) and CORS (`cors.rs`). `Loader::send` follows
+redirects itself, one hop at a time, so every hop gets its own `Cookie`,
+`Referer`, `Origin` and `Sec-Fetch-*` headers.
+
+- Profiles: normal windows share a jar saved to `cookies.tsv` in the
+  profile directory (0600 file, 0700 directory, written through a new temp
+  file and a rename). All private windows share one in-memory jar, dropped
+  when the last one closes. `huginn render` uses an in-memory jar.
+- Third-party cookies are partitioned by top-level site, like Firefox's
+  Total Cookie Protection. A request from a page to another site (an image,
+  a script, `fetch()`) reads and writes only the cookies stored under the
+  page's site (`site_key`: scheme and registrable domain). The third
+  party's own first-party cookies are never sent there, and two top-level
+  sites never share a third party's cookies, so a tracker cannot follow
+  the user from site to site. First-party cookies (top-level navigations
+  and same-site requests) are unchanged. `document.cookie` of a cross-site
+  frame would see only its partition (`CookieJar::document_cookie` takes
+  the top-level URL); Huginn does not run frames yet. Cookies under an
+  opaque top-level origin (`file:`, `data:`) are never sent to third
+  parties.
+- SameSite: navigations a page starts (links, forms, `location`, in the
+  same tab, a new tab or a new window) carry the page as initiator, so a
+  cross-site page gets Lax cookies on `GET` only and never Strict ones.
+  Only the browser UI (address bar, bookmarks, menus) navigates without an
+  initiator (`Sec-Fetch-Site: none`, `Sec-Fetch-User: ?1`); if such a chain
+  redirects to another site, the rest of it is cross-site.
+- Local Network Access: requests from a page on a public address, other
+  than top-level navigations, may not reach loopback or private addresses.
+  The check runs in the resolver on the resolved addresses (a second ureq
+  agent, made on first use), so DNS rebinding cannot get around it.
+  `localhost` and `*.localhost` always resolve to loopback, never through
+  DNS, because the jar treats them as secure.
+- Eviction (180 cookies per site, 3300 in total) removes expired cookies,
+  then non-secure ones, then the least recently used, so an insecure origin
+  cannot flood out a Secure cookie and shadow it.
+
 ## External crates
 
 Versions are the ones in `Cargo.lock`.

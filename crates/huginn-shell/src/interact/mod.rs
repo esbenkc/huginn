@@ -26,7 +26,7 @@ use huginn_paint::CpuRasterizer;
 
 use crate::engine::{EngineEvent, escape_html};
 use crate::input::{CursorKind, Key, KeyEvent, MouseButton, MouseEvent, MouseKind};
-use crate::tab::{PAGE_TOP, Request, Tab};
+use crate::tab::{Opener, PAGE_TOP, Request, Tab};
 use crate::ui::{Canvas, Pixels, render_snippet};
 use menu::{Menu, MenuItem, MenuKey};
 
@@ -887,18 +887,30 @@ fn open_context_menu(tab: &mut Tab, x: f32, y: f32) {
         actions.push(action);
     };
     if let Some(url) = &link {
+        let page = Opener {
+            initiator: tab.initiator(),
+            post: None,
+        };
         add(
             MenuItem::new("Open Link in New Tab"),
             Action::Request(Request::OpenTab {
                 url: url.clone(),
                 background: true,
+                opener: Box::new(page.clone()),
             }),
         );
+        // Another profile in a private window: nothing of this page goes along.
+        let (normal, private) = if tab.private {
+            (Opener::default(), page)
+        } else {
+            (page, Opener::default())
+        };
         add(
             MenuItem::new("Open Link in New Window"),
             Action::Request(Request::OpenWindow {
                 url: url.clone(),
                 private: false,
+                opener: Box::new(normal),
             }),
         );
         add(
@@ -906,6 +918,7 @@ fn open_context_menu(tab: &mut Tab, x: f32, y: f32) {
             Action::Request(Request::OpenWindow {
                 url: url.clone(),
                 private: true,
+                opener: Box::new(private),
             }),
         );
         add(
@@ -927,6 +940,7 @@ fn open_context_menu(tab: &mut Tab, x: f32, y: f32) {
                 Action::Request(Request::OpenTab {
                     url,
                     background: false,
+                    opener: Box::default(),
                 }),
             );
         }

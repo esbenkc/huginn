@@ -54,16 +54,27 @@ pub enum Request {
     OpenTab {
         url: Url,
         background: bool,
+        opener: Box<Opener>,
     },
     OpenWindow {
         url: Url,
         private: bool,
+        opener: Box<Opener>,
     },
     Back,
     Forward,
     Reload,
     /// Open `view-source:<url>` of this tab in a new tab.
     ViewSource,
+}
+
+/// Where a new tab or window's first load comes from: the page that opened
+/// it (`Referer`, `SameSite`, `Sec-Fetch-Site`) and a form body. The
+/// default is the user (the address bar, a menu of the browser itself).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Opener {
+    pub initiator: Option<Client>,
+    pub post: Option<PostData>,
 }
 
 /// The page on screen.
@@ -677,23 +688,34 @@ impl Tab {
         button: MouseButton,
         mods: Modifiers,
     ) {
+        let initiator = self.initiator();
         if mods.cmd || button == MouseButton::Middle {
             self.request(Request::OpenTab {
                 url,
                 background: !mods.shift,
+                opener: Box::new(Opener { initiator, post }),
             });
         } else if mods.shift {
             self.request(Request::OpenWindow {
                 url,
                 private: self.private,
+                opener: Box::new(Opener { initiator, post }),
             });
         } else {
-            let initiator = self.url().filter(|_| self.error.is_none()).map(|u| Client {
-                url: u.clone(),
-                referrer_policy: self.referrer_policy,
-            });
             self.navigate_with(url, post, initiator);
         }
+    }
+
+    /// The current page as the initiator of the navigations it starts.
+    /// `None` for error pages and the browser's own `huginn:` pages: their
+    /// links count as the user's.
+    pub(crate) fn initiator(&self) -> Option<Client> {
+        self.url()
+            .filter(|u| self.error.is_none() && !matches!(u.scheme(), "huginn" | "view-source"))
+            .map(|u| Client {
+                url: u.clone(),
+                referrer_policy: self.referrer_policy,
+            })
     }
 
     // ----- lifecycle ---------------------------------------------------------

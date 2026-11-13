@@ -16,7 +16,7 @@ use crate::input::{CursorKind, Key, KeyEvent, MouseButton, MouseEvent, MouseKind
 use crate::internal_pages::{self, parse_input};
 use crate::session::{ClosedTab, Shared, ZOOM_LEVELS};
 use crate::shortcuts::{self, Action};
-use crate::tab::{PAGE_TOP, Request, TABSTRIP_HEIGHT, Tab, TabId};
+use crate::tab::{Opener, PAGE_TOP, Request, TABSTRIP_HEIGHT, Tab, TabId};
 use crate::tabstrip::{StripHit, TabStrip};
 use crate::toolbar::{Edit, Toolbar, ToolbarHit, ToolbarInfo};
 use crate::ui::{Canvas, Pixels};
@@ -35,6 +35,7 @@ pub enum WindowOp {
     NewWindow {
         url: Option<Url>,
         private: bool,
+        opener: Box<Opener>,
     },
     /// Close this window (its tabs are gone).
     Close,
@@ -293,11 +294,26 @@ impl Browser {
     /// Open a tab on `url` (or the new tab page, with the address bar
     /// focused) at `at` (default: the end). Returns its index.
     pub fn open_tab(&mut self, url: Option<Url>, background: bool, at: Option<usize>) -> usize {
+        self.open_tab_from(url, Opener::default(), background, at)
+    }
+
+    /// [`Browser::open_tab`] for a page's link or form (`from`).
+    pub fn open_tab_from(
+        &mut self,
+        url: Option<Url>,
+        from: Opener,
+        background: bool,
+        at: Option<usize>,
+    ) -> usize {
         let id = self.shared.borrow_mut().new_tab_id();
         let (w, h) = self.page_size_device();
         let mut tab = Tab::new(id, self.shared.clone(), self.private, w, h, self.scale);
         let new_tab_page = url.is_none();
-        tab.navigate(url.unwrap_or_else(|| internal_pages::url(internal_pages::NEW_TAB)));
+        tab.navigate_with(
+            url.unwrap_or_else(|| internal_pages::url(internal_pages::NEW_TAB)),
+            from.post,
+            from.initiator,
+        );
         let at = at.unwrap_or(self.tabs.len()).min(self.tabs.len());
         self.tabs.insert(at, tab);
         if at <= self.active && self.tabs.len() > 1 {
@@ -385,13 +401,13 @@ impl Browser {
     /// Open `url` from tab `opener` in a new tab, like Chrome: a foreground
     /// tab goes right after the opener, a background tab after the tabs the
     /// opener already opened.
-    fn open_child_tab(&mut self, opener: usize, url: Url, background: bool) {
+    fn open_child_tab(&mut self, opener: usize, url: Url, background: bool, from: Opener) {
         let opener_id = self.tabs[opener].id;
         let at = match self.child_insert {
             Some((id, at)) if id == opener_id && background => at,
             _ => opener + 1,
         };
-        let at = self.open_tab(Some(url), background, Some(at));
+        let at = self.open_tab_from(Some(url), from, background, Some(at));
         if background {
             self.child_insert = Some((opener_id, at + 1));
         }
@@ -403,10 +419,19 @@ impl Browser {
         for r in requests {
             match r {
                 Request::Navigate(u) => self.tabs[i].navigate(u),
-                Request::OpenTab { url, background } => self.open_child_tab(i, url, background),
-                Request::OpenWindow { url, private } => self.ops.push(WindowOp::NewWindow {
+                Request::OpenTab {
+                    url,
+                    background,
+                    opener,
+                } => self.open_child_tab(i, url, background, *opener),
+                Request::OpenWindow {
+                    url,
+                    private,
+                    opener,
+                } => self.ops.push(WindowOp::NewWindow {
                     url: Some(url),
                     private,
+                    opener,
                 }),
                 Request::Back => self.tabs[i].back(),
                 Request::Forward => self.tabs[i].forward(),
@@ -416,7 +441,7 @@ impl Browser {
                         .url()
                         .and_then(|u| Url::parse(&format!("view-source:{u}")).ok())
                     {
-                        self.open_child_tab(i, u, false);
+                        self.open_child_tab(i, u, false, Opener::default());
                     }
                 }
             }
@@ -461,10 +486,12 @@ impl Browser {
             Action::NewWindow => self.ops.push(WindowOp::NewWindow {
                 url: None,
                 private: false,
+                opener: Box::default(),
             }),
             Action::NewPrivateWindow => self.ops.push(WindowOp::NewWindow {
                 url: None,
                 private: true,
+                opener: Box::default(),
             }),
             Action::CloseTab => self.close_tab(self.active),
             Action::CloseWindow => {
@@ -623,6 +650,7 @@ impl Browser {
             self.ops.push(WindowOp::NewWindow {
                 url: Some(url),
                 private: self.private,
+                opener: Box::default(),
             });
         } else {
             self.tab_mut_active().navigate(url);

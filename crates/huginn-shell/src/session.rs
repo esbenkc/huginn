@@ -15,7 +15,7 @@ use huginn_net::{CookieJar, DecodedImage, Url};
 use crate::browser::{Browser, WindowOp};
 use crate::engine::{self, Command, EngineEvent};
 use crate::internal_pages::{self, Bookmark};
-use crate::tab::{HistoryEntry, TabId};
+use crate::tab::{HistoryEntry, Opener, TabId};
 
 /// Engine events from all tabs, tagged with the tab (0: not tied to a tab).
 pub type Notify = Arc<dyn Fn(TabId, EngineEvent) + Send + Sync>;
@@ -272,6 +272,11 @@ impl Session {
 
     /// Open a window with one tab on `url` (or a new tab page). Returns its index.
     pub fn open_window(&mut self, url: Option<Url>, private: bool) -> usize {
+        self.open_window_from(url, private, Opener::default())
+    }
+
+    /// [`Session::open_window`] for a page's link or form (`from`).
+    pub fn open_window_from(&mut self, url: Option<Url>, private: bool, from: Opener) -> usize {
         self.next_window += 1;
         let (w, h) = (
             (self.size.0 * self.scale).round() as u32,
@@ -285,7 +290,7 @@ impl Session {
             h,
             self.scale,
         );
-        b.open_tab(url, false, None);
+        b.open_tab_from(url, from, false, None);
         self.windows.push(b);
         self.focused = self.windows.len() - 1;
         self.focused
@@ -332,8 +337,12 @@ impl Session {
             let mut closed = false;
             for op in ops {
                 match op {
-                    WindowOp::NewWindow { url, private } => {
-                        self.open_window(url, private);
+                    WindowOp::NewWindow {
+                        url,
+                        private,
+                        opener,
+                    } => {
+                        self.open_window_from(url, private, *opener);
                     }
                     WindowOp::Close => closed = true,
                     WindowOp::Quit => self.quit = true,
