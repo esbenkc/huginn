@@ -171,21 +171,39 @@ fn compile<'s>(
 }
 
 /// Fetch a module's source through the loader, same origin only.
-fn fetch_source(scope: &v8::PinScope<'_, '_>, url: &Url) -> Result<(String, String), String> {
-    let cx = ops::host(scope).ok_or("no host context")?;
-    if !dom_ops::fetch_allowed(cx.document_url, url) {
+fn fetch_module(
+    loader: &huginn_net::Loader,
+    document_url: &Url,
+    url: &Url,
+) -> Result<(String, String), String> {
+    if !dom_ops::fetch_allowed(document_url, url) {
         return Err(format!("cross-origin module {url} not loaded"));
     }
-    let r = cx
-        .loader
+    let r = loader
         .fetch(url, ResourceKind::Script)
         .map_err(|e| format!("cannot load module {url}: {e}"))?;
     Ok((r.text().into_owned(), r.url.to_string()))
 }
 
+fn fetch_source(scope: &v8::PinScope<'_, '_>, url: &Url) -> Result<(String, String), String> {
+    let cx = ops::host(scope).ok_or("no host context")?;
+    fetch_module(cx.loader, cx.document_url, url)
+}
+
+/// Fetch `urls` in parallel; results keep their order.
+fn fetch_all(scope: &v8::PinScope<'_, '_>, urls: &[Url]) -> Vec<Result<(String, String), String>> {
+    let Some(cx) = ops::host(scope) else {
+        return urls.iter().map(|_| Err("no host context".into())).collect();
+    };
+    let (loader, document_url) = (cx.loader, cx.document_url);
+    loader.map_parallel(urls, |u| fetch_module(loader, document_url, u))
+}
+
 /// Compile `source` (whose imports resolve against `base`) and fetch and
 /// compile everything it imports, transitively. `key` registers the root
-/// by URL (None for inline modules).
+/// by URL (None for inline modules). The graph is walked one level at a
+/// time and each level is fetched in parallel, as browsers do: fetching
+/// module by module costs one round trip per module.
 fn load_graph<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     state: &SharedState,
@@ -206,22 +224,46 @@ fn load_graph<'s>(
                 .insert(k.to_owned(), v8::Global::new(scope, root));
         }
     }
-    let mut queue = vec![(root, base.to_owned())];
-    while let Some((m, base)) = queue.pop() {
-        let requests = m.get_module_requests();
-        for i in 0..requests.length() {
-            let Some(req) = requests
-                .get(scope, i)
-                .and_then(|d| v8::Local::<v8::ModuleRequest>::try_from(d).ok())
-            else {
-                continue;
-            };
-            let spec = req.get_specifier().to_rust_string_lossy(scope);
-            let url = resolve(state, &base, &spec).map_err(|e| format!("{base}: {e}"))?;
-            if state.borrow().modules.by_url.contains_key(url.as_str()) {
+    let mut level = vec![(root, base.to_owned())];
+    while !level.is_empty() {
+        let mut wanted: Vec<Url> = Vec::new();
+        for (m, base) in &level {
+            let requests = m.get_module_requests();
+            for i in 0..requests.length() {
+                let Some(req) = requests
+                    .get(scope, i)
+                    .and_then(|d| v8::Local::<v8::ModuleRequest>::try_from(d).ok())
+                else {
+                    continue;
+                };
+                let spec = req.get_specifier().to_rust_string_lossy(scope);
+                let url = resolve(state, base, &spec).map_err(|e| format!("{base}: {e}"))?;
+                if !state.borrow().modules.by_url.contains_key(url.as_str())
+                    && !wanted.contains(&url)
+                {
+                    wanted.push(url);
+                }
+            }
+        }
+        let fetched = fetch_all(scope, &wanted);
+        let mut next = Vec::with_capacity(wanted.len());
+        for (url, r) in wanted.iter().zip(fetched) {
+            let (text, final_url) = r?;
+            // A redirect to a module that is already loaded: the same module.
+            let known = state
+                .borrow()
+                .modules
+                .by_url
+                .get(&final_url)
+                .map(|g| v8::Local::new(scope, g));
+            if let Some(m) = known {
+                state
+                    .borrow_mut()
+                    .modules
+                    .by_url
+                    .insert(url.to_string(), v8::Global::new(scope, m));
                 continue;
             }
-            let (text, final_url) = fetch_source(scope, &url)?;
             let dep = compile(scope, &text, &final_url)
                 .ok_or_else(|| format!("{final_url}: module failed to compile"))?;
             {
@@ -238,8 +280,9 @@ fn load_graph<'s>(
                         .insert(final_url.clone(), v8::Global::new(scope, dep));
                 }
             }
-            queue.push((dep, final_url));
+            next.push((dep, final_url));
         }
+        level = next;
     }
     Ok(root)
 }
@@ -360,10 +403,15 @@ pub(super) fn dynamic_import<'s>(
     Some(promise)
 }
 
-/// Load, run and settle queued `import()` calls. Returns how many settled.
-pub(super) fn run_pending_imports(scope: &mut v8::PinScope<'_, '_>, state: &SharedState) -> usize {
+/// Load, run and settle queued `import()` calls until `deadline`; later ones
+/// stay queued. Returns how many settled.
+pub(super) fn run_pending_imports(
+    scope: &mut v8::PinScope<'_, '_>,
+    state: &SharedState,
+    deadline: std::time::Instant,
+) -> usize {
     let mut n = 0;
-    loop {
+    while std::time::Instant::now() < deadline {
         let next = state.borrow_mut().pending_imports.pop_front();
         let Some((resolver, url)) = next else { break };
         n += 1;

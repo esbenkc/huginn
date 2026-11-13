@@ -422,6 +422,26 @@ fn start_script(scope: &mut v8::PinScope<'_, '_>, st: &SharedState, node: NodeId
     st.borrow_mut().current_script = prev;
 }
 
+/// Fetch the external scripts waiting in `pending_scripts` in parallel, so
+/// running them one by one (in order, as the spec requires) hits the
+/// loader's cache instead of paying one round trip each.
+pub(super) fn prefetch_pending_scripts(scope: &v8::PinScope<'_, '_>, st: &SharedState) {
+    let Some(cx) = host(scope) else { return };
+    let doc: &Document = cx.document;
+    let urls: Vec<(Url, ResourceKind)> = st
+        .borrow()
+        .pending_scripts
+        .iter()
+        .filter_map(|&n| doc.attribute(n, &local_name!("src")))
+        .filter_map(|src| huginn_net::resolve_url(cx.base_url, src))
+        .filter(|u| dom_ops::fetch_allowed(cx.document_url, u))
+        .map(|u| (u, ResourceKind::Script))
+        .collect();
+    if urls.len() > 1 {
+        let _ = cx.loader.fetch_all(&urls);
+    }
+}
+
 /// Fetch (same origin only) and run an external or module script inserted
 /// by script. Returns false if it could not be loaded or failed to compile.
 pub(super) fn run_external_script(

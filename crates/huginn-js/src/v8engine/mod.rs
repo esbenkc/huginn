@@ -757,9 +757,18 @@ fn dispatch_js(
 /// Fetch and run external scripts inserted by script, then fire their
 /// `load` (or `error`) event. Also settles queued `import()` calls.
 /// Returns how many ran.
+///
+/// Fetches are synchronous and the watchdog cannot stop them, so this stops
+/// starting new loads once the call's budget is spent; the rest stay queued
+/// for the next `run_timers` (`next_timer_due` reports them due now).
 fn run_pending(scope: &mut v8::PinScope<'_, '_>, state: &SharedState) -> usize {
+    let deadline = {
+        let st = state.borrow();
+        st.call_start + Duration::from_millis(st.options.call_budget_ms)
+    };
+    ops::prefetch_pending_scripts(scope, state);
     let mut ran = 0;
-    loop {
+    while Instant::now() < deadline {
         let next = state.borrow_mut().pending_scripts.pop_front();
         let Some(node) = next else { break };
         let ok = ops::run_external_script(scope, state, node);
@@ -770,5 +779,5 @@ fn run_pending(scope: &mut v8::PinScope<'_, '_>, state: &SharedState) -> usize {
         scope.perform_microtask_checkpoint();
         ran += 1;
     }
-    ran + modules::run_pending_imports(scope, state)
+    ran + modules::run_pending_imports(scope, state, deadline)
 }
