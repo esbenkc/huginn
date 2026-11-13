@@ -595,7 +595,7 @@ of huginn-shell).
 ### Today
 
 ```rust
-pub enum ScriptKind { Classic, Module }
+pub enum ScriptKind { Classic, Module, ImportMap }  // ImportMap: `<script type="importmap">`, JSON that maps module specifiers
 pub enum ScriptTiming { Blocking, Defer, Async }
 pub struct ScriptRef { pub node: NodeId, pub kind: ScriptKind, pub timing: ScriptTiming, pub src: Option<Url> }
 /// Scripts the HTML spec would run, in document order (skips data blocks and nomodule).

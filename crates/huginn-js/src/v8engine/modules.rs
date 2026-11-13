@@ -1,7 +1,7 @@
-//! ES modules: `<script type="module">` with static imports, and `import()`.
-//! The import graph is fetched up front through the shell's loader (same
-//! origin only), then instantiated and evaluated. Bare specifiers and import
-//! maps are not supported: such imports fail like a missing file.
+//! ES modules: `<script type="module">` with static imports, `import()`, and
+//! import maps. The import graph is fetched up front through the shell's
+//! loader (same origin only), then instantiated and evaluated. Specifiers
+//! resolve through the page's import map (`crate::importmap`).
 
 use std::collections::HashMap;
 
@@ -10,6 +10,7 @@ use huginn_net::{ResourceKind, Url};
 use super::{SharedState, exception_message, ops};
 use crate::ScriptError;
 use crate::dom_ops;
+use crate::importmap::{ImportMap, Json, Resolver};
 
 #[derive(Default)]
 pub(crate) struct ModuleMap {
@@ -17,6 +18,8 @@ pub(crate) struct ModuleMap {
     by_url: HashMap<String, v8::Global<v8::Module>>,
     /// Module identity hash -> URL that relative imports resolve against.
     bases: HashMap<i32, String>,
+    /// The import map and the specifiers resolved so far.
+    resolver: Resolver,
 }
 
 impl ModuleMap {
@@ -26,15 +29,121 @@ impl ModuleMap {
     }
 }
 
-/// Relative and absolute specifiers only (`./a.js`, `/a.js`, `https://...`).
-fn resolve_specifier(base: &str, spec: &str) -> Option<Url> {
-    if let Ok(u) = Url::parse(spec) {
-        return Some(u);
+/// HTML "resolve a module specifier" for a module or script at `base`.
+fn resolve(state: &SharedState, base: &str, spec: &str) -> Result<Url, String> {
+    let base = Url::parse(base).map_err(|e| format!("{base}: {e}"))?;
+    state.borrow_mut().modules.resolver.resolve(spec, &base)
+}
+
+/// `import.meta` for a module: `url` (its URL; the document URL for inline
+/// modules) and `resolve(specifier)`, which resolves like an import would.
+pub(super) unsafe extern "C" fn import_meta(
+    context: v8::Local<'_, v8::Context>,
+    module: v8::Local<'_, v8::Module>,
+    meta: v8::Local<'_, v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    let st = ops::state(scope);
+    let url = st
+        .borrow()
+        .modules
+        .bases
+        .get(&module.get_identity_hash().get())
+        .cloned();
+    let Some(url) = url.and_then(|u| v8::String::new(scope, &u)) else {
+        return;
+    };
+    if let Some(key) = v8::String::new(scope, "url") {
+        meta.create_data_property(scope, key.into(), url.into());
     }
-    if !(spec.starts_with('/') || spec.starts_with("./") || spec.starts_with("../")) {
-        return None;
+    if let (Some(key), Some(f)) = (
+        v8::String::new(scope, "resolve"),
+        v8::Function::builder(meta_resolve)
+            .data(url.into())
+            .build(scope),
+    ) {
+        meta.create_data_property(scope, key.into(), f.into());
     }
-    Url::parse(base).ok()?.join(spec).ok()
+}
+
+fn meta_resolve(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let base = args.data().to_rust_string_lossy(scope);
+    let spec = args.get(0).to_rust_string_lossy(scope);
+    let result = resolve(&ops::state(scope), &base, &spec);
+    match result {
+        Ok(u) => {
+            if let Some(s) = v8::String::new(scope, u.as_str()) {
+                rv.set(s.into());
+            }
+        }
+        Err(e) => {
+            if let Some(m) = v8::String::new(scope, &e) {
+                let e = v8::Exception::type_error(scope, m);
+                scope.throw_exception(e);
+            }
+        }
+    }
+}
+
+/// `<script type="importmap">`: parse the JSON (relative URLs in it resolve
+/// against the document's base URL) and merge it into the page's import map.
+pub(super) fn register_import_map(
+    scope: &mut v8::PinScope<'_, '_>,
+    state: &SharedState,
+    source: &str,
+    url: &str,
+) -> Result<(), ScriptError> {
+    let Some(base) = ops::host(scope).map(|cx| cx.base_url.clone()) else {
+        return Ok(());
+    };
+    v8::tc_scope!(let tc, scope);
+    let error = |message| ScriptError::Runtime {
+        url: url.into(),
+        message,
+    };
+    let Some(text) = v8::String::new(tc, source) else {
+        return Err(error("import map too large".into()));
+    };
+    let Some(value) = v8::json::parse(tc, text) else {
+        return Err(error(exception_message(tc)));
+    };
+    let json = to_json(tc, value, 0);
+    let map = ImportMap::parse(&json, &base).map_err(|m| error(format!("TypeError: {m}")))?;
+    state.borrow_mut().modules.resolver.merge(map);
+    Ok(())
+}
+
+/// The parts of a parsed JSON value an import map uses (objects three levels
+/// deep: top level, "scopes", one scope).
+fn to_json(scope: &mut v8::PinScope<'_, '_>, v: v8::Local<'_, v8::Value>, depth: u32) -> Json {
+    if v.is_string() {
+        return Json::Str(v.to_rust_string_lossy(scope));
+    }
+    if depth > 2 || v.is_array() {
+        return Json::Other;
+    }
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(v) else {
+        return Json::Other;
+    };
+    let Some(names) = obj.get_own_property_names(scope, Default::default()) else {
+        return Json::Map(Vec::new());
+    };
+    let mut out = Vec::with_capacity(names.length() as usize);
+    for i in 0..names.length() {
+        let Some(key) = names.get_index(scope, i) else {
+            continue;
+        };
+        let Some(value) = obj.get(scope, key) else {
+            continue;
+        };
+        let key = key.to_rust_string_lossy(scope);
+        out.push((key, to_json(scope, value, depth + 1)));
+    }
+    Json::Map(out)
 }
 
 fn compile<'s>(
@@ -108,8 +217,7 @@ fn load_graph<'s>(
                 continue;
             };
             let spec = req.get_specifier().to_rust_string_lossy(scope);
-            let url = resolve_specifier(&base, &spec)
-                .ok_or_else(|| format!("{base}: cannot resolve import '{spec}'"))?;
+            let url = resolve(state, &base, &spec).map_err(|e| format!("{base}: {e}"))?;
             if state.borrow().modules.by_url.contains_key(url.as_str()) {
                 continue;
             }
@@ -144,20 +252,22 @@ fn resolve_callback<'s>(
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
-    let found = {
-        let st = ops::state(scope);
-        let st = st.borrow();
-        st.modules
-            .bases
-            .get(&referrer.get_identity_hash().get())
-            .and_then(|base| resolve_specifier(base, &spec))
-            .and_then(|u| {
-                st.modules
-                    .by_url
-                    .get(u.as_str())
-                    .map(|g| v8::Local::new(scope, g))
-            })
-    };
+    let st = ops::state(scope);
+    let base = st
+        .borrow()
+        .modules
+        .bases
+        .get(&referrer.get_identity_hash().get())
+        .cloned();
+    let found = base
+        .and_then(|base| resolve(&st, &base, &spec).ok())
+        .and_then(|u| {
+            st.borrow()
+                .modules
+                .by_url
+                .get(u.as_str())
+                .map(|g| v8::Local::new(scope, g))
+        });
     if found.is_none() {
         // V8 requires an exception when resolution fails.
         let msg = v8::String::new(scope, &format!("cannot resolve module '{spec}'"))?;
@@ -234,15 +344,15 @@ pub(super) fn dynamic_import<'s>(
     {
         base = cx.base_url.to_string();
     }
-    match resolve_specifier(&base, &spec) {
-        Some(u) => {
-            let st = ops::state(scope);
+    let st = ops::state(scope);
+    match resolve(&st, &base, &spec) {
+        Ok(u) => {
             st.borrow_mut()
                 .pending_imports
                 .push_back((v8::Global::new(scope, resolver), u.to_string()));
         }
-        None => {
-            let msg = v8::String::new(scope, &format!("cannot resolve module '{spec}'"))?;
+        Err(e) => {
+            let msg = v8::String::new(scope, &e)?;
             let e = v8::Exception::type_error(scope, msg);
             resolver.reject(scope, e);
         }

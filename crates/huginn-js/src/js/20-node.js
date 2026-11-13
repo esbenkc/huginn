@@ -248,8 +248,8 @@ function mixin(target, source) {
   }
 }
 
-function checkSelector(r) {
-  if (r === null || r === -1) throw domErr('SyntaxError', 'not a valid selector');
+function checkSelector(r, sel) {
+  if (r === null || r === -1) throw domErr('SyntaxError', `'${sel}' is not a valid selector.`);
   return r;
 }
 
@@ -266,8 +266,8 @@ class ParentNode {
     while ((c = this.firstChild)) removeNode(c);
     if (n) insertNode(this, n, null);
   }
-  querySelector(sel) { return wrap(checkSelector(N.qs(this[ID], String(sel)))); }
-  querySelectorAll(sel) { return nodeList(checkSelector(N.qsa(this[ID], String(sel)))); }
+  querySelector(sel) { sel = String(sel); return wrap(checkSelector(N.qs(this[ID], sel), sel)); }
+  querySelectorAll(sel) { sel = String(sel); return nodeList(checkSelector(N.qsa(this[ID], sel), sel)); }
   getElementsByTagName(name) { return htmlCollection(N.byTag(this[ID], String(name))); }
   getElementsByTagNameNS(ns, name) { return htmlCollection(N.byTag(this[ID], String(name))); }
   getElementsByClassName(names) { return htmlCollection(N.byClass(this[ID], String(names))); }

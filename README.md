@@ -133,7 +133,7 @@ Missing or incomplete:
 - No developer tools, extensions, settings page or bookmarks bar.
 - No CSS animations or transitions, no `@container`, no `@media print`.
 - Style and layout run in full after each change, not incrementally.
-- JavaScript: no import maps, no IME, no `contenteditable`. `fetch` and XHR
+- JavaScript: no iframes, no IME, no `contenteditable`. `fetch` and XHR
   after load block the tab.
 - No disk cache. History lasts for one session.
 

@@ -106,64 +106,70 @@ defProp(G, 'webkitURL', { value: URL, writable: true, configurable: true });
 
 // ------------------------------------------------------------- encoding --
 
+// UTF-8 and the legacy encodings run natively (`N.utf8Encode`, `N.decode`).
 class TextEncoder {
   get encoding() { return 'utf-8'; }
-  encode(s) {
-    s = s === undefined ? '' : String(s);
-    const out = [];
-    for (let i = 0; i < s.length; i++) {
-      let c = s.charCodeAt(i);
-      if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
-        const d = s.charCodeAt(i + 1);
-        if (d >= 0xdc00 && d < 0xe000) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
-        else c = 0xfffd;
-      } else if (c >= 0xd800 && c < 0xe000) c = 0xfffd;
-      if (c < 0x80) out.push(c);
-      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-      else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-      else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-    }
-    return new Uint8Array(out);
-  }
+  encode(s = '') { return N.utf8Encode(String(s)); }
   encodeInto(s, dest) {
-    const b = this.encode(s);
-    const n = Math.min(b.length, dest.length);
-    dest.set(b.subarray(0, n));
-    return { read: s.length, written: n };
+    s = String(s);
+    if (!(dest instanceof Uint8Array)) throw new TypeError("Failed to execute 'encodeInto' on 'TextEncoder': parameter 2 is not of type 'Uint8Array'.");
+    const b = N.utf8Encode(s);
+    if (b.length <= dest.length) { dest.set(b); return { read: s.length, written: b.length }; }
+    // Only whole characters fit.
+    let read = 0, written = 0;
+    while (read < s.length) {
+      const c = s.codePointAt(read);
+      const n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+      if (written + n > dest.length) break;
+      read += c > 0xffff ? 2 : 1;
+      written += n;
+    }
+    dest.set(b.subarray(0, written));
+    return { read, written };
   }
 }
 expose(TextEncoder);
+const TD = Symbol('huginn.decoder');
 class TextDecoder {
-  constructor(label, options) {
-    this.encoding = String(label || 'utf-8').toLowerCase().replace(/^utf8$/, 'utf-8');
-    this.fatal = !!(options && options.fatal);
-    this.ignoreBOM = !!(options && options.ignoreBOM);
+  constructor(label = 'utf-8', options = undefined) {
+    const enc = N.encLabel(String(label));
+    if (enc === null) throw new RangeError(`Failed to construct 'TextDecoder': The encoding label provided ('${label}') is invalid.`);
+    const o = options == null ? {} : options;
+    defProp(this, TD, { value: { enc, fatal: !!o.fatal, ignoreBOM: !!o.ignoreBOM, pending: null, bomSeen: false } });
   }
-  decode(input) {
-    if (input === undefined) return '';
-    const b = input instanceof ArrayBuffer ? new Uint8Array(input) : new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-    if (this.encoding !== 'utf-8') {
-      let s = '';
-      for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-      return s;
+  get encoding() { return this[TD].enc; }
+  get fatal() { return this[TD].fatal; }
+  get ignoreBOM() { return this[TD].ignoreBOM; }
+  // With `{stream: true}`, an incomplete character at the end of `input` is
+  // kept for the next call.
+  decode(input = undefined, options = undefined) {
+    const st = this[TD];
+    const stream = !!(options && options.stream);
+    let bytes;
+    if (input === undefined) bytes = new Uint8Array(0);
+    else if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer === 'function' && input instanceof SharedArrayBuffer)) bytes = new Uint8Array(input);
+    else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    else throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+    if (st.pending !== null) {
+      const b = new Uint8Array(st.pending.length + bytes.length);
+      b.set(st.pending);
+      b.set(bytes, st.pending.length);
+      bytes = b;
+      st.pending = null;
     }
-    let s = '';
-    let i = (!this.ignoreBOM && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) ? 3 : 0;
-    const chunk = [];
-    const flush = () => { s += String.fromCharCode.apply(null, chunk); chunk.length = 0; };
-    while (i < b.length) {
-      const c = b[i++];
-      let cp;
-      if (c < 0x80) cp = c;
-      else if (c >= 0xc2 && c < 0xe0 && i < b.length) cp = ((c & 31) << 6) | (b[i++] & 63);
-      else if (c >= 0xe0 && c < 0xf0 && i + 1 < b.length) { cp = ((c & 15) << 12) | ((b[i] & 63) << 6) | (b[i + 1] & 63); i += 2; }
-      else if (c >= 0xf0 && c < 0xf5 && i + 2 < b.length) { cp = ((c & 7) << 18) | ((b[i] & 63) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63); i += 3; }
-      else { if (this.fatal) throw new TypeError('The encoded data was not valid.'); cp = 0xfffd; }
-      if (cp >= 0x10000) { cp -= 0x10000; chunk.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 1023)); }
-      else chunk.push(cp);
-      if (chunk.length > 8000) flush();
+    let s;
+    try {
+      s = N.decode(bytes, st.enc, st.fatal, stream);
+    } catch (e) {
+      st.bomSeen = false;
+      throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
     }
-    flush();
+    if (typeof s !== 'string') { st.pending = bytes.slice(bytes.length - s[1]); s = s[0]; }
+    if (!st.bomSeen && s.length) {
+      st.bomSeen = true;
+      if (!st.ignoreBOM && s.charCodeAt(0) === 0xfeff && /^utf-(8|16[lb]e)$/.test(st.enc)) s = s.slice(1);
+    }
+    if (!stream) { st.bomSeen = false; st.pending = null; }
     return s;
   }
 }
@@ -214,11 +220,11 @@ class Blob {
     this.type = options && options.type ? String(options.type).toLowerCase() : '';
   }
   get size() { return this._bytes.length; }
-  slice(start, end, type) { const b = new Blob([], { type }); defProp(b, '_bytes', { value: this._bytes.slice(start, end) }); return b; }
+  slice(start, end, type) { return new Blob([this._bytes.subarray(start, end)], { type }); }
   text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }
   arrayBuffer() { return Promise.resolve(this._bytes.slice().buffer); }
   bytes() { return Promise.resolve(this._bytes.slice()); }
-  stream() { throw domErr('NotSupportedError', 'streams are not supported'); }
+  stream() { return streams().bytesStream(this._bytes.slice()); }
 }
 expose(Blob);
 class File extends Blob {
@@ -308,22 +314,71 @@ class Headers {
 }
 expose(Headers);
 
+// A body's source (`_body`) is null, a string, a Uint8Array or a
+// ReadableStream. Scripts that read `body` get a stream, made on first use;
+// text() and friends read the source directly when no stream exists.
+const BODY = Symbol('huginn.body');
+const USED = Symbol('huginn.used');
+function isReadableStream(v) { return streamsLib !== null && v instanceof streamsLib.ReadableStream; }
+function bodyStream(b) {
+  if (b[BODY] !== undefined) return b[BODY];
+  return isReadableStream(b._body) ? b._body : null;
+}
+function extractBody(body) {
+  if (body === undefined || body === null) return null;
+  if (typeof body === 'string') return body;
+  if (isReadableStream(body)) {
+    if (streams().isDisturbed(body) || streams().isStreamLocked(body)) throw new TypeError('Response body object should not be disturbed or locked');
+    return body;
+  }
+  if (body instanceof Blob) return body._bytes.slice();
+  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
+  return String(body);
+}
+const bodyText = b => b === null ? '' : typeof b === 'string' ? b : new TextDecoder().decode(b);
+const bodyBytes = b => b === null ? new Uint8Array(0) : typeof b === 'string' ? new TextEncoder().encode(b) : b;
 class Body {
-  _text() { return this._body === null ? '' : this._body; }
+  get body() {
+    const b = this._body;
+    if (b === null) return null;
+    let s = bodyStream(this);
+    if (s === null) {
+      // A body already read by text() and friends streams as empty.
+      const bytes = this[USED] ? new Uint8Array(0) : typeof b === 'string' ? new TextEncoder().encode(b) : b.slice();
+      s = streams().bytesStream(bytes);
+      defProp(this, BODY, { value: s, writable: true, configurable: true });
+    }
+    return s;
+  }
+  get bodyUsed() {
+    if (this[USED]) return true;
+    const s = bodyStream(this);
+    return s !== null && streams().isDisturbed(s);
+  }
+  // The whole body: null, a string or a Uint8Array.
   _consume() {
     if (this.bodyUsed) return Promise.reject(new TypeError('body stream already read'));
-    defProp(this, 'bodyUsed', { value: true });
-    return Promise.resolve(this._text());
+    const s = bodyStream(this);
+    if (s !== null) {
+      if (streams().isStreamLocked(s)) return Promise.reject(new TypeError('body stream is locked'));
+      return streams().readAllBytes(s);
+    }
+    defProp(this, USED, { value: true });
+    return Promise.resolve(this._body);
   }
-  text() { return this._consume(); }
-  json() { return this._consume().then(t => JSON.parse(t)); }
-  arrayBuffer() { return this._consume().then(t => new TextEncoder().encode(t).buffer); }
-  bytes() { return this._consume().then(t => new TextEncoder().encode(t)); }
-  blob() { return this._consume().then(t => new Blob([t], { type: this.headers.get('content-type') || '' })); }
-  formData() { return this._consume().then(t => { const f = new FormData(); new URLSearchParams(t).forEach((v, k) => f.append(k, v)); return f; }); }
-  get body() { return null; }
+  text() { return this._consume().then(bodyText); }
+  json() { return this._consume().then(b => JSON.parse(bodyText(b))); }
+  arrayBuffer() {
+    return this._consume().then(b => {
+      const u = bodyBytes(b);
+      return u.byteOffset === 0 && u.byteLength === u.buffer.byteLength ? u.buffer : u.slice().buffer;
+    });
+  }
+  bytes() { return this._consume().then(bodyBytes); }
+  blob() { return this._consume().then(b => new Blob([bodyBytes(b)], { type: this.headers.get('content-type') || '' })); }
+  formData() { return this._consume().then(b => { const f = new FormData(); new URLSearchParams(bodyText(b)).forEach((v, k) => f.append(k, v)); return f; }); }
 }
-Body.prototype.bodyUsed = false;
 class Request extends Body {
   constructor(input, init) {
     super();
@@ -356,10 +411,24 @@ class Response extends Body {
     this.type = 'default';
     this.url = '';
     this.redirected = false;
-    defProp(this, '_body', { value: body === undefined || body === null ? null : typeof body === 'string' ? body : body instanceof Blob ? new TextDecoder().decode(body._bytes) : ArrayBuffer.isView(body) || body instanceof ArrayBuffer ? new TextDecoder().decode(body) : String(body) });
+    defProp(this, '_body', { value: extractBody(body), writable: true });
   }
   get ok() { return this.status >= 200 && this.status < 300; }
-  clone() { const r = new Response(this._body, this); r.url = this.url; r.type = this.type; return r; }
+  clone() {
+    if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Response': Response body is already used");
+    const r = new Response(null, this);
+    r.url = this.url;
+    r.type = this.type;
+    const s = bodyStream(this);
+    if (s !== null) {
+      const [a, b] = streams().teeStream(s);
+      defProp(this, BODY, { value: a, writable: true, configurable: true });
+      r._body = b;
+    } else {
+      r._body = this._body instanceof Uint8Array ? this._body.slice() : this._body;
+    }
+    return r;
+  }
   static error() { const r = new Response(null, { status: 0, statusText: '' }); r.type = 'error'; return r; }
   static json(data, init) {
     const r = new Response(JSON.stringify(data), init);

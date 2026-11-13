@@ -376,10 +376,10 @@ class Element extends Node {
   }
   insertAdjacentElement(pos, el) { return adjacent(this, String(pos).toLowerCase(), el); }
   insertAdjacentText(pos, text) { adjacent(this, String(pos).toLowerCase(), document.createTextNode(str(text))); }
-  matches(sel) { return checkSelector(N.matches(this[ID], String(sel))); }
+  matches(sel) { sel = String(sel); return checkSelector(N.matches(this[ID], sel), sel); }
   webkitMatchesSelector(sel) { return this.matches(sel); }
   msMatchesSelector(sel) { return this.matches(sel); }
-  closest(sel) { return wrap(checkSelector(N.closest(this[ID], String(sel)))); }
+  closest(sel) { sel = String(sel); return wrap(checkSelector(N.closest(this[ID], sel), sel)); }
   getBoundingClientRect() {
     const g = N.geom(this[ID]);
     return g ? new DOMRect(g[0], g[1], g[2], g[3]) : new DOMRect(0, 0, 0, 0);

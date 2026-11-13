@@ -6,11 +6,12 @@
 //! [`State`] for the duration of the call, so native callbacks can reach the
 //! document. A watchdog thread terminates calls that run past the budget.
 
+mod codec;
 mod modules;
 mod ops;
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -31,6 +32,7 @@ const PRELUDE: &str = concat!(
     include_str!("../js/40-html.js"),
     include_str!("../js/50-document.js"),
     include_str!("../js/60-net.js"),
+    include_str!("../js/65-streams.js"),
     include_str!("../js/70-window.js"),
     include_str!("../js/90-hooks.js"),
 );
@@ -93,6 +95,9 @@ pub(crate) struct State {
     requests: Vec<HostRequest>,
     /// Elements whose `click()` is running (HTML's click in progress flag).
     clicking: Vec<NodeId>,
+    /// Compression streams in progress, by the id the prelude holds.
+    codecs: HashMap<u32, codec::Codec>,
+    next_codec: u32,
 }
 
 struct Hooks {
@@ -121,6 +126,8 @@ impl State {
             errors: 0,
             requests: Vec::new(),
             clicking: Vec::new(),
+            codecs: HashMap::new(),
+            next_codec: 0,
         }
     }
 
@@ -314,6 +321,7 @@ impl Runtime {
         let mut isolate = v8::Isolate::new(params);
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         isolate.set_host_import_module_dynamically_callback(modules::dynamic_import);
+        isolate.set_host_initialize_import_meta_object_callback(modules::import_meta);
         isolate.set_promise_reject_callback(promise_reject);
         let handle = isolate.thread_safe_handle();
         let near_limit = Box::new(isolate.thread_safe_handle());
@@ -529,6 +537,7 @@ impl ScriptEngine for V8Engine {
         let result = with_context(rt, cx, |scope, state| match kind {
             ScriptKind::Classic => run_classic(scope, source, url),
             ScriptKind::Module => modules::run_module(scope, state, source, url),
+            ScriptKind::ImportMap => modules::register_import_map(scope, state, source, url),
         });
         if let Err(e) = &result {
             rt.state.borrow_mut().errors += 1;
