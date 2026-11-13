@@ -8,6 +8,7 @@ Huginn's own code is licensed under MIT OR Apache-2.0 (see `LICENSE-MIT` and
 | path | what | license |
 |---|---|---|
 | `vendor/taffy/` | Taffy 0.15.1 with small layout fixes. Each change is marked `huginn:`; list them with `grep -rn huginn: vendor/taffy/src`. | MIT, `vendor/taffy/LICENSE` |
+| `vendor/fontique/` | Fontique 0.12.0 with one change to its fontconfig backend (short generic families, a fallback list per script); see `vendor/fontique/HUGINN.md`. Each change is marked `huginn:`. | Apache-2.0 OR MIT, `vendor/fontique/LICENSE-APACHE` and `LICENSE-MIT` |
 | `crates/huginn-js/data/icudtl.dat` | ICU 78 data, the `flutter_desktop` subset that ships in the `v8` crate 152.2.0 (`third_party/icu/flutter_desktop/icudtl.dat`), unchanged. | Unicode License V3, `crates/huginn-js/data/LICENSE-ICU` |
 | `bench/ladybird-screenshot-on-load.patch` | A patch to Ladybird that adds `--screenshot-on-load`. | BSD-2-Clause, the license of Ladybird |
 
@@ -181,7 +182,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | fnv | 1.0.7 | Apache-2.0 / MIT |  |
 | foldhash | 0.2.0 | Zlib |  |
 | font-types | 0.12.7 | MIT OR Apache-2.0 |  |
-| fontique | 0.12.0 | Apache-2.0 OR MIT |  |
+| fontique (vendored, patched) | 0.12.0 | Apache-2.0 OR MIT |  |
 | foreign-types | 0.5.0 | MIT/Apache-2.0 |  |
 | foreign-types-macros | 0.2.4 | MIT/Apache-2.0 |  |
 | foreign-types-shared | 0.3.1 | MIT/Apache-2.0 |  |

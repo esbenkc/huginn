@@ -107,6 +107,10 @@ miniz_oxide = "0.8"
 # vendor/taffy/src; list them with `grep -rn huginn: vendor/taffy/src`.
 [patch.crates-io]
 taffy = { path = "vendor/taffy" }
+# Fontique 0.12.0 (the font collection under Parley) with one change to its
+# fontconfig backend: short generic families and a fallback list per script.
+# The change is marked `huginn:` in vendor/fontique/src.
+fontique = { path = "vendor/fontique" }
 
 [profile.release]
 debug = false
