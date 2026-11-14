@@ -44,7 +44,11 @@ fn snapshot(prelude: &str, out: &std::path::Path) {
     if env::var("HOST") != env::var("TARGET") {
         return;
     }
-    startup::init_v8(startup::V8_FLAGS);
+    // A fixed seed makes the snapshot the same on every build. V8 leaves
+    // `--random-seed` out of the flags a snapshot must match, and the
+    // snapshot is rehashable: each isolate still gets its own hash seed and
+    // `Math.random` state.
+    startup::init_v8(&format!("{} --random-seed=314159265", startup::V8_FLAGS));
     let mut creator = v8::Isolate::snapshot_creator(None, None);
     {
         v8::scope!(let scope, &mut creator);
