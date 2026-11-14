@@ -913,6 +913,10 @@ How it fits together (`crates/huginn-style/src`):
   (screen, light scheme, fine pointer with hover), stylesheet parsing with
   synchronous `@import` through our `StylesheetLoader`, `@font-face`
   extraction (incl. `unicode-range`), the traversal and the style pool.
+  Stylo's parser reads the prefs, so every function that parses CSS
+  (sheets, `style` attributes and hints, selectors) sets them first: the
+  shell parses sheets on fetch threads before the page has an engine, and
+  the cache keeps each parse.
 - `sheets.rs`: `parse_stylesheet` (any thread), the process-wide lock and
   cache of parsed sheets, and which places of a repeated sheet a cascade
   can leave out. A page that links the same sheet several times (github:
