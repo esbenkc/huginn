@@ -124,6 +124,11 @@ in, first paint, first contentful paint, images and fonts in, complete.
   timer task gets the whole budget (a round starts no new task after it),
   and time the thread waits for the network (sync XHR, inserted scripts,
   modules) does not count.
+- Each isolate starts from a V8 startup snapshot with the prelude already
+  run (`huginn-js/build.rs` runs it at build time; see CONTRACTS.md). The
+  pipeline makes the isolate right after parsing when scripts run before
+  the first paint (`ScriptEngine::prepare`), so requests already in flight
+  arrive meanwhile.
 - `fetch()` and async XHR run on threads of their own
   (`huginn-js/src/v8engine/fetches.rs`), several at once, as in Chrome; the
   engine thread keeps running scripts meanwhile. Each request runs the
@@ -1063,9 +1068,11 @@ classic, defer, async and module scripts (static imports, `import()`,
 `import.meta`, import maps with scopes and merging: `src/importmap.rs`),
 script-inserted scripts, `document.write`. Timers are
 ordered from the start time of the engine call, so the order does not depend
-on CPU speed.
-1. A V8 startup snapshot of the prelude (isolate plus prelude cost about
-   5.5 ms and 15 MB RSS per script page).
-2. Image `load` events and `naturalWidth` (needs decoded sizes from huginn-net).
-3. `about:blank` iframes with their own realm (`contentWindow` is null today;
+on CPU speed. Each isolate starts from a V8 startup snapshot of the prelude
+(2026-11-14, bench-release, `huginn render` of a one-script page, median of
+30, load average 56: the engine is ready in 3.9 ms instead of 14.3 ms, of
+which compiling the prelude took 5.2 ms and running it 5.9 ms; 6 MB less
+peak RSS; the binary is 1.4 MB larger).
+1. Image `load` events and `naturalWidth` (needs decoded sizes from huginn-net).
+2. `about:blank` iframes with their own realm (`contentWindow` is null today;
    Google's search page script reads builtins from one and fails).
