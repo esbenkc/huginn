@@ -14,7 +14,7 @@ use huginn_net::{
     Client, CorsSettings, ImageStore, Loader, NetError, ReferrerPolicy, Resource, ResourceKind, Url,
 };
 use huginn_paint::{CpuRasterizer, Rasterizer};
-use huginn_style::{Origin, StyleEngine, StyleMap, StylesheetLoader, Viewport};
+use huginn_style::{Origin, ParsedStylesheet, StyleEngine, StyleMap, StylesheetLoader, Viewport};
 
 use crate::{resources, scripts};
 
@@ -544,9 +544,19 @@ pub fn load_document(
             .iter()
             .filter_map(|s| Some((s.src.clone()?, ResourceKind::Script, s.cors))),
     );
-    let fetched = loader.map_parallel(&requests, |(u, kind, cors)| {
-        loader.fetch_with(u, *kind, *cors)
-    });
+    // Each stylesheet is parsed on the thread that fetched it, as soon as
+    // its bytes are in, while the others are still on the network.
+    let (fetched, parsed): (Vec<_>, Vec<_>) = loader
+        .map_parallel(&requests, |(u, kind, cors)| {
+            let r = loader.fetch_with(u, *kind, *cors);
+            let sheet = match &r {
+                Ok(r) if *kind == ResourceKind::Stylesheet => Some(parse_fetched_sheet(loader, r)),
+                _ => None,
+            };
+            (r, sheet)
+        })
+        .into_iter()
+        .unzip();
     huginn_net::log_phase("stylesheets and blocking scripts in");
     // The later scripts' sources load while the page is styled, laid out and
     // painted: after the stylesheets and blocking scripts, which Chrome
@@ -556,27 +566,16 @@ pub fn load_document(
     let images = ImageStore::new();
     fetch += t.elapsed();
 
-    // 4. Parse CSS (counted as parse time).
+    // 4. Add the parsed CSS; inline sheets are parsed here (counted as
+    // parse time).
     let t = Instant::now();
-    let imports = Imports(&loader);
     let mut engine = StyleEngine::new(viewport);
     engine.set_document_url(base.as_str());
-    for s in &sheets {
-        match s {
-            SheetSource::Inline(css) => {
-                engine.add_stylesheet(css, base.as_str(), Origin::Author, &imports)
-            }
-            SheetSource::External(u) => {
-                if let Some(Ok(r)) = requests
-                    .iter()
-                    .position(|(ru, _, _)| ru == u)
-                    .map(|i| &fetched[i])
-                {
-                    engine.add_stylesheet(&r.text(), r.url.as_str(), Origin::Author, &imports);
-                }
-            }
-        }
-    }
+    let parsed = parsed_sheets(loader, &sheets, &base, |u| {
+        let i = requests.iter().position(|(ru, _, _)| ru == u)?;
+        parsed[i].clone()
+    });
+    engine.add_parsed_stylesheets(&parsed);
     parse += t.elapsed();
     huginn_net::log_phase("css parsed");
 
@@ -721,30 +720,60 @@ pub fn load_document(
     })
 }
 
-/// Add stylesheets in document order, fetching external ones (cached by the loader).
+/// Add stylesheets in document order, fetching external ones (cached by the
+/// loader) and parsing each on the thread that fetched it.
 fn add_sheets(engine: &mut StyleEngine, loader: &Loader, sheets: &[SheetSource], base: &Url) {
-    let imports = Imports(loader);
-    let externals: Vec<(Url, ResourceKind)> = sheets
+    let externals: Vec<&Url> = sheets
         .iter()
         .filter_map(|s| match s {
-            SheetSource::External(u) => Some((u.clone(), ResourceKind::Stylesheet)),
+            SheetSource::External(u) => Some(u),
             SheetSource::Inline(_) => None,
         })
         .collect();
-    let fetched = loader.fetch_all(&externals);
-    let mut next = fetched.iter();
-    for s in sheets {
-        match s {
-            SheetSource::Inline(css) => {
-                engine.add_stylesheet(css, base.as_str(), Origin::Author, &imports)
-            }
-            SheetSource::External(_) => {
-                if let Some(Ok(r)) = next.next() {
-                    engine.add_stylesheet(&r.text(), r.url.as_str(), Origin::Author, &imports);
-                }
-            }
-        }
-    }
+    let parsed = loader.map_parallel(&externals, |u| {
+        let r = loader.fetch(u, ResourceKind::Stylesheet).ok()?;
+        Some(parse_fetched_sheet(loader, &r))
+    });
+    let parsed = parsed_sheets(loader, sheets, base, |u| {
+        let i = externals.iter().position(|e| *e == u)?;
+        parsed[i].clone()
+    });
+    engine.add_parsed_stylesheets(&parsed);
+}
+
+/// Parse a fetched stylesheet (on the thread that fetched it).
+fn parse_fetched_sheet(loader: &Loader, r: &Resource) -> ParsedStylesheet {
+    huginn_style::parse_stylesheet(&r.text(), r.url.as_str(), Origin::Author, &Imports(loader))
+}
+
+/// The parsed sheets of `sheets`, in document order: external ones from
+/// `external` (`None` if the fetch failed), inline ones parsed here, in
+/// parallel.
+fn parsed_sheets(
+    loader: &Loader,
+    sheets: &[SheetSource],
+    base: &Url,
+    external: impl Fn(&Url) -> Option<ParsedStylesheet>,
+) -> Vec<ParsedStylesheet> {
+    let inline: Vec<&str> = sheets
+        .iter()
+        .filter_map(|s| match s {
+            SheetSource::Inline(css) => Some(css.as_str()),
+            SheetSource::External(_) => None,
+        })
+        .collect();
+    let mut inline = loader
+        .map_parallel(&inline, |css| {
+            huginn_style::parse_stylesheet(css, base.as_str(), Origin::Author, &Imports(loader))
+        })
+        .into_iter();
+    sheets
+        .iter()
+        .filter_map(|s| match s {
+            SheetSource::Inline(_) => inline.next(),
+            SheetSource::External(u) => external(u),
+        })
+        .collect()
 }
 
 /// `<base href>` or the document URL.

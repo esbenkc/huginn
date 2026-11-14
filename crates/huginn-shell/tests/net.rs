@@ -863,6 +863,40 @@ fn text_in_a_loading_web_font_follows_font_display() {
     );
 }
 
+#[test]
+fn stylesheets_apply_in_document_order_whatever_order_they_arrive_in() {
+    // Each sheet is parsed on the thread that fetched it, so `b.css` (slow)
+    // is parsed last; `a.css` is linked twice. Document order: a, the
+    // inline sheet, b, a: the last `a.css` sets the height.
+    let port = serve_delayed(|path| match path {
+        "/a.css" => (
+            0,
+            "Content-Type: text/css\r\n",
+            "#box { height: 4000px } @layer x { #box { width: 10px } }".into(),
+        ),
+        "/b.css" => (
+            300,
+            "Content-Type: text/css\r\n",
+            "#box { height: 3000px } @layer y { #box { width: 20px } }".into(),
+        ),
+        _ => (
+            0,
+            "Content-Type: text/html\r\n",
+            "<!doctype html><title>t</title>
+             <link rel=stylesheet href=/a.css>
+             <style>#box { height: 2000px }</style>
+             <link rel=stylesheet href=/b.css>
+             <link rel=stylesheet href=/a.css>
+             <body style='margin: 0'><div id=box></div>"
+                .into(),
+        ),
+    });
+    let s = run(&format!("http://127.0.0.1:{port}/"), "wait; state", &[]);
+    // 4000 px of page in a 520 px tall viewport.
+    let max = s[0]["max_scroll"].as_f64().unwrap();
+    assert!((3400.0..3600.0).contains(&max), "{}", s[0]);
+}
+
 fn huginn_net_file_url(path: &std::path::Path) -> String {
     format!("file://{}", path.to_str().expect("UTF-8 path"))
 }

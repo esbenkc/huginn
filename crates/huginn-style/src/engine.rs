@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc as StdArc, Once};
+use std::sync::{Arc as StdArc, LazyLock, Mutex, Once, TryLockError};
 
 use huginn_dom::{Document, NodeId, local_name};
 use style::author_styles::AuthorStyles;
@@ -25,12 +25,12 @@ use style::selector_parser::SnapshotMap;
 use style::servo::animation::DocumentAnimationSet;
 use style::servo::media_features::PointerCapabilities;
 use style::servo_arc::Arc;
-use style::shared_lock::{Locked, SharedRwLock, StylesheetGuards};
+use style::shared_lock::{Locked, SharedRwLock, SharedRwLockReadGuard, StylesheetGuards};
 use style::stylesheets::DocumentStyleSheet;
 use style::stylesheets::import_rule::{ImportLayer, ImportSheet, ImportSupportsCondition};
 use style::stylesheets::{
     AllowImportRules, CssRule, CssRuleType, CustomMediaMap, ImportRule, Origin as StyloOrigin,
-    Stylesheet, StylesheetInDocument, UrlExtraData,
+    Stylesheet, StylesheetContents, UrlExtraData,
 };
 use style::stylist::{CascadeData, Stylist};
 use style::thread_state::{self, ThreadState};
@@ -301,21 +301,17 @@ impl style::stylesheets::StylesheetLoader for ImportLoader<'_> {
 /// `@font-face` rules of `sheet` that apply on `device` (including nested
 /// `@media`/`@supports`/`@layer` and imported sheets).
 pub(crate) fn font_faces(
-    sheet: &Stylesheet,
+    sheet: &StylesheetContents,
     device: &Device,
-    lock: &SharedRwLock,
+    guard: &SharedRwLockReadGuard,
 ) -> Vec<FontFaceRule> {
-    let guard = lock.read();
     let custom_media = CustomMediaMap::default();
     let mut out = Vec::new();
-    for rule in sheet
-        .contents(&guard)
-        .effective_rules(device, &custom_media, &guard)
-    {
+    for rule in sheet.effective_rules(device, &custom_media, guard) {
         let CssRule::FontFace(ff) = rule else {
             continue;
         };
-        let d = &ff.read_with(&guard).descriptors;
+        let d = &ff.read_with(guard).descriptors;
         let (Some(family), Some(src)) = (&d.font_family, &d.src) else {
             continue;
         };
@@ -514,7 +510,7 @@ impl<'a, 'dom> DomTraversal<HuginnNode<'dom>> for Recalc<'a> {
         F: FnMut(HuginnNode<'dom>),
     {
         let Some(el) = node.as_element() else { return };
-        // SAFETY: the sequential traversal has exclusive access to the data.
+        // SAFETY: the traversal hands each element to one thread, once.
         let mut data = unsafe { el.ensure_data() };
         recalc_style_at(self, context, el, &mut data, note_child);
         // SAFETY: as above.
@@ -538,8 +534,47 @@ impl<'a, 'dom> DomTraversal<HuginnNode<'dom>> for Recalc<'a> {
     }
 }
 
-/// Style every element of `cx.doc` (sequentially).
-pub(crate) fn traverse(stylist: &Stylist, cx: &DomCx<'_>, lock: &SharedRwLock) {
+/// Documents with fewer elements are styled on the calling thread: handing
+/// a small document to the pool costs more than the threads save.
+pub(crate) const PARALLEL_MIN_ELEMENTS: usize = 600;
+
+/// The style threads: Gecko's count (three quarters of the cores, at most
+/// 6). `HUGINN_STYLE_THREADS=n` sets it; 0 or 1 styles every document
+/// sequentially. `None` when there is one thread.
+pub(crate) fn pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let threads = std::env::var("HUGINN_STYLE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or((cores * 3 / 4).clamp(1, 6));
+        if threads < 2 {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("huginn-style-{i}"))
+            // Selector matching (`:has()`) recurses on deep documents, like
+            // the render thread's style pass; stack pages are committed only
+            // when touched.
+            .stack_size(64 << 20)
+            .start_handler(|_| thread_state::initialize_layout_worker_thread())
+            .build()
+            .ok()
+    });
+    POOL.as_ref()
+}
+
+/// The style pool runs one pass at a time: each pool thread keeps Stylo's
+/// thread-local bloom filter and sharing cache borrowed until its pass
+/// ends, so a second pass's work on the same thread would find them taken.
+static POOL_IN_USE: Mutex<()> = Mutex::new(());
+
+/// Style every element of `cx.doc`: on the style threads when it has at
+/// least [`PARALLEL_MIN_ELEMENTS`] elements, `parallel` is set and no other
+/// pass (another tab) has the pool, else on the calling thread. Both give
+/// the same styles.
+pub(crate) fn traverse(stylist: &Stylist, cx: &DomCx<'_>, lock: &SharedRwLock, parallel: bool) {
     let Some(root) = cx.doc.document_element() else {
         return;
     };
@@ -563,9 +598,17 @@ pub(crate) fn traverse(stylist: &Stylist, cx: &DomCx<'_>, lock: &SharedRwLock) {
         return;
     }
     let traversal = Recalc { shared };
+    let wanted = pool().filter(|_| parallel && cx.element_count() >= PARALLEL_MIN_ELEMENTS);
+    let busy = wanted.and_then(|_| match POOL_IN_USE.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    });
+    let pool = wanted.filter(|_| busy.is_some());
     thread_state::enter(ThreadState::LAYOUT);
-    style::driver::traverse_dom(&traversal, token, None);
+    style::driver::traverse_dom(&traversal, token, pool);
     thread_state::exit(ThreadState::LAYOUT);
+    drop(busy);
 }
 
 /// The Stylo data of an element after `traverse`.

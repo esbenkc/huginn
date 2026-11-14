@@ -7,14 +7,19 @@
 //! interned id and classes, the parsed `style` attribute and presentational
 //! hints). The side table lives only for one `compute` call.
 //!
-//! Stylo runs sequentially here (no rayon pool), so the handles do not need
-//! to be `Send`. `Document` is not `Sync` anyway (non-atomic `StrTendril`).
+//! The parallel traversal styles elements on several threads at once
+//! (`engine::traverse`). Each element's Stylo data is written only by the
+//! thread that styles it, after its parent is done; flags that matching
+//! sets on other elements (the parent, `:has()` anchors) are atomic. The
+//! handles are not `Send`: only Stylo's traversal moves them between
+//! threads. `Document` has no interior mutability; style only reads it.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use huginn_dom::{Document, NodeData, NodeId, local_name, ns};
 use selectors::OpaqueElement;
@@ -43,8 +48,8 @@ use style_dom::ElementState;
 /// Per-element state for one style pass.
 pub(crate) struct ElemSide {
     data: UnsafeCell<Option<ElementDataWrapper>>,
-    dirty_descendants: Cell<bool>,
-    selector_flags: Cell<ElementSelectorFlags>,
+    dirty_descendants: AtomicBool,
+    selector_flags: AtomicUsize,
     pub(crate) style_attr: Option<Arc<Locked<PropertyDeclarationBlock>>>,
     pub(crate) hints: Option<Arc<Locked<PropertyDeclarationBlock>>>,
     id: Option<Atom>,
@@ -60,8 +65,8 @@ impl ElemSide {
     ) -> ElemSide {
         ElemSide {
             data: UnsafeCell::new(None),
-            dirty_descendants: Cell::new(true),
-            selector_flags: Cell::new(ElementSelectorFlags::empty()),
+            dirty_descendants: AtomicBool::new(true),
+            selector_flags: AtomicUsize::new(0),
             style_attr,
             hints,
             id,
@@ -73,6 +78,10 @@ impl ElemSide {
     pub(crate) fn data(&self) -> Option<ElementDataRef<'_>> {
         // SAFETY: only called after the traversal, when nothing mutates.
         unsafe { &*self.data.get() }.as_ref().map(|w| w.borrow())
+    }
+
+    fn selector_flags(&self) -> ElementSelectorFlags {
+        ElementSelectorFlags::from_bits_retain(self.selector_flags.load(Ordering::Relaxed))
     }
 }
 
@@ -159,6 +168,11 @@ impl<'a> DomCx<'a> {
             })
             .collect();
         cx
+    }
+
+    /// Elements with a side entry (those a style pass styles at most).
+    pub(crate) fn element_count(&self) -> usize {
+        self.elems.len()
     }
 
     pub(crate) fn side(&self, id: NodeId) -> Option<&ElemSide> {
@@ -715,7 +729,7 @@ impl selectors::Element for HuginnNode<'_> {
             && let Some(side) = self.side()
         {
             side.selector_flags
-                .set(side.selector_flags.get() | self_flags);
+                .fetch_or(self_flags.bits(), Ordering::Relaxed);
         }
         let parent_flags = flags.for_parent();
         if !parent_flags.is_empty()
@@ -723,7 +737,7 @@ impl selectors::Element for HuginnNode<'_> {
             && let Some(side) = parent.side()
         {
             side.selector_flags
-                .set(side.selector_flags.get() | parent_flags);
+                .fetch_or(parent_flags.bits(), Ordering::Relaxed);
         }
     }
 
@@ -926,7 +940,8 @@ impl<'a> TElement for HuginnNode<'a> {
     }
 
     fn has_dirty_descendants(&self) -> bool {
-        self.side().is_some_and(|s| s.dirty_descendants.get())
+        self.side()
+            .is_some_and(|s| s.dirty_descendants.load(Ordering::Relaxed))
     }
 
     fn has_snapshot(&self) -> bool {
@@ -941,27 +956,29 @@ impl<'a> TElement for HuginnNode<'a> {
 
     unsafe fn set_dirty_descendants(&self) {
         if let Some(s) = self.side() {
-            s.dirty_descendants.set(true);
+            s.dirty_descendants.store(true, Ordering::Relaxed);
         }
     }
 
     unsafe fn unset_dirty_descendants(&self) {
         if let Some(s) = self.side() {
-            s.dirty_descendants.set(false);
+            s.dirty_descendants.store(false, Ordering::Relaxed);
         }
     }
 
     fn store_children_to_process(&self, _n: isize) {
-        unreachable!("no parallel traversal")
+        unreachable!("no postorder traversal")
     }
 
     fn did_process_child(&self) -> isize {
-        unreachable!("no parallel traversal")
+        unreachable!("no postorder traversal")
     }
 
     unsafe fn ensure_data(&self) -> ElementDataMut<'_> {
-        // SAFETY: the sequential traversal has exclusive access to the side
-        // table, and borrows of one element's data never overlap.
+        // SAFETY: only the thread that styles an element writes its data
+        // (Stylo hands each element to one thread), and borrows of one
+        // element's data never overlap. Other threads read it only after
+        // that thread is done with it (a parent before its children).
         let cell = unsafe { &mut *self.data_cell().get() };
         cell.get_or_insert_with(ElementDataWrapper::default)
             .borrow_mut()
@@ -1108,13 +1125,13 @@ impl<'a> TElement for HuginnNode<'a> {
 
     fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
         self.side()
-            .is_some_and(|s| s.selector_flags.get().contains(flags))
+            .is_some_and(|s| s.selector_flags().contains(flags))
     }
 
     fn relative_selector_search_direction(&self) -> ElementSelectorFlags {
         let flags = self
             .side()
-            .map_or(ElementSelectorFlags::empty(), |s| s.selector_flags.get());
+            .map_or(ElementSelectorFlags::empty(), |s| s.selector_flags());
         flags
             .intersection(ElementSelectorFlags::RELATIVE_SELECTOR_SEARCH_DIRECTION_ANCESTOR_SIBLING)
     }

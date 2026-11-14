@@ -5,15 +5,17 @@
 //! - [`StyleMap`]: computed style per DOM node, indexed by `NodeId`.
 //! - [`ComputedStyle`] and the value types in [`values`].
 //!
-//! The cascade is Stylo's (Servo's CSS engine), run sequentially on our
-//! arena DOM; see ARCHITECTURE.md, "The Stylo decision". `convert.rs` turns
-//! Stylo's computed values into [`ComputedStyle`].
+//! The cascade is Stylo's (Servo's CSS engine), run on our arena DOM (in
+//! parallel on big documents); see ARCHITECTURE.md, "The Stylo decision".
+//! `sheets.rs` parses stylesheets on any thread and keeps the parses;
+//! `convert.rs` turns Stylo's computed values into [`ComputedStyle`].
 
 mod convert;
 mod dom;
 mod engine;
 mod hints;
 mod query;
+mod sheets;
 pub mod values;
 
 use std::cell::{Cell, RefCell};
@@ -22,6 +24,7 @@ use std::sync::Arc;
 
 use huginn_dom::{Document, NodeId};
 pub use query::{SelectorError, closest, matches_selector, query_selector, query_selector_all};
+pub use sheets::{ParsedStylesheet, parse_stylesheet};
 use style::shared_lock::{SharedRwLock, StylesheetGuards};
 use style::stylesheets::{DocumentStyleSheet, UrlExtraData};
 use style::stylist::Stylist;
@@ -462,7 +465,9 @@ impl StyleEngine {
     /// A new engine with the built-in user-agent stylesheet loaded.
     pub fn new(viewport: Viewport) -> StyleEngine {
         engine::init_stylo();
-        let lock = SharedRwLock::new();
+        // One lock for all engines: parsed stylesheets are shared between
+        // them (see `sheets.rs`).
+        let lock = sheets::lock().clone();
         let stylist = Stylist::new(
             engine::make_device(viewport),
             style::context::QuirksMode::NoQuirks,
@@ -509,19 +514,34 @@ impl StyleEngine {
         origin: Origin,
         loader: &dyn StylesheetLoader,
     ) {
+        let sheet = parse_stylesheet(css, base_url, origin, loader);
+        self.add_parsed_stylesheets(std::slice::from_ref(&sheet));
+    }
+
+    /// Add stylesheets parsed by [`parse_stylesheet`], in document order:
+    /// later sheets win ties. A sheet that comes again later in `sheets`
+    /// (the same parse) is left out of the cascade at its earlier places
+    /// when that cannot change a computed value: every rule of it matches
+    /// again later, with the same specificity in the same layer, so the
+    /// earlier copy never wins (see `sheets::left_out`). Its `@font-face`
+    /// rules count at every place.
+    pub fn add_parsed_stylesheets(&mut self, sheets: &[ParsedStylesheet]) {
         let stylist = self.stylist.get_mut();
-        let sheet = engine::parse_sheet(
-            css,
-            base_url,
-            origin,
-            &self.lock,
-            loader,
-            stylist.device().quirks_mode(),
-            0,
-        );
-        self.font_faces
-            .extend(engine::font_faces(&sheet, stylist.device(), &self.lock));
-        stylist.append_stylesheet(DocumentStyleSheet(sheet), &self.lock.read());
+        let guard = self.lock.read();
+        let left_out = sheets::left_out(sheets);
+        for (sheet, left_out) in sheets.iter().zip(left_out) {
+            self.font_faces.extend(engine::font_faces(
+                &sheet.parsed().contents,
+                stylist.device(),
+                &guard,
+            ));
+            if !left_out {
+                stylist.append_stylesheet(
+                    DocumentStyleSheet(style::servo_arc::Arc::new(sheet.instance())),
+                    &guard,
+                );
+            }
+        }
     }
 
     /// `@font-face` rules seen so far, in order.
@@ -557,6 +577,12 @@ impl StyleEngine {
 
     /// Compute styles for every element of `doc`.
     pub fn compute(&self, doc: &Document) -> StyleMap {
+        self.compute_with(doc, true)
+    }
+
+    /// [`StyleEngine::compute`]; `parallel`: big documents may be styled on
+    /// the style threads.
+    fn compute_with(&self, doc: &Document, parallel: bool) -> StyleMap {
         let mut stylist = self.stylist.borrow_mut();
         let quirks = match doc.quirks_mode() {
             huginn_dom::QuirksMode::Quirks => style::context::QuirksMode::Quirks,
@@ -591,7 +617,7 @@ impl StyleEngine {
                 &mut self.shadow_sheets.borrow_mut(),
             );
         }
-        engine::traverse(&stylist, &cx, &self.lock);
+        engine::traverse(&stylist, &cx, &self.lock, parallel);
         drop(stylist);
 
         let conv = convert::Cx {
@@ -724,6 +750,58 @@ mod tests {
             Some(BackgroundImage::LinearGradient(_))
         ));
         assert_eq!(s.background_repeat, BackgroundRepeat::NoRepeat);
+    }
+
+    #[test]
+    fn the_parallel_style_pass_gives_the_sequential_styles() {
+        // A wide page well over the parallel cutoff: selectors that set
+        // flags on parents and siblings (`:nth-child`, `:empty`, `+`,
+        // `:has()`), many style sharing candidates, inheritance, `em`,
+        // custom properties and generated content.
+        let mut body = String::new();
+        for s in 0..40 {
+            body.push_str(&format!("<ul class=l{} id=u{s}>", s % 5));
+            for e in 0..40 {
+                let empty = if e % 6 == 0 { "<b></b>" } else { "<b>b</b>" };
+                body.push_str(&format!(
+                    "<li class='i{} {}' data-k={}><span>t</span>{empty}</li>",
+                    e % 9,
+                    if e % 2 == 0 { "even" } else { "odd" },
+                    e % 4
+                ));
+            }
+            body.push_str("</ul>");
+        }
+        let doc = parse_html(&format!("<!doctype html><body>{body}</body>"));
+        let css = "
+            :root { --gap: 3px; --c: rgb(1, 2, 3) }
+            ul { font-size: 14px; margin: var(--gap) }
+            .l1 { font-size: 18px; --gap: 5px } .l3 li { color: var(--c) }
+            li:nth-child(3n+1) { padding-left: 2em } li:nth-last-child(2) { color: red }
+            li.even + li { margin-top: 1px } li[data-k=\"2\"] { border-left: 1px solid }
+            b:empty { display: inline-block; width: var(--gap) }
+            li:has(> b:empty) { background-color: rgb(0, 9, 0) }
+            .i4 span::before { content: 'x'; margin-right: 0.5em }
+            ul:has(.i8:last-child) > li:first-child { font-weight: bold }
+            #u7 .i2, #u11 .i3 { display: none }";
+        let mut e = engine();
+        e.add_stylesheet(css, "file:///t/a.css", Origin::Author, &NoImports);
+        let cx = engine::build_cx(&doc, &e.lock, &e.document_url);
+        assert!(cx.element_count() >= engine::PARALLEL_MIN_ELEMENTS);
+        drop(cx);
+        if std::thread::available_parallelism().map_or(1, |n| n.get()) >= 3 {
+            assert!(engine::pool().is_some(), "no style threads");
+        }
+        let parallel = e.compute_with(&doc, true);
+        let sequential = e.compute_with(&doc, false);
+        assert!(sequential.styled_count() > 3000);
+        for i in 0..doc.len() {
+            let id = NodeId::from_index(i);
+            assert_eq!(parallel.get(id), sequential.get(id), "node {i}");
+            for p in [PseudoElement::Before, PseudoElement::After] {
+                assert_eq!(parallel.pseudo(id, p), sequential.pseudo(id, p), "node {i}");
+            }
+        }
     }
 
     #[test]

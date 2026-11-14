@@ -1295,6 +1295,7 @@ dependencies = [
  "euclid",
  "huginn-dom",
  "markup5ever",
+ "rayon",
  "selectors",
  "stylo",
  "stylo_dom",
