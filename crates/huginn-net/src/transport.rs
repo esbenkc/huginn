@@ -566,8 +566,8 @@ fn key_for(uri: &http::Uri, public_only: bool) -> Option<Key> {
 
 /// The request for HTTP/1.1 or (`h2`) HTTP/2. HTTP/1.1 gets the path as its target and
 /// a `Host` header; HTTP/2 keeps the absolute URI (`:scheme`,
-/// `:authority`). Both get the user agent and `Accept-Encoding` unless the
-/// request has its own.
+/// `:authority`), without user info (RFC 9113, 8.3.1). Both get the user
+/// agent and `Accept-Encoding` unless the request has its own.
 fn request(head: &Head, body: &Bytes, h2: bool) -> http::Request<ReqBody> {
     use http::header::{ACCEPT_ENCODING, HOST, USER_AGENT};
     let mut headers = head.headers.clone();
@@ -582,7 +582,7 @@ fn request(head: &Head, body: &Bytes, h2: bool) -> http::Request<ReqBody> {
     }
     let uri = if h2 {
         headers.remove(HOST);
-        head.uri.clone()
+        without_user_info(&head.uri)
     } else {
         if let Some(a) = head.uri.authority()
             && !headers.contains_key(HOST)
@@ -619,6 +619,16 @@ fn default_port(uri: &http::Uri) -> Option<u16> {
         Some("http") => Some(80),
         _ => None,
     }
+}
+
+/// `uri` without `user:password@` in its authority.
+fn without_user_info(uri: &http::Uri) -> http::Uri {
+    let Some((_, host)) = uri.authority().and_then(|a| a.as_str().rsplit_once('@')) else {
+        return uri.clone();
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.authority = host.parse().ok();
+    http::Uri::from_parts(parts).unwrap_or_else(|_| uri.clone())
 }
 
 impl Response {
@@ -691,8 +701,9 @@ pub(crate) mod test_server {
     const LEAF_KEY: &[u8] = include_bytes!("testdata/leaf.key.der");
 
     /// A TLS server on 127.0.0.1 that offers `alpn`, answers every request
-    /// after `delay` with its HTTP version and path, closes a connection
-    /// after `requests_per_connection` requests, and counts connections and
+    /// after `delay` with its HTTP version and path (and the authority it
+    /// got in `x-authority`), closes a connection after
+    /// `requests_per_connection` requests, and counts connections and
     /// requests in flight.
     pub(crate) struct Server {
         pub(crate) port: u16,
@@ -765,6 +776,19 @@ pub(crate) mod test_server {
                                         "connection",
                                         http::HeaderValue::from_static("close"),
                                     );
+                                }
+                                // `:authority`, or `Host` on HTTP/1.1.
+                                let authority = req
+                                    .uri()
+                                    .authority()
+                                    .map(|a| a.as_str().to_owned())
+                                    .or_else(|| {
+                                        let host = req.headers().get("host")?;
+                                        Some(host.to_str().ok()?.to_owned())
+                                    })
+                                    .unwrap_or_default();
+                                if let Ok(v) = http::HeaderValue::from_str(&authority) {
+                                    resp.headers_mut().insert("x-authority", v);
                                 }
                                 Ok::<_, std::convert::Infallible>(resp)
                             }
@@ -917,5 +941,27 @@ mod tests {
             assert!(connected, "Connection: close was honoured");
         }
         assert_eq!(s.connections.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn user_info_is_never_sent_as_the_authority() {
+        for alpn in [&b"h2"[..], &b"http/1.1"[..]] {
+            let s = server(&[alpn], Duration::ZERO, usize::MAX);
+            let t = client();
+            let head = http::Request::get(format!("https://user:secret@127.0.0.1:{}/a", s.port))
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let mut resp = t.send(head, None, false, &mut Exchange::begin()).unwrap();
+            let body = String::from_utf8(resp.read(1 << 20).unwrap()).unwrap();
+            assert!(body.ends_with(" /a"), "{body}");
+            assert_eq!(
+                resp.headers.get("x-authority").unwrap(),
+                &format!("127.0.0.1:{}", s.port),
+                "{}",
+                String::from_utf8_lossy(alpn)
+            );
+        }
     }
 }
