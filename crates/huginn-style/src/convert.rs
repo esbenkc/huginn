@@ -895,7 +895,14 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
         justify_self: alignment(pos.justify_self.0),
         fill: svg_paint(s, &s.get_inherited_svg().fill),
         stroke: svg_paint(s, &s.get_inherited_svg().stroke),
-        clip_path: clip_path(cx, &s.get_svg().clip_path),
+        clip_path: clip_path(cx, &s.get_svg().clip_path).or_else(|| {
+            matches!(
+                bx.position,
+                computed_values::position::T::Absolute | computed_values::position::T::Fixed
+            )
+            .then(|| clip_rect(&effects.clip))
+            .flatten()
+        }),
         filter: filters(s, &effects.filter.0),
         backdrop_filter: filters(s, &effects.backdrop_filter.0),
         mix_blend_mode: blend_mode(effects.mix_blend_mode),
@@ -998,6 +1005,45 @@ fn blend_mode(b: c::effects::Blend) -> BlendMode {
         B::Luminosity => BlendMode::Luminosity,
         B::PlusLighter => BlendMode::PlusLighter,
     }
+}
+
+/// The legacy `clip: rect(top, right, bottom, left)` of an absolutely
+/// positioned box (CSS Masking 1, 6.1) as an `inset()` clip: top and bottom
+/// are offsets from the top border edge, left and right from the left one;
+/// `auto` is the border box edge. `rect(1px, 1px, 1px, 1px)` (visually
+/// hidden text) has no area, so nothing shows. A box with `clip-path` keeps
+/// that instead.
+fn clip_rect(clip: &c::ClipRectOrAuto) -> Option<Arc<ClipPath>> {
+    use generics::GenericClipRectOrAuto as R;
+    use generics::length::GenericLengthPercentageOrAuto as L;
+    let R::Rect(r) = clip else { return None };
+    let px = |v: &c::LengthOrAuto| match v {
+        L::LengthPercentage(l) => Some(l.px()),
+        L::Auto => None,
+    };
+    // From the far edge: `calc(100% - offset)`, or 0 for `auto`.
+    let far = |v: &c::LengthOrAuto| match px(v) {
+        Some(p) => LengthPercentage::Calc(CalcLength {
+            px: -p,
+            percent: 100.0,
+        }),
+        None => LengthPercentage::ZERO,
+    };
+    let near = |v: &c::LengthOrAuto| LengthPercentage::Px(px(v).unwrap_or(0.0));
+    Some(Arc::new(ClipPath::Inset {
+        inset: Edges {
+            top: near(&r.top),
+            right: far(&r.right),
+            bottom: far(&r.bottom),
+            left: near(&r.left),
+        },
+        radius: Corners {
+            top_left: LengthPercentage::ZERO,
+            top_right: LengthPercentage::ZERO,
+            bottom_right: LengthPercentage::ZERO,
+            bottom_left: LengthPercentage::ZERO,
+        },
+    }))
 }
 
 fn clip_path(cx: &Cx, p: &c::basic_shape::ClipPath) -> Option<Arc<ClipPath>> {

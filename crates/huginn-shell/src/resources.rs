@@ -292,6 +292,8 @@ pub struct Loaded {
     /// In registration order: within a family, the subset covering the most
     /// text comes first.
     pub fonts: Vec<WebFont>,
+    /// URLs of the font files fetched (loaded or failed).
+    pub font_urls: HashSet<Url>,
 }
 
 enum Job {
@@ -419,14 +421,16 @@ pub fn load(
 
     // Inline <svg>.
     let svg_start = jobs_list.len();
-    let svg_nodes = collect_inline_svgs(doc, styles, screen, &mut jobs_list);
+    let svg_nodes = collect_inline_svgs(doc, styles, screen, &mut jobs_list, |_| false);
 
     // Web fonts.
     let font_start = jobs_list.len();
     let selected = select_font_faces(doc, styles, font_faces);
     let mut font_meta = Vec::new();
+    let mut font_urls = HashSet::new();
     for (face, url) in selected {
         font_meta.push(face);
+        font_urls.insert(url.clone());
         jobs_list.push(Job::Font { url });
     }
 
@@ -458,24 +462,63 @@ pub fn load(
             images.insert_for_node(node.to_raw(), img.clone());
         }
     }
-    let mut fonts = Vec::new();
-    for (k, face) in font_meta.into_iter().enumerate() {
-        if let Done::Font(Ok(mut data)) =
-            std::mem::replace(&mut done[font_start + k], Done::Font(Ok(Vec::new())))
-        {
-            let ff = &font_faces[face];
-            if ff.size_adjust != 1.0 {
-                huginn_net::size_adjust_font(&mut data, ff.size_adjust);
+    let fonts = font_meta
+        .into_iter()
+        .enumerate()
+        .filter_map(|(k, face)| {
+            match std::mem::replace(&mut done[font_start + k], Done::Font(Ok(Vec::new()))) {
+                Done::Font(Ok(data)) => Some(web_font(&font_faces[face], data)),
+                _ => None,
             }
-            fonts.push(WebFont {
-                family: ff.family.clone(),
-                weight: representative_weight(ff.weight),
-                style: ff.style,
-                data,
-            });
-        }
+        })
+        .collect();
+    Loaded {
+        images,
+        fonts,
+        font_urls,
     }
-    Loaded { images, fonts }
+}
+
+fn web_font(ff: &FontFaceRule, mut data: Vec<u8>) -> WebFont {
+    if ff.size_adjust != 1.0 {
+        huginn_net::size_adjust_font(&mut data, ff.size_adjust);
+    }
+    WebFont {
+        family: ff.family.clone(),
+        weight: representative_weight(ff.weight),
+        style: ff.style,
+        data,
+    }
+}
+
+/// After scripts changed the DOM (the live window): the web fonts that the
+/// text now uses and that were not fetched yet (`font_urls`, updated), as
+/// [`load`] picks them. Icon fonts whose glyphs come from ligatures in text
+/// that scripts insert load here.
+pub fn load_added_fonts(
+    loader: &Loader,
+    doc: &Document,
+    styles: &StyleMap,
+    font_faces: &[FontFaceRule],
+    font_urls: &mut HashSet<Url>,
+) -> Vec<WebFont> {
+    let jobs: Vec<(usize, Job)> = select_font_faces(doc, styles, font_faces)
+        .into_iter()
+        .filter(|(_, url)| font_urls.insert(url.clone()))
+        .map(|(face, url)| (face, Job::Font { url }))
+        .collect();
+    if jobs.is_empty() {
+        return Vec::new();
+    }
+    loader
+        .map_parallel(&jobs, |(_, j)| j.run(loader))
+        .into_iter()
+        .zip(&jobs)
+        .filter_map(|(d, (face, _))| match d {
+            Done::Font(Ok(data)) => Some(web_font(&font_faces[*face], data)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn with_density(img: &DecodedImage, density: f32) -> DecodedImage {
@@ -549,9 +592,10 @@ pub fn load_all_lazy(
 
 /// After scripts changed the DOM or a state changed styles (the live window):
 /// load the `<img>` choices and CSS background, mask and `content` images
-/// that are not in `images` yet. Returns true if any was added. Inline
-/// `<svg>` and web fonts are not reloaded. `tried`: URLs fetched before
-/// (failures are not retried).
+/// that are not in `images` yet, and inline `<svg>` elements without an
+/// image (an `<svg>` whose content a script changes keeps its first image).
+/// Returns true if any was added. `tried`: URLs and `<svg>` nodes tried
+/// before (failures are not retried). Web fonts: [`load_added_fonts`].
 pub fn load_added(
     loader: &Loader,
     doc: &Document,
@@ -617,12 +661,24 @@ pub fn load_added(
             }
         }
     }
-    if !jobs.jobs.is_empty() {
-        let done = loader.map_parallel(&jobs.jobs, |j| j.run(loader));
-        for (job, d) in jobs.jobs.iter().zip(done) {
-            if let (Job::Image { url, .. }, Done::Image(Ok(img))) = (job, d) {
-                images.insert(url, img);
-                added = true;
+    let mut jobs = jobs.jobs;
+    let svg_start = jobs.len();
+    let svg_nodes = collect_inline_svgs(doc, styles, screen, &mut jobs, |n| {
+        images.get_for_node(n.to_raw()).is_some() || !tried.insert(format!("svg {}", n.to_raw()))
+    });
+    if !jobs.is_empty() {
+        let done = loader.map_parallel(&jobs, |j| j.run(loader));
+        for (k, (job, d)) in jobs.iter().zip(done).enumerate() {
+            match (job, d) {
+                (Job::Image { url, .. }, Done::Image(Ok(img))) => {
+                    images.insert(url, img);
+                    added = true;
+                }
+                (Job::Svg { .. }, Done::Image(Ok(img))) => {
+                    images.insert_for_node(svg_nodes[k - svg_start].to_raw(), img);
+                    added = true;
+                }
+                _ => {}
             }
         }
     }
@@ -679,6 +735,7 @@ fn collect_inline_svgs(
     styles: &StyleMap,
     screen: &Screen,
     jobs: &mut Vec<Job>,
+    mut skip: impl FnMut(NodeId) -> bool,
 ) -> Vec<NodeId> {
     let mut nodes = Vec::new();
     for n in doc.shadow_including_descendants(NodeId::DOCUMENT) {
@@ -696,7 +753,7 @@ fn collect_inline_svgs(
         }
         let Some(style) = styles.get(n) else { continue };
         let hint = display_size(style, el, None, screen.device_pixel_ratio);
-        if is_zero_sized(style, el) {
+        if is_zero_sized(style, el) || skip(n) {
             continue;
         }
         let mut markup = String::with_capacity(512);
@@ -1089,6 +1146,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fonts_for_text_added_after_load_are_fetched_once() {
+        // The server counts requests; its 404 makes the face fail, which
+        // still counts as fetched.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader, Write};
+            for stream in listener.incoming().flatten() {
+                let mut r = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut s = stream;
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let mut icons = face("Icons", (400.0, 400.0), FontStyle::Normal, &[]);
+        icons.sources[0].url = format!("http://127.0.0.1:{port}/icons.woff2");
+        let faces = vec![icons];
+        let css = "i { font-family: Icons }";
+        let loader = Loader::new();
+        let mut urls = HashSet::new();
+        let count = || hits.load(std::sync::atomic::Ordering::SeqCst);
+        // At load no text uses the family.
+        let (doc, styles) = styled("<p>text</p>", css);
+        assert!(load_added_fonts(&loader, &doc, &styles, &faces, &mut urls).is_empty());
+        assert_eq!(count(), 0);
+        // A script adds an icon ligature: the face is fetched, once.
+        let (doc, styles) = styled("<p>text <i>search</i></p>", css);
+        load_added_fonts(&loader, &doc, &styles, &faces, &mut urls);
+        assert_eq!(count(), 1);
+        load_added_fonts(&loader, &doc, &styles, &faces, &mut urls);
+        assert_eq!(count(), 1);
+    }
+
     fn styled(html: &str, css: &str) -> (Document, StyleMap) {
         let doc = huginn_dom::parse_html(html);
         let mut e = huginn_style::StyleEngine::new(huginn_style::Viewport {
@@ -1224,7 +1321,7 @@ mod tests {
             device_pixel_ratio: 1.0,
         };
         let mut jobs = Vec::new();
-        let nodes = collect_inline_svgs(&doc, &styles, &screen, &mut jobs);
+        let nodes = collect_inline_svgs(&doc, &styles, &screen, &mut jobs, |_| false);
         assert_eq!(nodes.len(), 1);
         let Job::Svg { markup, hint } = &jobs[0] else {
             panic!()

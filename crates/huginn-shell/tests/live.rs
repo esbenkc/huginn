@@ -178,18 +178,76 @@ fn wheel_scrolls_the_container_under_the_pointer_then_the_page() {
     );
     assert_eq!(
         title(&s[0]),
-        "scrolled 300",
-        "the box scrolls, not the page"
+        "scrolled 300 wheel 300 true",
+        "a wheel event, then the box scrolls, not the page"
     );
     assert_eq!(s[0]["scroll"].as_f64(), Some(0.0));
     assert_eq!(
         title(&s[1]),
-        "scrolled 800",
+        "scrolled 800 wheel 5000 true",
         "clamped to scrollHeight - clientHeight"
     );
     // At its end the box cannot move: the page scrolls (scroll chaining).
-    assert_eq!(title(&s[2]), "scrolled 800");
+    assert_eq!(title(&s[2]), "scrolled 800 wheel 100 true");
     assert_eq!(s[2]["scroll"].as_f64(), Some(100.0));
+}
+
+#[test]
+fn keys_scroll_the_container_that_was_clicked() {
+    // A press in #box (200 px high) makes it the target of scrolling keys.
+    let s = run(
+        &page("scroll.html"),
+        "wait; click 100 180; wait; key pagedown; wait; state; key down; wait; state; \
+         key end; wait; state; key home; wait; state",
+    );
+    assert_eq!(title(&s[0]), "scrolled 175", "a page is 87.5 % of the box");
+    assert_eq!(title(&s[1]), "scrolled 215", "an arrow is one 40 px line");
+    assert_eq!(title(&s[2]), "scrolled 800");
+    assert_eq!(title(&s[3]), "scrolled 0");
+    assert_eq!(s[3]["scroll"].as_f64(), Some(0.0), "the page did not move");
+}
+
+#[test]
+fn inline_svg_added_after_load_and_clip_rect_paint() {
+    let dir = std::env::temp_dir().join(format!("huginn-late-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shot = dir.join("late.png");
+    let s = run(
+        &page("late.html"),
+        &format!("wait; sleep 300; wait; state; shot {}", shot.display()),
+    );
+    assert_eq!(title(&s[0]), "added");
+    let dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&shot).unwrap()));
+    let mut r = dec.read_info().unwrap();
+    let mut buf = vec![0; r.output_buffer_size().unwrap()];
+    let info = r.next_frame(&mut buf).unwrap();
+    let ch = info.color_type.samples();
+    // Document (x, y) is window (x, y + 80).
+    let pixel = |x: usize, y: usize| {
+        let i = ((y + 80) * info.width as usize + x) * ch;
+        (buf[i], buf[i + 1], buf[i + 2])
+    };
+    let (red, white, blue) = ((255, 0, 0), (255, 255, 255), (0, 0, 255));
+    assert_eq!(pixel(320, 20), blue, "inline <svg> inserted after load");
+    assert_eq!(pixel(120, 20), white, "clip: rect(1px, 1px, 1px, 1px)");
+    assert_eq!(
+        pixel(210, 20),
+        red,
+        "clip: rect(auto, 20px, auto, auto), left half"
+    );
+    assert_eq!(
+        pixel(230, 20),
+        white,
+        "clip: rect(auto, 20px, auto, auto), right half"
+    );
+    assert_eq!(pixel(20, 80), red, "clip does not apply to static boxes");
+    assert_eq!(pixel(420, 20), red, "the filtered box");
+    assert_eq!(
+        pixel(450, 20),
+        white,
+        "its drop shadow is clipped: filter, then clip"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -73,6 +73,11 @@ pub fn text_control_focused(tab: &Tab) -> bool {
     tab.live.status.field.is_some()
 }
 
+/// The page's focused element, as last reported by the engine.
+pub fn focused(tab: &Tab) -> Option<NodeId> {
+    tab.live.status.focus
+}
+
 /// Keys after the find bar and menus, before selection and scrolling.
 pub fn key(tab: &mut Tab, ev: &KeyEvent) -> bool {
     if tab.view.is_none() {

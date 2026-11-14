@@ -41,12 +41,25 @@ pub enum PageInput {
     },
     /// The pointer left the page area.
     Leave,
-    /// A wheel turn over a scroll container (`Tab::wheel` picked it):
-    /// scroll it by `dy` CSS px, to at most `max`, and fire `scroll` at it.
+    /// Scroll a scroll container by `dy` CSS px, to at most `max`, and fire
+    /// `scroll` at it (keys; `Tab::scroll_key` picked it).
     Scroll {
         node: NodeId,
         dy: f32,
         max: f32,
+    },
+    /// A wheel turn of `dy` at document point (`x`, `y`): a `wheel` event at
+    /// `target`, then, unless a listener cancels it, `scroll` as for
+    /// [`PageInput::Scroll`] (`Tab::wheel` picked the container; `None`:
+    /// the UI scrolled the page).
+    Wheel {
+        x: f32,
+        y: f32,
+        /// Viewport CSS px (`clientX`/`clientY`).
+        client: (f32, f32),
+        target: Option<NodeId>,
+        dy: f32,
+        scroll: Option<(NodeId, f32)>,
     },
 }
 
@@ -333,13 +346,33 @@ impl LivePage {
                 Reply::default()
             }
             PageInput::Scroll { node, dy, max } => {
-                let doc = sink.document();
-                let (x, y) = doc.scroll_offset(node);
-                let to = (y + dy).clamp(0.0, max.max(0.0));
-                if to != y {
-                    doc.set_scroll_offset(node, x, to);
-                    // CSSOM View: `scroll` at the element, not bubbling.
-                    sink.fire(EventTarget::Node(node), &Event::new("scroll", false, false));
+                scroll_element(sink, node, dy, max);
+                Reply::default()
+            }
+            PageInput::Wheel {
+                x,
+                y,
+                client,
+                target,
+                dy,
+                scroll,
+            } => {
+                let target = target.and_then(|t| element_of(sink.document(), t));
+                let go = target.is_none_or(|t| {
+                    let init = vec![
+                        ("deltaY", EventValue::Num(f64::from(dy))),
+                        ("clientX", EventValue::Num(f64::from(client.0))),
+                        ("clientY", EventValue::Num(f64::from(client.1))),
+                        ("x", EventValue::Num(f64::from(client.0))),
+                        ("y", EventValue::Num(f64::from(client.1))),
+                        ("pageX", EventValue::Num(f64::from(x))),
+                        ("pageY", EventValue::Num(f64::from(y))),
+                    ];
+                    let ev = Event::ui("wheel", "WheelEvent", init).with_bubbles(true, true);
+                    sink.fire(EventTarget::Node(t), &ev)
+                });
+                if go && let Some((node, max)) = scroll {
+                    scroll_element(sink, node, dy, max);
                 }
                 Reply::default()
             }
@@ -459,6 +492,7 @@ impl LivePage {
             let _span = crate::perf::span("update");
             page.restyle_dom(&self.loader);
             page.load_added(&self.loader, &mut self.tried);
+            page.register_fonts(layout);
             let tree = page.layout(layout, viewport);
             notify(EngineEvent::Relaid {
                 generation,
@@ -1344,6 +1378,18 @@ fn mods_init(m: Modifiers) -> [(&'static str, EventValue); 4] {
         ("altKey", EventValue::Bool(m.alt)),
         ("metaKey", EventValue::Bool(m.cmd)),
     ]
+}
+
+/// Scroll `node` by `dy`, to at most `max`, and fire `scroll` at it (CSSOM
+/// View: at the element, not bubbling).
+fn scroll_element(sink: &mut EngineSink<'_, '_>, node: NodeId, dy: f32, max: f32) {
+    let doc = sink.document();
+    let (x, y) = doc.scroll_offset(node);
+    let to = (y + dy).clamp(0.0, max.max(0.0));
+    if to != y {
+        doc.set_scroll_offset(node, x, to);
+        sink.fire(EventTarget::Node(node), &Event::new("scroll", false, false));
+    }
 }
 
 fn mouse_event(

@@ -10,5 +10,9 @@
 <div id="overlay"></div>
 <script>
   const box = document.getElementById('box');
-  box.addEventListener('scroll', () => { document.title = 'scrolled ' + box.scrollTop; });
+  let wheel = '';
+  const show = () => { document.title = 'scrolled ' + box.scrollTop + wheel; };
+  box.addEventListener('scroll', show);
+  // Wheel events reach the node under the pointer before it scrolls.
+  box.addEventListener('wheel', e => { wheel = ' wheel ' + e.deltaY + ' ' + e.cancelable; show(); });
 </script>

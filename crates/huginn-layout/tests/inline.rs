@@ -345,3 +345,23 @@ fn text_index_keeps_order_on_a_very_long_line() {
             .all(|c| c == ['a', 'b', 'c', 'd'])
     );
 }
+
+#[test]
+fn empty_textarea_shows_its_placeholder_in_grey() {
+    let grey = |html: &str| {
+        let (_, tree) = layout(html);
+        let runs: Vec<_> = tree.runs.iter().filter(|r| !r.glyphs.is_empty()).collect();
+        (
+            runs.len(),
+            runs.iter()
+                .all(|r| r.color == huginn_style::Color::rgb(0x75, 0x75, 0x75)),
+        )
+    };
+    assert_eq!(
+        grey("<textarea placeholder='Search issues'></textarea>"),
+        (1, true),
+        "placeholder in Chrome's placeholder grey"
+    );
+    let (runs, all_grey) = grey("<textarea placeholder='Search issues'>typed</textarea>");
+    assert!(runs >= 1 && !all_grey, "a value hides the placeholder");
+}

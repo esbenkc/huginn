@@ -1,0 +1,27 @@
+<!doctype html>
+<title>late</title>
+<style>
+  body { margin: 0 }
+  .box { position: absolute; top: 0; width: 40px; height: 40px; background: rgb(255, 0, 0) }
+  /* The visually-hidden pattern: no area left. */
+  #hidden { left: 100px; clip: rect(1px, 1px, 1px, 1px) }
+  /* Only the left 20 px show; `auto` sides are the border box edges. */
+  #half { left: 200px; clip: rect(auto, 20px, auto, auto) }
+  /* `clip` applies to absolutely positioned boxes only. */
+  #static { position: static; margin-top: 60px; clip: rect(1px, 1px, 1px, 1px) }
+  /* Filter, then clip (CSS Masking): the shadow outside the box is clipped. */
+  #shadow { left: 400px; filter: drop-shadow(30px 0 0 rgb(0, 255, 0)); clip: rect(auto, auto, auto, auto) }
+</style>
+<div class="box" id="hidden"></div>
+<div class="box" id="half"></div>
+<div class="box" id="static"></div>
+<div class="box" id="shadow"></div>
+<script>
+  // An inline <svg> that a script adds after load (icon components do this).
+  setTimeout(() => {
+    document.body.insertAdjacentHTML('beforeend',
+      '<svg width="40" height="40" style="position:absolute;left:300px;top:0">' +
+      '<rect width="40" height="40" fill="rgb(0,0,255)"/></svg>');
+    document.title = 'added';
+  }, 50);
+</script>

@@ -352,14 +352,30 @@ impl Builder<'_, '_> {
     }
 
     /// The text an `<input>` shows: its value, a button label, or its
-    /// placeholder (in Chrome's placeholder grey). A drop-down `<select>`
-    /// shows its selected option's label (the UA sheet hides the options).
+    /// placeholder (in Chrome's placeholder grey). An empty `<textarea>`
+    /// shows its placeholder the same way. A drop-down `<select>` shows its
+    /// selected option's label (the UA sheet hides the options).
     fn input_text(&self, node: NodeId, out: &mut Vec<Item>) {
         let Some(el) = self.input.document.element(node) else {
             return;
         };
         if el.is_html(&local_name!("select")) {
             return self.select_text(node, out);
+        }
+        if el.is_html(&local_name!("textarea")) {
+            if let (Some(style), Some(text)) = (
+                self.input.styles.get(node),
+                el.attr(&local_name!("placeholder"))
+                    .filter(|p| !p.is_empty()),
+            ) && self.input.document.text_content(node).is_empty()
+            {
+                // Keeps the textarea's `white-space` (line breaks show).
+                let mut st = ComputedStyle::inherit_from(style);
+                st.content = Content::Text(text.into());
+                st.color = huginn_style::Color::rgb(0x75, 0x75, 0x75);
+                out.push(Item::Inline(Inline::Generated(node, Arc::new(st))));
+            }
+            return;
         }
         if !el.is_html(&local_name!("input")) {
             return;
