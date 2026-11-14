@@ -211,8 +211,10 @@ pub enum PseudoElement { Before, After }
 pub struct FontFaceRule { pub family: Arc<str> /* as written */, pub sources: Vec<FontFaceSource>,
                           pub weight: (f32, f32), pub style: FontStyle,
                           pub unicode_range: Vec<(u32, u32)> /* inclusive; empty = all */,
-                          pub size_adjust: f32 /* size-adjust factor; the shell rescales the font */ }
+                          pub size_adjust: f32 /* size-adjust factor; the shell rescales the font */,
+                          pub display: FontDisplay /* font-display; Auto when absent */ }
 pub struct FontFaceSource { pub url: String /* absolute */, pub format: Option<String> /* lowercase */ }
+pub enum FontDisplay { Auto /* default */, Block, Swap, Fallback, Optional }
 ```
 
 `ComputedStyle` (all fields `pub`, `Clone + Debug + PartialEq`, `Default` =
@@ -317,6 +319,11 @@ impl LayoutEngine {
     /// Call before layout(); the family name wins over system fonts.
     pub fn register_font(&mut self, data: Vec<u8>, family: &str, weight: f32, style: huginn_style::FontStyle) -> usize;
     pub fn layout(&mut self, input: &LayoutInput<'_>) -> LayoutTree;
+    /// Web font families still loading in their font-display block period:
+    /// text whose first available family is one of them keeps the fallback's
+    /// geometry and gets alpha 0 (runs and decorations). True if the set
+    /// changed (the next layout shapes all text again).
+    pub fn set_invisible_families(&mut self, families: Vec<String>) -> bool;
     /// Also build `LayoutTree::text_index` (off by default; the window turns it on).
     pub fn set_text_index(&mut self, on: bool);
     /// Keep the shaped text of each pass for the next one (off by default; the
@@ -597,6 +604,10 @@ impl Loader {
     /// Not kept in the loader (the HTTP cache still answers): for bodies decoded once and
     /// dropped (images, fonts). Document = a browser-started navigation.
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError>;
+    /// fetch_uncached only if nothing has to be sent: data:/file: URLs and fresh HTTP cache
+    /// entries (a hard reload has none); None otherwise. The window loads these before its
+    /// first paint.
+    pub fn fetch_cached(&self, url: &Url, kind: ResourceKind) -> Option<Resource>;
     /// Top-level GET or form POST (content type, body); initiator = the page that started it.
     /// Returns the document and its referrer (document.referrer).
     pub fn navigate(&self, url: &Url, post: Option<(&str, &[u8])>, initiator: Option<&Client>)
@@ -610,6 +621,9 @@ impl Loader {
     pub fn clear_cache(&self);               // drop the bodies kept in the loader (after CSS parsing); the HTTP cache stays
 }
 pub struct ScriptRequestsHeld<'a> { .. }    // Loader::hold_script_requests; the requests go when it drops
+/// HUGINN_NET_LOG=1: print `huginn: load: +<ms> <what>` on the net log's clock (the shell
+/// marks the phases of a page load with it).
+pub fn log_phase(what: &str);
 
 /// RFC 6265bis cookies: Domain (no public suffixes), Path, Expires/Max-Age
 /// (<= 400 days), Secure (https and loopback), HttpOnly, SameSite (Lax when
@@ -863,8 +877,11 @@ middle right double triple]`, `down`, `up`, `dblclick`, `tripleclick`,
 real window (plus `capture <png>`, a `screencapture` of it) and quits after
 the last one. `state` prints one JSON line: the focused window's
 active tab (`url`, `title`, `error`, `load_ms` (to the first paint),
-`complete_ms` (to the end of the scripts after it, the load events and the
-lazy images; `null` before), `loading`, `history`,
+`complete_ms` (to the end of the scripts after it, the images and fonts
+still on the network at the first paint, the load events and the lazy
+images; `null` before), `contentful_ms` (to the first tree that paints
+content: visible text, an image, a background image; `null` before),
+`loading`, `history`,
 `index`, `scroll`, `max_scroll`, `zoom`, `hover`, `strips`, `discarded`,
 `icon`, `favicon`, plus the fields `interact::state` and `live::state` add),
 the window (`tabs` [{`url`, `title`, `loading`, `discarded`, `active`,

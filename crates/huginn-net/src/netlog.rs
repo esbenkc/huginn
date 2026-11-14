@@ -5,14 +5,21 @@
 //! huginn: net: +412.3 GET 200 network new h2 dns=1.1 connect=48.2 head=95.0 body=3.4 bytes=10521 style https://example.com/a.css
 //! ```
 //!
-//! `+412.3`: start, ms after the first exchange of the process. `network`,
-//! `hit` (from the HTTP cache, no request) or `revalidated` (the server
-//! answered 304). `new` or `reused`: whether the exchange opened a
-//! connection. `h1` or `h2`: HTTP/1.1 or HTTP/2 (`-`: no request, a cache
-//! hit). `dns`: name lookup; `connect`: TCP and TLS handshakes (new
-//! connections only); `head`: request sent until the response head arrived
-//! (includes `dns` and `connect`); `body`: reading and decompressing the
-//! body. All times in ms.
+//! `+412.3`: start, ms after the first exchange (or phase mark) of the
+//! process. `network`, `hit` (from the HTTP cache, no request) or
+//! `revalidated` (the server answered 304). `new` or `reused`: whether the
+//! exchange opened a connection. `h1` or `h2`: HTTP/1.1 or HTTP/2 (`-`: no
+//! request, a cache hit). `dns`: name lookup; `connect`: TCP and TLS
+//! handshakes (new connections only); `head`: request sent until the
+//! response head arrived (includes `dns` and `connect`); `body`: reading
+//! and decompressing the body. All times in ms.
+//!
+//! The shell marks the phases of a page load on the same clock
+//! ([`log_phase`]):
+//!
+//! ```text
+//! huginn: load: +530.1 first paint
+//! ```
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -23,6 +30,18 @@ static ENABLED: LazyLock<bool> =
 
 /// Start of the log's clock: the first exchange of the process.
 static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Print `huginn: load: +12.3 <what>` on the log's clock (only with
+/// `HUGINN_NET_LOG=1`): a phase of a page load, to read the exchanges
+/// against.
+pub fn log_phase(what: &str) {
+    if *ENABLED {
+        eprintln!(
+            "huginn: load: +{:.1} {what}",
+            ORIGIN.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
 
 /// The HTTP version of an exchange.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

@@ -50,6 +50,10 @@ pub(crate) struct Fonts {
     /// (family list pointer, weight, style) -> vertical metrics of the
     /// list's first available font, for `line-height: normal`.
     vmetrics: HashMap<(usize, u32, u8), Option<VMetrics>>,
+    /// Web font families (lowercase) in their `font-display` block period.
+    blocked: Vec<String>,
+    /// CSS `font-family` source string -> whether its text is invisible.
+    invisible: HashMap<Arc<str>, bool>,
 }
 
 /// Vertical metrics of a font in font units, as Chrome reads them on macOS
@@ -327,6 +331,8 @@ impl Fonts {
             fallbacks: 0,
             epoch: 0,
             vmetrics: HashMap::new(),
+            blocked: Vec::new(),
+            invisible: HashMap::new(),
         }
     }
 
@@ -504,6 +510,50 @@ impl Fonts {
         self.epoch += 1;
         self.lists.clear();
         self.vmetrics.clear();
+        self.invisible.clear();
+    }
+
+    /// Set the web font families in their block period (lowercase). True
+    /// if the set changed; then text is shaped again.
+    pub fn set_blocked(&mut self, mut families: Vec<String>) -> bool {
+        families.sort_unstable();
+        families.dedup();
+        if families == self.blocked {
+            return false;
+        }
+        self.blocked = families;
+        self.forget_lists();
+        true
+    }
+
+    /// Whether text in the `font-family` list `css` is invisible: the first
+    /// family of the list that is available or still loading is a web
+    /// font in its block period (CSS Fonts 4, "font-display").
+    pub fn invisible(&mut self, css: &Arc<str>) -> bool {
+        if self.blocked.is_empty() {
+            return false;
+        }
+        if let Some(&v) = self.invisible.get(css) {
+            return v;
+        }
+        let mut v = false;
+        for name in FontFamilyName::parse_css_list(css).filter_map(Result::ok) {
+            let FontFamilyName::Named(n) = name else {
+                break;
+            };
+            if self.blocked.binary_search(&n.to_lowercase()).is_ok() {
+                v = true;
+                break;
+            }
+            if n.eq_ignore_ascii_case("-apple-system")
+                || n.eq_ignore_ascii_case("BlinkMacSystemFont")
+                || self.ensure_family(&n)
+            {
+                break;
+            }
+        }
+        self.invisible.insert(css.clone(), v);
+        v
     }
 
     /// Install fallback fonts for the characters in `text`.

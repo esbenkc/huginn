@@ -52,6 +52,7 @@ pub use charset::{decode_html, decode_text};
 pub use cookies::{CookieContext, CookieJar, SameSite, registrable_domain, same_site, site_key};
 pub use font::{FontFormat, decode_font, font_format, size_adjust_font};
 pub use media::{Screen, media_matches, parse_length};
+pub use netlog::log_phase;
 pub use referrer::{ReferrerPolicy, referrer_for};
 pub use srcset::{Descriptor, SrcsetCandidate, choose_candidate, eval_sizes, parse_srcset};
 pub use svg::{decode_svg, is_svg};
@@ -638,6 +639,35 @@ impl Loader {
         self.fetch_uncached_with(url, kind, CorsSettings::NoCors)
     }
 
+    /// [`Loader::fetch_uncached`] if no request has to go out: `data:` and
+    /// `file:` URLs, and http(s) URLs the HTTP cache has a fresh entry for
+    /// (the hit is logged like any other). `None` otherwise, without
+    /// sending anything. A hard reload takes nothing from the cache. The
+    /// window loads these before its first paint and the rest after it.
+    pub fn fetch_cached(&self, url: &Url, kind: ResourceKind) -> Option<Resource> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return self.fetch_uncached(url, kind).ok();
+        }
+        if kind == ResourceKind::Document || self.load.lock().subresources() != CacheMode::Default {
+            return None;
+        }
+        let (mode, credentials) = CorsSettings::NoCors.mode();
+        self.send(Request {
+            url: url.clone(),
+            method: "GET".into(),
+            headers: Vec::new(),
+            body: None,
+            kind,
+            mode,
+            credentials,
+            redirect: RedirectMode::Follow,
+            client: self.client(),
+            any_status: false,
+            cache: CacheMode::OnlyFresh,
+        })
+        .ok()
+    }
+
     /// A document from the web may not load `file:` subresources (scripts,
     /// styles, images): a page could run or probe the user's local files.
     /// Chrome refuses them too ("Not allowed to load local resource").
@@ -1055,16 +1085,22 @@ impl Loader {
                 .filter(|_| {
                     matches!(
                         req.cache,
-                        CacheMode::Default | CacheMode::NoCache | CacheMode::ForceCache
+                        CacheMode::Default
+                            | CacheMode::NoCache
+                            | CacheMode::ForceCache
+                            | CacheMode::OnlyFresh
                     )
                 })
                 .and_then(|k| self.net.cache.get(k))
                 .filter(|e| e.matches(value_of));
             let fresh = stored.as_ref().is_some_and(|e| match req.cache {
                 CacheMode::ForceCache => true,
-                CacheMode::Default => e.is_fresh(cache::now_ms()),
+                CacheMode::Default | CacheMode::OnlyFresh => e.is_fresh(cache::now_ms()),
                 _ => false,
             });
+            if !fresh && req.cache == CacheMode::OnlyFresh {
+                return Err(NetError::Transport(format!("{url}: not in the cache")));
+            }
             if !fresh {
                 stored = stored.filter(|e| e.validators() != (None, None));
                 if let Some(e) = &stored {

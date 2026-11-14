@@ -119,6 +119,76 @@ fn font_feature_settings_reach_the_shaper() {
     );
 }
 
+#[test]
+fn text_in_a_web_font_in_its_block_period_is_laid_out_but_not_painted() {
+    // `Web` is still loading. Text whose first family is `Web` keeps the
+    // fallback's geometry but draws nothing (glyphs and underline); text
+    // whose first available family is a system one shows. When the period
+    // ends, the same engine shows all of it.
+    let html = "<!DOCTYPE html><style>body { margin: 0; font: 16px sans-serif }
+        #a { font-family: Web, sans-serif } #b { font-family: sans-serif, Web }
+        u { text-decoration: underline }</style>
+        <p id=a>Hidden <u>text</u></p><p id=b>Shown</p>";
+    let doc = huginn_dom::parse_html(html);
+    let mut style = StyleEngine::new(Viewport {
+        width: 400.0,
+        height: 300.0,
+        device_pixel_ratio: 1.0,
+    });
+    for n in doc.elements_by_local_name(&huginn_dom::local_name!("style")) {
+        style.add_stylesheet(
+            &doc.text_content(n),
+            "about:blank",
+            Origin::Author,
+            &NoImports,
+        );
+    }
+    let styles = style.compute(&doc);
+    let images = ImageStore::new();
+    let base = Url::parse("about:blank").unwrap();
+    let input = LayoutInput {
+        document: &doc,
+        styles: &styles,
+        images: &images,
+        base_url: &base,
+        viewport: Size {
+            width: 400.0,
+            height: 300.0,
+        },
+    };
+    let mut engine = LayoutEngine::new();
+    engine.set_keep_tree(true);
+    engine.set_shape_cache(true);
+    let shown = engine.layout(&input);
+    assert!(engine.set_invisible_families(vec!["web".into()]));
+    assert!(
+        !engine.set_invisible_families(vec!["Web".into()]),
+        "same set"
+    );
+    let hidden = engine.layout(&input);
+    // (glyph count, alpha) per run, top to bottom.
+    let runs = |t: &LayoutTree| -> Vec<(u32, u8, f32)> {
+        t.runs
+            .iter()
+            .map(|r| (r.glyphs.end - r.glyphs.start, r.color.a, r.baseline))
+            .collect()
+    };
+    let (a, b) = (runs(&shown), runs(&hidden));
+    assert_eq!(a.len(), b.len());
+    let p_b = rect(&doc, &hidden, "p").bottom();
+    for ((n0, a0, y0), (n1, a1, y1)) in a.iter().zip(&b) {
+        assert_eq!((n0, y0), (n1, y1), "same layout");
+        assert_eq!(*a0, 255);
+        // #a (the first <p>) is hidden, #b shown.
+        assert_eq!(*a1, if *y1 < p_b { 0 } else { 255 }, "{b:?}");
+    }
+    assert!(hidden.decorations.iter().all(|d| d.color.a == 0));
+    assert!(shown.decorations.iter().all(|d| d.color.a == 255));
+    assert!(engine.set_invisible_families(Vec::new()));
+    let again = engine.layout(&input);
+    assert!(again.runs.iter().all(|r| r.color.a == 255));
+}
+
 /// Per line (x0, x1) of the first `tag` element's inline fragments.
 fn line_extents(doc: &huginn_dom::Document, tree: &LayoutTree, tag: &str) -> Vec<(f32, f32)> {
     let n = doc

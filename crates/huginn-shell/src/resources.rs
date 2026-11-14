@@ -11,19 +11,26 @@
 //!    background images, inline `<svg>` elements (serialized and rasterized at
 //!    their CSS size) and the `@font-face` files that CSS font matching picks
 //!    for the text on the page (only `unicode-range` subsets that cover it).
+//!    The window calls [`load_for_first_paint`] instead: the same batch, but
+//!    its first paint does not wait for the files still on the network
+//!    (except web fonts in their `font-display` block period); they come
+//!    later through [`Pending`].
 //! 3. [`load_lazy`] after layout: lazy images whose box is in the painted
 //!    region. They are patched into the layout tree, or the caller lays out
 //!    again when the image changes the box size.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, ElementData, NodeData, NodeId, local_name, ns};
 use huginn_layout::{BoxKind, LayoutTree, Rect};
 use huginn_net::{DecodedImage, ImageStore, Loader, NetError, ResourceKind, Screen, Url};
 use huginn_style::{
-    BackgroundImage, Color, ComputedStyle, Content, ContentItem, FontFaceRule, FontStyle,
-    LengthPercentageAuto, PseudoElement, StyleMap,
+    BackgroundImage, Color, ComputedStyle, Content, ContentItem, FontDisplay, FontFaceRule,
+    FontStyle, LengthPercentageAuto, PseudoElement, StyleMap,
 };
 
 /// The image chosen for one `<img>` element, or the poster of a `<video>`.
@@ -366,8 +373,234 @@ impl ImageJobs {
     }
 }
 
+/// The second wave of a page: one job per image URL, inline `<svg>` and
+/// web font file, in that order, and where each result goes.
+struct Wave {
+    jobs: Vec<Option<Job>>,
+    /// The URL of each image job (`jobs[..svg_start]`).
+    image_urls: Vec<Url>,
+    /// Per image job: the elements whose choice is stored per element
+    /// (`srcset`, `<picture>`), with the candidate's density.
+    users: Vec<Vec<(NodeId, f32)>>,
+    svg_start: usize,
+    svg_nodes: Vec<NodeId>,
+    font_start: usize,
+    fonts: Vec<FontSlot>,
+    font_urls: HashSet<Url>,
+}
+
+/// One web font file of the wave.
+struct FontSlot {
+    face: FontFaceRule,
+    state: FontState,
+}
+
+enum FontState {
+    /// On its way.
+    Waiting,
+    /// Decoded; it waits for the files of its family before it.
+    Loaded(WebFont),
+    /// Handed out for registration, failed, or not used (`font-display`).
+    Done,
+}
+
+impl Wave {
+    /// Collect the jobs: eager `<img>` choices that generate a box, CSS
+    /// background, mask and `content` images, inline `<svg>`s and the web
+    /// fonts the text uses.
+    fn plan(
+        doc: &Document,
+        styles: &StyleMap,
+        font_faces: &[FontFaceRule],
+        plan: &ImagePlan,
+        screen: &Screen,
+    ) -> Wave {
+        let mut jobs = ImageJobs::default();
+        let mut by_node: Vec<(usize, NodeId, f32)> = Vec::new();
+        for c in &plan.eager {
+            let (Some(style), Some(el)) = (styles.get(c.node), doc.element(c.node)) else {
+                continue;
+            };
+            let display = display_size(style, el, c.slot_width, screen.device_pixel_ratio);
+            let job = jobs.add(&c.url, display);
+            if !c.by_url {
+                by_node.push((job, c.node, c.density));
+            }
+        }
+        // CSS background and mask images, and `content: url(...)` images, at
+        // natural size: of elements in shadow trees and of ::before/::after too.
+        for n in doc.shadow_including_descendants(NodeId::DOCUMENT) {
+            let pseudos =
+                [PseudoElement::Before, PseudoElement::After].map(|p| styles.pseudo(n, p));
+            for s in std::iter::once(styles.get(n)).chain(pseudos).flatten() {
+                let mask = s.mask.as_deref().map(|m| &m.image);
+                for layer in [s.background_image.as_ref(), mask].into_iter().flatten() {
+                    if let BackgroundImage::Url(u) = layer
+                        && let Ok(u) = Url::parse(u)
+                    {
+                        jobs.add(&u, None);
+                    }
+                }
+                if let Content::Items(list) = &s.content {
+                    for item in list.iter() {
+                        if let ContentItem::Image(u) = item
+                            && let Ok(u) = Url::parse(u)
+                        {
+                            jobs.add(&u, None);
+                        }
+                    }
+                }
+            }
+        }
+        let mut list = jobs.jobs;
+        let image_urls: Vec<Url> = list
+            .iter()
+            .filter_map(|j| match j {
+                Job::Image { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut users = vec![Vec::new(); image_urls.len()];
+        for (job, node, density) in by_node {
+            users[job].push((node, density));
+        }
+        let svg_start = list.len();
+        let svg_nodes = collect_inline_svgs(doc, styles, screen, &mut list, |_| false);
+        let font_start = list.len();
+        let mut fonts = Vec::new();
+        let mut font_urls = HashSet::new();
+        for (face, url) in select_font_faces(doc, styles, font_faces) {
+            font_urls.insert(url.clone());
+            list.push(Job::Font { url });
+            fonts.push(FontSlot {
+                face: font_faces[face].clone(),
+                state: FontState::Waiting,
+            });
+        }
+        Wave {
+            jobs: list.into_iter().map(Some).collect(),
+            image_urls,
+            users,
+            svg_start,
+            svg_nodes,
+            font_start,
+            fonts,
+            font_urls,
+        }
+    }
+
+    /// Store the result of job `i`: images in `images` at once, fonts for
+    /// [`Wave::ready_fonts`].
+    fn apply(&mut self, i: usize, done: Done, images: &mut ImageStore) {
+        match done {
+            Done::Image(Ok(img)) if i < self.svg_start => {
+                for &(node, density) in &self.users[i] {
+                    images.insert_for_node(node.to_raw(), with_density(&img, density));
+                }
+                images.insert(&self.image_urls[i], img);
+            }
+            Done::Image(Ok(img)) if i < self.font_start => {
+                images.insert_for_node(self.svg_nodes[i - self.svg_start].to_raw(), img);
+            }
+            Done::Font(result) if i >= self.font_start => {
+                let slot = &mut self.fonts[i - self.font_start];
+                if matches!(slot.state, FontState::Waiting) {
+                    slot.state = match result {
+                        Ok(data) => FontState::Loaded(web_font(&slot.face, data)),
+                        Err(_) => FontState::Done,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The decoded fonts that may be registered now, in registration
+    /// order. Within a family the subset covering the most text comes
+    /// first, so a file waits until the ones before it are in.
+    fn ready_fonts(&mut self) -> Vec<WebFont> {
+        let mut waiting: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for slot in &mut self.fonts {
+            let family = slot.face.family.to_lowercase();
+            match &slot.state {
+                FontState::Waiting => {
+                    waiting.insert(family);
+                }
+                FontState::Loaded(_) if !waiting.contains(&family) => {
+                    if let FontState::Loaded(f) =
+                        std::mem::replace(&mut slot.state, FontState::Done)
+                    {
+                        out.push(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// End the periods that are over at `now`: an `optional` font after its
+    /// block period and a `fallback` font after its swap period are not
+    /// used any more (the fallback stays).
+    fn expire(&mut self, start: Instant, now: Instant) {
+        for s in &mut self.fonts {
+            let over = match s.face.display {
+                FontDisplay::Optional => start + block_period(FontDisplay::Optional),
+                FontDisplay::Fallback => start + FALLBACK_SWAP_END,
+                _ => continue,
+            };
+            if matches!(s.state, FontState::Waiting) && now >= over {
+                s.state = FontState::Done;
+            }
+        }
+    }
+
+    /// The families of the fonts still on their way and in their block
+    /// period (from `start`) at `now`: their text is invisible.
+    fn blocked_families(&self, start: Instant, now: Instant) -> Vec<String> {
+        self.fonts
+            .iter()
+            .filter(|s| {
+                matches!(s.state, FontState::Waiting) && start + block_period(s.face.display) > now
+            })
+            .map(|s| s.face.family.to_lowercase())
+            .collect()
+    }
+
+    /// When the next period of a font still on its way ends after `now`.
+    fn next_period_end(&self, start: Instant, now: Instant) -> Option<Instant> {
+        self.fonts
+            .iter()
+            .filter(|s| matches!(s.state, FontState::Waiting))
+            .flat_map(|s| {
+                let swap_end =
+                    (s.face.display == FontDisplay::Fallback).then_some(start + FALLBACK_SWAP_END);
+                [Some(start + block_period(s.face.display)), swap_end]
+            })
+            .flatten()
+            .filter(|&end| end > now)
+            .min()
+    }
+}
+
+/// How long text waits for a web font before it shows in a fallback
+/// (CSS Fonts 4 `font-display`, with Chrome's periods: it blocks `auto`).
+fn block_period(display: FontDisplay) -> Duration {
+    match display {
+        FontDisplay::Auto | FontDisplay::Block => Duration::from_secs(3),
+        FontDisplay::Fallback | FontDisplay::Optional => Duration::from_millis(100),
+        FontDisplay::Swap => Duration::ZERO,
+    }
+}
+
+/// A `font-display: fallback` font replaces the fallback only if it
+/// arrives within this time from the start of its load (its swap period).
+const FALLBACK_SWAP_END: Duration = Duration::from_secs(3);
+
 /// Fetch and decode the eager images, CSS backgrounds, inline SVGs and web
-/// fonts in one parallel batch.
+/// fonts in one parallel batch, and wait for all of them (`huginn render`,
+/// which paints once).
 pub fn load(
     loader: &Loader,
     doc: &Document,
@@ -376,106 +609,257 @@ pub fn load(
     plan: &ImagePlan,
     screen: &Screen,
 ) -> Loaded {
-    let mut jobs = ImageJobs::default();
-    // <img> elements that generate a box.
-    let mut img_users: Vec<(usize, &ImgChoice)> = Vec::new();
-    for c in &plan.eager {
-        let (Some(style), Some(el)) = (styles.get(c.node), doc.element(c.node)) else {
-            continue;
-        };
-        let display = display_size(style, el, c.slot_width, screen.device_pixel_ratio);
-        img_users.push((jobs.add(&c.url, display), c));
-    }
-    // CSS background and mask images, and `content: url(...)` images, at
-    // natural size: of elements in shadow trees and of ::before/::after too.
-    for n in doc.shadow_including_descendants(NodeId::DOCUMENT) {
-        let pseudos = [PseudoElement::Before, PseudoElement::After].map(|p| styles.pseudo(n, p));
-        for s in std::iter::once(styles.get(n)).chain(pseudos).flatten() {
-            let mask = s.mask.as_deref().map(|m| &m.image);
-            for layer in [s.background_image.as_ref(), mask].into_iter().flatten() {
-                if let BackgroundImage::Url(u) = layer
-                    && let Ok(u) = Url::parse(u)
-                {
-                    jobs.add(&u, None);
-                }
-            }
-            if let Content::Items(list) = &s.content {
-                for item in list.iter() {
-                    if let ContentItem::Image(u) = item
-                        && let Ok(u) = Url::parse(u)
-                    {
-                        jobs.add(&u, None);
-                    }
-                }
-            }
-        }
-    }
-    let mut jobs_list = jobs.jobs;
-    let url_of: Vec<Option<Url>> = jobs_list
-        .iter()
-        .map(|j| match j {
-            Job::Image { url, .. } => Some(url.clone()),
-            _ => None,
-        })
-        .collect();
-
-    // Inline <svg>.
-    let svg_start = jobs_list.len();
-    let svg_nodes = collect_inline_svgs(doc, styles, screen, &mut jobs_list, |_| false);
-
-    // Web fonts.
-    let font_start = jobs_list.len();
-    let selected = select_font_faces(doc, styles, font_faces);
-    let mut font_meta = Vec::new();
-    let mut font_urls = HashSet::new();
-    for (face, url) in selected {
-        font_meta.push(face);
-        font_urls.insert(url.clone());
-        jobs_list.push(Job::Font { url });
-    }
-
-    let mut done = loader.map_parallel(&jobs_list, |j| j.run(loader));
-    drop(jobs_list);
-
-    let mut images = ImageStore::new();
-    let decoded: Vec<Option<DecodedImage>> = done[..svg_start]
-        .iter()
-        .map(|d| match d {
-            Done::Image(Ok(img)) => Some(img.clone()),
-            _ => None,
-        })
-        .collect();
-    for (i, url) in url_of.iter().enumerate() {
-        if let (Some(img), Some(url)) = (&decoded[i], url) {
-            images.insert(url, img.clone());
-        }
-    }
-    for (job, c) in img_users {
-        if let Some(img) = &decoded[job]
-            && !c.by_url
-        {
-            images.insert_for_node(c.node.to_raw(), with_density(img, c.density));
-        }
-    }
-    for (k, node) in svg_nodes.into_iter().enumerate() {
-        if let Done::Image(Ok(img)) = &done[svg_start + k] {
-            images.insert_for_node(node.to_raw(), img.clone());
-        }
-    }
-    let fonts = font_meta
+    let mut wave = Wave::plan(doc, styles, font_faces, plan, screen);
+    let jobs: Vec<Job> = std::mem::take(&mut wave.jobs)
         .into_iter()
-        .enumerate()
-        .filter_map(|(k, face)| {
-            match std::mem::replace(&mut done[font_start + k], Done::Font(Ok(Vec::new()))) {
-                Done::Font(Ok(data)) => Some(web_font(&font_faces[face], data)),
-                _ => None,
-            }
-        })
+        .flatten()
         .collect();
+    let done = loader.map_parallel(&jobs, |j| j.run(loader));
+    drop(jobs);
+    let mut images = ImageStore::new();
+    for (i, d) in done.into_iter().enumerate() {
+        wave.apply(i, d, &mut images);
+    }
     Loaded {
         images,
-        fonts,
-        font_urls,
+        fonts: wave.ready_fonts(),
+        font_urls: wave.font_urls,
+    }
+}
+
+/// The window's [`load`], for its first paint. What needs no request is
+/// loaded at once: inline SVGs, `data:` URLs and fresh HTTP cache entries
+/// (Chrome paints those in its first frame too). The rest starts on the
+/// network and comes through [`Pending`]: the first paint waits for none
+/// of it, as in Chrome. Text in a web font still on the network is
+/// invisible during the font's block period (`font-display`: `auto` and
+/// `block` 3 s, `fallback` and `optional` 100 ms, `swap` none) and shows in
+/// a fallback font after it ([`Pending::blocked_families`]). An `optional`
+/// font that missed its block period is not used on the page, a
+/// `fallback` font only if it arrives within 3 s.
+pub fn load_for_first_paint(
+    loader: &Arc<Loader>,
+    doc: &Document,
+    styles: &StyleMap,
+    font_faces: &[FontFaceRule],
+    plan: &ImagePlan,
+    screen: &Screen,
+) -> (Loaded, Option<Pending>) {
+    let mut wave = Wave::plan(doc, styles, font_faces, plan, screen);
+    // Which image and font files need no request.
+    let probe: Vec<usize> = (0..wave.svg_start)
+        .chain(wave.font_start..wave.jobs.len())
+        .collect();
+    let cached = loader.map_parallel(&probe, |&i| match &wave.jobs[i] {
+        Some(Job::Image { url, .. }) => loader.fetch_cached(url, ResourceKind::Image),
+        Some(Job::Font { url }) => loader.fetch_cached(url, ResourceKind::Font),
+        _ => None,
+    });
+    // Bodies sit in a lock so the decode can take them without a copy.
+    type Hit = std::sync::Mutex<Option<huginn_net::Resource>>;
+    let mut local: Vec<(usize, Job, Hit)> = Vec::new();
+    let mut network: Vec<(usize, Job)> = Vec::new();
+    for (&i, hit) in probe.iter().zip(cached) {
+        let job = wave.jobs[i].take().expect("each job is taken once");
+        match hit {
+            Some(r) => local.push((i, job, Hit::new(Some(r)))),
+            None => network.push((i, job)),
+        }
+    }
+    for i in wave.svg_start..wave.font_start {
+        let job = wave.jobs[i].take().expect("each job is taken once");
+        local.push((i, job, Hit::new(None)));
+    }
+    // `load_added`'s keys for the images on the network.
+    let mut keys = Vec::new();
+    for &(i, _) in network.iter().filter(|(i, _)| *i < wave.svg_start) {
+        let url = &wave.image_urls[i];
+        keys.push(url.to_string());
+        keys.extend(
+            wave.users[i]
+                .iter()
+                .map(|(node, _)| format!("{} {url}", node.to_raw())),
+        );
+    }
+
+    // The network jobs go first, on a thread of their own.
+    let start = Instant::now();
+    let net = (!network.is_empty()).then(|| spawn_jobs(loader, network));
+
+    let mut images = ImageStore::new();
+    let decoded = loader.map_parallel(&local, |(_, job, hit)| {
+        let hit = hit.lock().ok().and_then(|mut h| h.take());
+        match (job, hit) {
+            (Job::Image { display, .. }, Some(r)) => {
+                Done::Image(huginn_net::decode_image(&r.body, *display))
+            }
+            (Job::Font { .. }, Some(r)) => Done::Font(huginn_net::decode_font(r.body)),
+            (job, _) => job.run(loader),
+        }
+    });
+    for ((i, _, _), d) in local.iter().zip(decoded) {
+        wave.apply(*i, d, &mut images);
+    }
+    drop(local);
+
+    let Some((rx, left, cancel)) = net else {
+        let fonts = wave.ready_fonts();
+        let font_urls = std::mem::take(&mut wave.font_urls);
+        return (
+            Loaded {
+                images,
+                fonts,
+                font_urls,
+            },
+            None,
+        );
+    };
+    let mut pending = Pending {
+        wave,
+        rx,
+        left,
+        keys,
+        start,
+        cancel,
+    };
+    let fonts = pending.wave.ready_fonts();
+    let font_urls = std::mem::take(&mut pending.wave.font_urls);
+    (
+        Loaded {
+            images,
+            fonts,
+            font_urls,
+        },
+        Some(pending),
+    )
+}
+
+/// Run `jobs` on a thread of their own (which runs them on the loader's
+/// worker threads); each result is sent as it comes. Returns the
+/// receiver, the number of results to expect, and the flag that skips the
+/// jobs not started yet.
+fn spawn_jobs(
+    loader: &Arc<Loader>,
+    jobs: Vec<(usize, Job)>,
+) -> (Receiver<(usize, Done)>, usize, Arc<AtomicBool>) {
+    let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let left = jobs.len();
+    let (loader, stop) = (loader.clone(), cancel.clone());
+    let spawned = std::thread::Builder::new()
+        .name("huginn-resources".into())
+        .spawn(move || {
+            loader.map_parallel(&jobs, |(i, job)| {
+                if !stop.load(Ordering::Relaxed) {
+                    let _ = tx.send((*i, job.run(&loader)));
+                }
+            });
+        });
+    // No thread: nothing will come.
+    (rx, if spawned.is_ok() { left } else { 0 }, cancel)
+}
+
+/// The images and web fonts of a page that were still on the network at
+/// its first paint ([`load_for_first_paint`]). Dropping it skips the jobs
+/// that have not started.
+pub struct Pending {
+    wave: Wave,
+    rx: Receiver<(usize, Done)>,
+    /// Network jobs not answered yet.
+    left: usize,
+    /// The image URLs (and `node url` keys of per-element choices) of the
+    /// jobs on the network, as [`load_added`] marks what it tried.
+    keys: Vec<String>,
+    /// When the network jobs started: font-display periods count from here.
+    start: Instant,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Pending {
+    /// Store one result and note what it was.
+    fn store(&mut self, (i, done): (usize, Done), images: &mut ImageStore, took: &mut Took) {
+        self.left -= 1;
+        // A `fallback` font is used only within its swap period.
+        self.wave.expire(self.start, Instant::now());
+        if i >= self.wave.font_start {
+            took.fonts = true;
+        } else {
+            took.images = true;
+        }
+        self.wave.apply(i, done, images);
+    }
+
+    /// Wait until the next result arrives (or `deadline`; `None`: as long
+    /// as it takes), then store it and all others already in. Fonts that
+    /// may be registered now go to `fonts`.
+    pub fn take(
+        &mut self,
+        images: &mut ImageStore,
+        fonts: &mut Vec<WebFont>,
+        deadline: Option<Instant>,
+    ) -> Took {
+        let mut took = Took::default();
+        if self.left == 0 {
+            return took;
+        }
+        let first = match deadline {
+            Some(t) => self
+                .rx
+                .recv_timeout(t.saturating_duration_since(Instant::now()))
+                .map_err(|e| e == RecvTimeoutError::Disconnected),
+            None => self.rx.recv().map_err(|_| true),
+        };
+        match first {
+            Ok(r) => self.store(r, images, &mut took),
+            // The thread ended without answering every job (it panicked).
+            Err(true) => self.left = 0,
+            Err(false) => {}
+        }
+        while self.left > 0
+            && let Ok(r) = self.rx.try_recv()
+        {
+            self.store(r, images, &mut took);
+        }
+        self.wave.expire(self.start, Instant::now());
+        fonts.extend(self.wave.ready_fonts());
+        took
+    }
+
+    /// The web font families whose text is invisible at `now`: fonts still
+    /// on their way in their block period.
+    pub fn blocked_families(&mut self, now: Instant) -> Vec<String> {
+        self.wave.expire(self.start, now);
+        self.wave.blocked_families(self.start, now)
+    }
+
+    /// When the next font-display period ends (text shows in a fallback, or
+    /// a late font is no longer used).
+    pub fn next_font_change(&self, now: Instant) -> Option<Instant> {
+        self.wave.next_period_end(self.start, now)
+    }
+
+    /// Whether every job is answered.
+    pub fn is_done(&self) -> bool {
+        self.left == 0
+    }
+
+    /// The keys [`load_added`] marks as tried for the images still on the
+    /// network, so it does not fetch them a second time.
+    pub fn tried_keys(&self) -> impl Iterator<Item = &String> {
+        self.keys.iter()
+    }
+}
+
+/// What [`Pending::take`] stored.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct Took {
+    pub images: bool,
+    pub fonts: bool,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1151,6 +1535,7 @@ mod tests {
             style,
             unicode_range: range.to_vec(),
             size_adjust: 1.0,
+            display: huginn_style::FontDisplay::Auto,
         }
     }
 

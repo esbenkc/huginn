@@ -321,6 +321,25 @@ pub enum FontStyle {
     Oblique,
 }
 
+/// The `font-display` descriptor of an `@font-face` rule: how long text
+/// waits for the font before it shows in a fallback (CSS Fonts 4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum FontDisplay {
+    /// The browser's choice: Chrome blocks like `block`.
+    #[default]
+    Auto,
+    /// Invisible text for up to 3 s, then a fallback until the font loads.
+    Block,
+    /// A fallback at once; the font replaces it when it loads.
+    Swap,
+    /// Invisible text for up to 100 ms, then a fallback; the font replaces
+    /// it only if it loads within 3 s.
+    Fallback,
+    /// Invisible text for up to 100 ms; the font is used only if it loaded
+    /// by then.
+    Optional,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Default)]
 pub enum LineHeight {
     #[default]

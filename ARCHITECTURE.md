@@ -43,7 +43,8 @@ ordered.
  StyleEngine::compute(&Document)    huginn-style  StyleMap: Arc<ComputedStyle> per element
    |  resources::load: one parallel batch of <img> (not display:none, decoded at
    |  display size), CSS backgrounds, inline <svg> (resvg) and the @font-face
-   |  files the text uses (WOFF2 -> sfnt); bodies dropped after decoding
+   |  files the text uses (WOFF2 -> sfnt); bodies dropped after decoding. The
+   |  window lays out without the ones still on the network (load_for_first_paint)
    v
  LayoutEngine::layout(LayoutInput)  huginn-layout LayoutTree: flat boxes + text runs + glyphs
    |  resources::load_lazy: loading=lazy images in the painted region (patched
@@ -86,6 +87,12 @@ responses to scripts' requests arrive counts in `fetch_ms`, not in
 `script_ms` or `script_timers_ms`. `--no-js` (or `HUGINN_NO_JS=1`) turns scripts off.
 The window runs only the parser-blocking scripts here and the `async`,
 `defer` and module scripts after its first paint (see "The window").
+
+With `HUGINN_NET_LOG=1` the pipeline also prints the end of each phase of
+a load on the net log's clock (`huginn: load: +530.1 first paint (laid
+out)`): document in, HTML parsed, stylesheets and blocking scripts in, CSS
+parsed, blocking scripts run, styled, images and fonts for the first paint
+in, first paint, first contentful paint, images and fonts in, complete.
 
 ## Threading
 
@@ -139,9 +146,9 @@ The window runs only the parser-blocking scripts here and the `async`,
 - The window's first paint goes first. While `pipeline::load_document`
   loads a page, it holds the scripts' requests
   (`Loader::hold_script_requests`): `fetch()` and async XHR that the
-  parser-blocking scripts start wait in the queue until the stylesheets,
-  images and fonts of the first paint are in. Then they all go, up to 16 at
-  once, while the page is laid out. Chrome gives stylesheets and fonts the
+  parser-blocking scripts start wait in the queue until the first paint's
+  stylesheets are in and its images and fonts have started. Then they all
+  go, up to 16 at once, while the page is laid out. Chrome gives stylesheets and fonts the
   highest priority and `fetch()` and XHR the next one, and servers that
   use HTTP/2 or HTTP/3 priorities send the higher ones first. Huginn's
   requests carry no priority, so it holds the lower ones back instead. It
@@ -187,10 +194,26 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
   touched pages committed) that owns its `Page` (the `Document` is not
   `Send`). It runs `pipeline::load` and layout and sends the finished
   `LayoutTree` and a link table to the main thread, tagged with the tab id:
-  the first paint. It waits for the stylesheets, the parser-blocking
-  scripts, the images and the web fonts, not for `async`, `defer` and module
-  scripts (Chrome paints before them when they are not loaded yet; their
-  sources load on a `huginn-scripts` thread meanwhile). Then it runs those,
+  the first paint. It waits for the stylesheets and the parser-blocking
+  scripts, not for `async`, `defer` and module scripts (Chrome paints
+  before them when they are not loaded yet; their sources load on a
+  `huginn-scripts` thread meanwhile), and not for images and web fonts
+  on the network (`resources::load_for_first_paint`). Inline SVGs,
+  `data:` URLs and fresh HTTP cache entries (`Loader::fetch_cached`) are
+  in the first paint, as they are in Chrome's first frame; the rest load
+  on a `huginn-resources` thread. Text in a web font that is still
+  loading follows `font-display` with Chrome's periods: invisible (laid
+  out with the fallback, `LayoutEngine::set_invisible_families`) for 3 s
+  with `auto` and `block`, 100 ms with `fallback` and `optional`, not at
+  all with `swap`; then the fallback shows. An `optional` font that
+  missed its 100 ms is not used on the page, a `fallback` font only if it
+  came within 3 s. Arriving fonts and the end of a period show at once;
+  arriving images in batches, at most every 50 ms. The first tree that
+  paints content (visible text, an image, a background image in the
+  viewport) is the first contentful paint (`contentful_ms` in `state`);
+  the first paint can be earlier, with all its text invisible. Images
+  and fonts that came show before the async, defer and module scripts
+  run, which run once their sources are in. Then it runs those,
   fires the load events they held up and sends the tree again if they
   changed the page. Then it loads every `loading=lazy` image of the page (the window
   scrolls, so all can come into view) and sends the tree again; like in

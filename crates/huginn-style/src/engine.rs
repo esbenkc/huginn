@@ -42,7 +42,9 @@ use style::values::computed::{CSSPixelLength, Length};
 use style::{Atom, font_face};
 
 use crate::dom::{DomCx, ElemSide, HuginnNode};
-use crate::{FontFaceRule, FontFaceSource, FontStyle, Origin, StylesheetLoader, Viewport, hints};
+use crate::{
+    FontDisplay, FontFaceRule, FontFaceSource, FontStyle, Origin, StylesheetLoader, Viewport, hints,
+};
 
 /// Max `@import` nesting.
 const MAX_IMPORT_DEPTH: u32 = 4;
@@ -364,6 +366,13 @@ pub(crate) fn font_faces(
                 .as_ref()
                 .and_then(|p| p.0.get())
                 .unwrap_or(1.0),
+            display: match d.font_display {
+                None | Some(font_face::FontDisplay::Auto) => FontDisplay::Auto,
+                Some(font_face::FontDisplay::Block) => FontDisplay::Block,
+                Some(font_face::FontDisplay::Swap) => FontDisplay::Swap,
+                Some(font_face::FontDisplay::Fallback) => FontDisplay::Fallback,
+                Some(font_face::FontDisplay::Optional) => FontDisplay::Optional,
+            },
         });
     }
     out

@@ -211,6 +211,10 @@ pub struct Tab {
     /// Time until its load was complete (the scripts after the first paint,
     /// DOMContentLoaded, load, lazy images), ms; `None` before.
     pub complete_ms: Option<f64>,
+    /// Time to the first paint that shows content (text not waiting for a
+    /// web font, an image), like Chrome's first contentful paint; `None`
+    /// before.
+    pub contentful_ms: Option<f64>,
     /// The current document's referrer policy, for the links it opens.
     referrer_policy: ReferrerPolicy,
     /// The page's icon URL and image, once loaded.
@@ -286,6 +290,7 @@ impl Tab {
             error: None,
             load_ms: 0.0,
             complete_ms: None,
+            contentful_ms: None,
             referrer_policy: ReferrerPolicy::default(),
             icon: None,
             favicon: None,
@@ -482,6 +487,10 @@ impl Tab {
                 generation,
                 complete_ms,
             } if generation == self.generation => self.complete_ms = Some(complete_ms),
+            EngineEvent::Contentful {
+                generation,
+                contentful_ms,
+            } if generation == self.generation => self.contentful_ms = Some(contentful_ms),
             EngineEvent::Relaid {
                 generation,
                 tree,
@@ -546,6 +555,7 @@ impl Tab {
         self.error = l.error;
         self.load_ms = l.load_ms;
         self.complete_ms = None;
+        self.contentful_ms = None;
         self.referrer_policy = l.referrer_policy;
         self.loading = None;
         self.stale = false;
@@ -1196,6 +1206,7 @@ impl Tab {
         set("error", self.error.clone().into());
         set("load_ms", self.load_ms.into());
         set("complete_ms", self.complete_ms.into());
+        set("contentful_ms", self.contentful_ms.into());
         set("loading", self.is_loading().into());
         set("history", self.history.len().into());
         set("index", self.index.into());

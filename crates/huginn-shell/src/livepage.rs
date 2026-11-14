@@ -236,7 +236,9 @@ impl LivePage {
             shown_scroll: page.doc.scroll_generation(),
             shown_state: page.doc.interaction().clone(),
             status: Status::default(),
-            tried: HashSet::new(),
+            // Images still on the network from the first paint come with
+            // `Page::take_pending`; `load_added` must not fetch them again.
+            tried: page.pending_keys().cloned().collect(),
         }
     }
 
