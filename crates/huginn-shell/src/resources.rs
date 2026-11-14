@@ -181,7 +181,7 @@ fn choose_img(
 /// The `srcset` candidate for the screen: (URL, density, slot width if `w`
 /// descriptors were used). `src` joins as the `1x` candidate when the set has
 /// neither `w` descriptors nor a `1x` entry (HTML spec).
-fn choose_from_srcset<'a>(
+pub(crate) fn choose_from_srcset<'a>(
     srcset: &'a str,
     sizes: Option<&str>,
     src: Option<&'a str>,
@@ -226,7 +226,7 @@ fn choose_from_srcset<'a>(
     ))
 }
 
-fn supported_image_type(t: &str) -> bool {
+pub(crate) fn supported_image_type(t: &str) -> bool {
     let t = t
         .split(';')
         .next()
