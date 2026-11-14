@@ -333,8 +333,19 @@ fn passes_on_several_threads_at_once_give_the_same_styles() {
             let (html, texts, expected) = (html.clone(), texts.clone(), expected.clone());
             std::thread::spawn(move || {
                 let doc = parse_html(&html);
-                for _ in 0..10 {
-                    assert!(styles_with(&doc, &sheets(&texts)) == expected);
+                for round in 0..10 {
+                    let got = styles_with(&doc, &sheets(&texts));
+                    if let Some(n) = (0..got.len()).find(|&n| got[n] != expected[n]) {
+                        let (a, b) = (format!("{:#?}", expected[n]), format!("{:#?}", got[n]));
+                        let diff: Vec<String> = a
+                            .lines()
+                            .zip(b.lines())
+                            .filter(|(x, y)| x != y)
+                            .take(8)
+                            .map(|(x, y)| format!("{} -> {}", x.trim(), y.trim()))
+                            .collect();
+                        panic!("round {round}: node {n} differs: {diff:#?}");
+                    }
                 }
             })
         })
