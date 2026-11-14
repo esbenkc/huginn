@@ -505,6 +505,27 @@ pub fn load_document(
         scripts::Until::Load
     };
 
+    // The first script would make the script engine's isolate (a few ms).
+    // Make it now, so that requests already in flight for the stylesheets
+    // and scripts below arrive meanwhile. Counted as script time.
+    let t = Instant::now();
+    if let Some(js) = js_engine.as_deref_mut()
+        && !scripts.is_empty()
+    {
+        js.prepare(&mut huginn_js::HostContext {
+            document: &mut doc,
+            loader,
+            document_url: &doc_url,
+            referrer: referrer.as_deref().unwrap_or(""),
+            base_url: &base,
+            viewport: (viewport.width, viewport.height),
+            now_ms: start.elapsed().as_secs_f64() * 1000.0,
+            layout: None,
+            current_script: None,
+        });
+    }
+    let prepare_time = t.elapsed();
+
     // 3. Fetch stylesheets and scripts in parallel. Images wait for style:
     // hidden ones are skipped and the rest are decoded at their displayed size.
     let t = Instant::now();
@@ -631,7 +652,7 @@ pub fn load_document(
         _ => None,
     };
     // Time the settle loop waited for scripts' requests is network time.
-    let script_time = t.elapsed().saturating_sub(js_report.net_wait);
+    let script_time = t.elapsed().saturating_sub(js_report.net_wait) + prepare_time;
     fetch += js_report.net_wait;
 
     // 5. Style.

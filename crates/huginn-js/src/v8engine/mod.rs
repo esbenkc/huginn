@@ -668,6 +668,11 @@ impl ScriptEngine for V8Engine {
         st.next_due
     }
 
+    fn prepare(&mut self, cx: &mut HostContext<'_>) {
+        // A failure here comes back from `execute`, which tries again.
+        let _ = self.runtime(cx);
+    }
+
     fn requests_in_flight(&self) -> usize {
         self.rt
             .as_ref()
