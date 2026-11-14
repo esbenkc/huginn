@@ -142,8 +142,11 @@ pub(crate) struct Preloads {
     slots: HashMap<Key, Arc<Slot>>,
     /// Queued preloads, in the order they were found.
     queue: VecDeque<(Key, Arc<Slot>)>,
-    /// Threads sending queued preloads.
+    /// Threads sending queued preloads (sending one, or looking for the
+    /// next).
     workers: usize,
+    /// Of those, the ones sending one now.
+    sending: usize,
     /// Preloads in flight per priority.
     running: [usize; 3],
     /// The loader, for the threads (set by the first preload).
@@ -216,10 +219,12 @@ impl Loader {
             })
     }
 
-    /// Start threads for the preloads that may go now.
+    /// Start threads for the preloads that may go now: each gets a thread
+    /// that is not busy with another one, so a stylesheet found while
+    /// others are on the network goes at once instead of after them.
     pub(crate) fn pump(&self, p: &mut Preloads) {
         let ready = self.ready(p);
-        while p.workers < ready.min(MAX_PARALLEL) {
+        while p.workers - p.sending < ready && p.workers < MAX_PARALLEL {
             let loader = p.loader.clone();
             let spawned = std::thread::Builder::new()
                 .name("huginn-preload".into())
@@ -262,8 +267,12 @@ impl Loader {
     }
 
     /// The next preload a thread may send, if any (else the thread ends).
-    fn next_preload(&self) -> Option<(Key, Arc<Slot>)> {
+    /// `sent`: the thread has sent one since it last asked.
+    fn next_preload(&self, sent: bool) -> Option<(Key, Arc<Slot>)> {
         let mut p = self.preloads.lock();
+        if sent {
+            p.sending -= 1;
+        }
         // The most urgent that may go, in the order they were found.
         let next = self.may_go(&mut p).and_then(|lowest| {
             let first = Priority::ALL
@@ -272,7 +281,9 @@ impl Loader {
                 .find_map(|q| p.queue.iter().position(|(_, s)| s.priority() == *q))?;
             p.queue.remove(first)
         });
-        if next.is_none() {
+        if next.is_some() {
+            p.sending += 1;
+        } else {
             p.workers -= 1;
         }
         next
@@ -395,10 +406,12 @@ impl Loader {
 /// A preload thread: sends queued preloads until none may go. It holds the
 /// loader only while it sends one, so a closed page's queue is not sent.
 fn preload_worker(loader: &Weak<Loader>) {
+    let mut sent = false;
     while let Some(me) = loader.upgrade() {
-        let Some((key, slot)) = me.next_preload() else {
+        let Some((key, slot)) = me.next_preload(sent) else {
             return;
         };
+        sent = true;
         if slot.start() {
             me.send_preload(&key, &slot);
         }

@@ -47,6 +47,18 @@ impl Server {
             .cloned()
             .collect()
     }
+
+    /// When the first request for `path` came in (waits up to 5 s).
+    fn first(&self, path: &str) -> Duration {
+        let t = Instant::now();
+        loop {
+            if let Some(r) = self.requests(path).first() {
+                return r.at;
+            }
+            assert!(t.elapsed() < Duration::from_secs(5), "{path} never went");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 /// Answers every request on a thread of its own after `delay(path)`, with
@@ -221,16 +233,7 @@ fn less_urgent_preloads_wait_for_more_urgent_ones_and_low_ones_for_a_hold() {
         _ => 0,
     });
     let l = loader(&format!("http://127.0.0.1:{}/page", s.port));
-    let first = |p: &str| -> Duration {
-        let t = Instant::now();
-        loop {
-            if let Some(r) = s.requests(p).first() {
-                return r.at;
-            }
-            assert!(t.elapsed() < Duration::from_secs(5), "{p} never went");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    };
+    let first = |p: &str| s.first(p);
     let (css, font, img) = (s.url("/slow.css"), s.url("/f.woff2"), s.url("/a.png"));
     l.preload(
         &img,
@@ -304,4 +307,28 @@ fn less_urgent_preloads_wait_for_more_urgent_ones_and_low_ones_for_a_hold() {
         Priority::Blocking,
     );
     first("/d.js");
+}
+
+#[test]
+fn a_preload_found_while_others_are_on_the_network_goes_at_once() {
+    let s = serve(|_| 500);
+    let l = loader(&format!("http://127.0.0.1:{}/page", s.port));
+    // The scanner finds a page's stylesheets one by one while the document
+    // arrives; each goes before the earlier ones' responses are in.
+    let paths: Vec<String> = (0..6).map(|i| format!("/s{i}.css")).collect();
+    for p in &paths {
+        l.preload(
+            &s.url(p),
+            ResourceKind::Stylesheet,
+            CorsSettings::NoCors,
+            Priority::Blocking,
+        );
+        s.first(p);
+    }
+    let first = s.first(&paths[0]);
+    let last = s.first(&paths[5]);
+    assert!(
+        last < first + Duration::from_millis(250),
+        "{first:?} {last:?}"
+    );
 }
