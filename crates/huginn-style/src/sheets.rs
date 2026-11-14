@@ -168,8 +168,10 @@ impl Cache {
     }
 }
 
-/// Parse a stylesheet, on any thread. `base_url` resolves relative `url()`s
-/// and `@import`s; `@import`s are fetched synchronously through `loader`.
+/// Parse a stylesheet, on any thread, before or after any `StyleEngine`
+/// exists (the parse turns Stylo's features on first, as an engine does).
+/// `base_url` resolves relative `url()`s and `@import`s; `@import`s are
+/// fetched synchronously through `loader`.
 /// The same origin, URL and text give the same parse while the cache keeps
 /// it (several threads asking at once wait for one parse).
 pub fn parse_stylesheet(

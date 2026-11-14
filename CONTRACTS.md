@@ -201,7 +201,8 @@ impl StyleEngine {
 }
 pub const UA_STYLESHEET: &str;                 // src/ua.css
 
-/// Parse on any thread. Same origin, URL and text: the same parse while the
+/// Parse on any thread, before or after any StyleEngine exists (the same parse either way).
+/// Same origin, URL and text: the same parse while the
 /// process-wide cache keeps it (8 MB of source, LRU; sheets with @import are not kept).
 pub fn parse_stylesheet(css: &str, base_url: &str, origin: Origin, loader: &dyn StylesheetLoader) -> ParsedStylesheet;
 pub struct ParsedStylesheet { .. }             // Clone + Send + Sync

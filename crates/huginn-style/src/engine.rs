@@ -49,11 +49,16 @@ use crate::{
 /// Max `@import` nesting.
 const MAX_IMPORT_DEPTH: u32 = 4;
 
+static STYLO_INIT: Once = Once::new();
+
 /// Turn on the Stylo features Huginn renders (or at least parses so that
-/// the cascade matches Chrome). Must run before the first `Stylist`.
+/// the cascade matches Chrome). Stylo's parser reads these switches, so
+/// every entry point that parses CSS calls this first (`parse_sheet`,
+/// `BlockCache::get`, `query::parse`), as does `StyleEngine::new` for the
+/// `Stylist`: the shell parses sheets on fetch threads before any engine
+/// exists, and the cache keeps each parse for the whole process.
 pub(crate) fn init_stylo() {
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
+    STYLO_INIT.call_once(|| {
         use style_config::set_pref;
         set_pref!("layout.css.has-selector.enabled", true);
         set_pref!("layout.css.nth-child-of.enabled", true);
@@ -165,6 +170,7 @@ pub(crate) fn parse_sheet(
     quirks: QuirksMode,
     depth: u32,
 ) -> Arc<Stylesheet> {
+    init_stylo();
     parse_sheet_with_media(
         css,
         base_url,
@@ -226,6 +232,8 @@ fn parse_sheet_with_media(
     depth: u32,
     media: Arc<Locked<MediaList>>,
 ) -> Arc<Stylesheet> {
+    // `parse_sheet` or the `@import` of a sheet it is parsing called us.
+    debug_assert!(STYLO_INIT.is_completed(), "parse before init_stylo");
     let imports = ImportLoader {
         loader,
         origin,
@@ -390,6 +398,7 @@ impl BlockCache {
         if let Some(b) = self.0.get(css) {
             return b.clone();
         }
+        init_stylo();
         let block = Arc::new(lock.wrap(parse_style_attribute(
             &webkit_aliases(css),
             url,
