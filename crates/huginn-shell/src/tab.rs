@@ -203,8 +203,12 @@ pub struct Tab {
     pub title: String,
     /// Why the current page failed to load (an error page is shown).
     pub error: Option<String>,
-    /// Load time of the current page (fetch to layout), ms.
+    /// Time to the first paint of the current page (fetch to its first
+    /// layout), ms.
     pub load_ms: f64,
+    /// Time until its load was complete (the scripts after the first paint,
+    /// DOMContentLoaded, load, lazy images), ms; `None` before.
+    pub complete_ms: Option<f64>,
     /// The current document's referrer policy, for the links it opens.
     referrer_policy: ReferrerPolicy,
     /// The page's icon URL and image, once loaded.
@@ -277,6 +281,7 @@ impl Tab {
             title: String::new(),
             error: None,
             load_ms: 0.0,
+            complete_ms: None,
             referrer_policy: ReferrerPolicy::default(),
             icon: None,
             favicon: None,
@@ -468,6 +473,10 @@ impl Tab {
         match ev {
             EngineEvent::Idle { seq } => self.done_seq = self.done_seq.max(seq),
             EngineEvent::Loaded(l) if l.generation == self.generation => self.on_loaded(*l),
+            EngineEvent::Complete {
+                generation,
+                complete_ms,
+            } if generation == self.generation => self.complete_ms = Some(complete_ms),
             EngineEvent::Relaid {
                 generation,
                 tree,
@@ -527,6 +536,7 @@ impl Tab {
         self.title = l.title;
         self.error = l.error;
         self.load_ms = l.load_ms;
+        self.complete_ms = None;
         self.referrer_policy = l.referrer_policy;
         self.loading = None;
         self.stale = false;
@@ -1143,6 +1153,7 @@ impl Tab {
         set("title", self.title.clone().into());
         set("error", self.error.clone().into());
         set("load_ms", self.load_ms.into());
+        set("complete_ms", self.complete_ms.into());
         set("loading", self.is_loading().into());
         set("history", self.history.len().into());
         set("index", self.index.into());

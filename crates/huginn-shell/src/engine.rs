@@ -88,6 +88,8 @@ impl Command {
 
 /// Engine thread -> UI thread.
 pub enum EngineEvent {
+    /// The first paint of a page: parsed, its stylesheets and blocking
+    /// scripts done.
     Loaded(Box<Loaded>),
     /// New layout of the current page (after a resize, or a DOM change: then
     /// also new links and maybe a new title).
@@ -120,13 +122,15 @@ pub enum EngineEvent {
         url: Url,
         image: Option<huginn_net::DecodedImage>,
     },
+    /// The load of `generation` is complete: the scripts that ran after the
+    /// first paint, DOMContentLoaded, load and the lazy images are done.
+    /// `complete_ms` counts from the start of the load, like `load_ms`.
+    Complete { generation: u64, complete_ms: f64 },
     /// Every command up to `seq` is done and the queue is empty.
-    Idle {
-        seq: u64,
-    },
+    Idle { seq: u64 },
 }
 
-/// A page that finished loading (or the error page that replaced it).
+/// A page ready for its first paint (or the error page that replaced it).
 pub struct Loaded {
     pub generation: u64,
     /// Final URL after redirects; the requested URL if loading failed.
@@ -140,6 +144,7 @@ pub struct Loaded {
     pub fragment: Vec<NodeId>,
     /// Why loading failed; the tree then shows an error page.
     pub error: Option<String>,
+    /// From the start of the load to the first paint, ms.
     pub load_ms: f64,
     /// The document's referrer policy, for the links it starts.
     pub referrer_policy: ReferrerPolicy,
@@ -300,6 +305,15 @@ fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(Eng
                         cur.generation,
                         notify,
                     );
+                    // The page is on screen: now the async, defer and module
+                    // scripts, and the load events that waited for them.
+                    cur.live.finish_load(
+                        &mut cur.page,
+                        &mut cur.layout,
+                        cur.viewport,
+                        cur.generation,
+                        notify,
+                    );
                     // `loading=lazy` images after the page is on screen, as
                     // in Chrome (on bbc.com they held up the first paint by
                     // seconds); then the page is laid out again.
@@ -312,6 +326,10 @@ fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(Eng
                             title: None,
                         });
                     }
+                    notify(EngineEvent::Complete {
+                        generation: cur.generation,
+                        complete_ms: cur.live.load_start().elapsed().as_secs_f64() * 1e3,
+                    });
                     // The load is done: from now on the page's requests use
                     // the cache as usual, also after a hard reload.
                     cur.live.loader().set_load_kind(LoadKind::Normal);
@@ -408,7 +426,7 @@ fn load(
     // One loader per page, on the profile's network (idle connections and
     // the HTTP cache outlive the page); scripts keep fetching through it
     // (XMLHttpRequest, fetch) while the page lives.
-    let loader = Loader::with_network(net.clone());
+    let loader = Arc::new(Loader::with_network(net.clone()));
     loader.set_load_kind(kind);
     let internal;
     let (mut page, error) = {

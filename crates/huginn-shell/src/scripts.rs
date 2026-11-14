@@ -5,7 +5,9 @@
 //! Order (CONTRACTS.md, huginn-js): blocking scripts in document order, then
 //! async ones, then deferred ones; a microtask checkpoint after each; then
 //! DOMContentLoaded and load; then timers due within `SETTLE_MS` of virtual
-//! time (no real waiting) or until the real-time budget is spent.
+//! time (no real waiting) or until the real-time budget is spent. The
+//! window runs only the blocking scripts before its first paint and the
+//! rest after it ([`run_later`]); its timers run in real time.
 
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
@@ -51,6 +53,20 @@ pub struct ScriptReport {
     pub cpu_time: Option<Duration>,
 }
 
+/// How far [`run`] takes the load after the scripts it is given.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Until {
+    /// No events: `defer` or module scripts still to come hold up
+    /// DOMContentLoaded (the window, before its first paint).
+    Scripts,
+    /// DOMContentLoaded: `async` scripts still to come hold up `load`.
+    DomContentLoaded,
+    /// DOMContentLoaded and `load`.
+    Load,
+    /// Both events, then timers settle for a short while (`huginn render`).
+    Settled,
+}
+
 /// Run the page's scripts. `sources[i]` is the fetched text and final URL of
 /// `scripts[i]` for external scripts (None if the fetch failed).
 #[allow(clippy::too_many_arguments)]
@@ -66,7 +82,7 @@ pub fn run(
     scripts: &[ScriptRef],
     sources: &[Option<(Cow<'_, str>, String)>],
     layout: &mut PageLayout<'_>,
-    settle: bool,
+    until: Until,
 ) -> ScriptReport {
     let mut report = ScriptReport::default();
     let phase_start = Instant::now();
@@ -83,57 +99,7 @@ pub fn run(
         layout: Some(layout),
         current_script: None,
     };
-    let order = [
-        ScriptTiming::Blocking,
-        ScriptTiming::Async,
-        ScriptTiming::Defer,
-    ];
-    let scripts_end = Instant::now() + SCRIPTS_BUDGET;
-    for timing in order {
-        for (s, src) in scripts
-            .iter()
-            .zip(sources)
-            .filter(|(s, _)| s.timing == timing)
-        {
-            let inline;
-            let (source, url): (&str, &str) = match (&s.src, src) {
-                (Some(_), Some((text, url))) => (text, url),
-                (Some(_), None) => {
-                    let _ = engine.dispatch_event(
-                        &mut cx,
-                        EventTarget::Node(s.node),
-                        &Event::new("error", false, false),
-                    );
-                    continue;
-                }
-                (None, _) => {
-                    inline = huginn_js::inline_source(cx.document, s.node);
-                    (&inline, document_url.as_str())
-                }
-            };
-            if Instant::now() > scripts_end {
-                eprintln!("huginn: js: script budget spent, skipping {url}");
-                continue;
-            }
-            cx.now_ms = elapsed_ms();
-            cx.current_script = Some(s.node);
-            report.scripts += 1;
-            if let Err(e) = engine.execute(&mut cx, source, url, s.kind) {
-                report.errors += 1;
-                eprintln!("huginn: js: {}", truncate(&e.to_string(), 400));
-            }
-            cx.current_script = None;
-            let _ = engine.run_microtasks(&mut cx);
-            if s.src.is_some() || s.kind == ScriptKind::Module {
-                let _ = engine.dispatch_event(
-                    &mut cx,
-                    EventTarget::Node(s.node),
-                    &Event::new("load", false, false),
-                );
-                let _ = engine.run_microtasks(&mut cx);
-            }
-        }
-    }
+    run_in_order(engine, &mut cx, start, scripts, sources, &mut report);
     if report.scripts == 0 {
         return report;
     }
@@ -141,18 +107,12 @@ pub fn run(
     let events_start = Instant::now();
 
     cx.now_ms = elapsed_ms();
-    let _ = engine.dispatch_event(
-        &mut cx,
-        EventTarget::Document,
-        &Event::new("DOMContentLoaded", true, false),
-    );
-    let _ = engine.run_microtasks(&mut cx);
-    let _ = engine.dispatch_event(
-        &mut cx,
-        EventTarget::Window,
-        &Event::new("load", false, false),
-    );
-    let _ = engine.run_microtasks(&mut cx);
+    if until >= Until::DomContentLoaded {
+        dom_content_loaded(engine, &mut cx);
+    }
+    if until >= Until::Load {
+        window_load(engine, &mut cx);
+    }
 
     report.events_time = events_start.elapsed();
     let timers_start = Instant::now();
@@ -160,7 +120,7 @@ pub fn run(
     // Settle: jump virtual time to each due timer, without real waiting. The
     // window skips this: its timers run in real time after load.
     let mut now = elapsed_ms();
-    let settle_end = if settle {
+    let settle_end = if until == Until::Settled {
         now + SETTLE_MS
     } else {
         f64::NEG_INFINITY
@@ -185,6 +145,112 @@ pub fn run(
         .zip(crate::perf::thread_cpu())
         .map(|(a, b)| b.saturating_sub(a));
     report
+}
+
+/// The window, after its first paint: the async, defer and module scripts
+/// (`scripts`, with `sources` as in [`run`]), then the load events that
+/// waited for them. `ran_before`: [`run`] ran scripts before the paint (and
+/// fired DOMContentLoaded then, unless a `defer` or module script was to
+/// come).
+pub fn run_later(
+    engine: &mut dyn ScriptEngine,
+    cx: &mut HostContext<'_>,
+    start: Instant,
+    scripts: &[ScriptRef],
+    sources: &[Option<(Cow<'_, str>, String)>],
+    ran_before: bool,
+) {
+    let mut report = ScriptReport::default();
+    run_in_order(engine, cx, start, scripts, sources, &mut report);
+    if report.scripts == 0 && !ran_before {
+        return;
+    }
+    cx.now_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if !ran_before || scripts.iter().any(|s| s.timing == ScriptTiming::Defer) {
+        dom_content_loaded(engine, cx);
+    }
+    window_load(engine, cx);
+}
+
+/// Blocking, then async, then deferred scripts, each kind in document
+/// order; a microtask checkpoint after each, and its element's `load` (or
+/// `error`) event.
+fn run_in_order(
+    engine: &mut dyn ScriptEngine,
+    cx: &mut HostContext<'_>,
+    start: Instant,
+    scripts: &[ScriptRef],
+    sources: &[Option<(Cow<'_, str>, String)>],
+    report: &mut ScriptReport,
+) {
+    let order = [
+        ScriptTiming::Blocking,
+        ScriptTiming::Async,
+        ScriptTiming::Defer,
+    ];
+    let document_url = cx.document_url;
+    let scripts_end = Instant::now() + SCRIPTS_BUDGET;
+    for timing in order {
+        for (s, src) in scripts
+            .iter()
+            .zip(sources)
+            .filter(|(s, _)| s.timing == timing)
+        {
+            let inline;
+            let (source, url): (&str, &str) = match (&s.src, src) {
+                (Some(_), Some((text, url))) => (text, url),
+                (Some(_), None) => {
+                    let _ = engine.dispatch_event(
+                        cx,
+                        EventTarget::Node(s.node),
+                        &Event::new("error", false, false),
+                    );
+                    continue;
+                }
+                (None, _) => {
+                    inline = huginn_js::inline_source(cx.document, s.node);
+                    (&inline, document_url.as_str())
+                }
+            };
+            if Instant::now() > scripts_end {
+                eprintln!("huginn: js: script budget spent, skipping {url}");
+                continue;
+            }
+            cx.now_ms = start.elapsed().as_secs_f64() * 1000.0;
+            cx.current_script = Some(s.node);
+            report.scripts += 1;
+            if let Err(e) = engine.execute(cx, source, url, s.kind) {
+                report.errors += 1;
+                eprintln!("huginn: js: {}", truncate(&e.to_string(), 400));
+            }
+            cx.current_script = None;
+            let _ = engine.run_microtasks(cx);
+            if s.src.is_some() || s.kind == ScriptKind::Module {
+                let _ = engine.dispatch_event(
+                    cx,
+                    EventTarget::Node(s.node),
+                    &Event::new("load", false, false),
+                );
+                let _ = engine.run_microtasks(cx);
+            }
+        }
+    }
+}
+
+/// DOMContentLoaded at the document, then a microtask checkpoint.
+fn dom_content_loaded(engine: &mut dyn ScriptEngine, cx: &mut HostContext<'_>) {
+    let _ = engine.dispatch_event(
+        cx,
+        EventTarget::Document,
+        &Event::new("DOMContentLoaded", true, false),
+    );
+    let _ = engine.run_microtasks(cx);
+}
+
+/// `load` at the window, then a microtask checkpoint.
+fn window_load(engine: &mut dyn ScriptEngine, cx: &mut HostContext<'_>) {
+    let _ = engine.dispatch_event(cx, EventTarget::Window, &Event::new("load", false, false));
+    let _ = engine.run_microtasks(cx);
 }
 
 fn truncate(s: &str, n: usize) -> String {

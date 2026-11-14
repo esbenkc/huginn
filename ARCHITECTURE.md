@@ -81,6 +81,8 @@ the parser found), `script_events_ms` (DOMContentLoaded and load),
 `script_layouts` (style and layout that scripts asked for), and
 `script_wait_ms` (time the thread waited instead of running, mostly for the
 network; Linux only, `null` elsewhere). `--no-js` (or `HUGINN_NO_JS=1`) turns scripts off.
+The window runs only the parser-blocking scripts here and the `async`,
+`defer` and module scripts after its first paint (see "The window").
 
 ## Threading
 
@@ -134,8 +136,13 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
   every window. Each tab has its own `engine` thread (256 MiB stack, only
   touched pages committed) that owns its `Page` (the `Document` is not
   `Send`). It runs `pipeline::load` and layout and sends the finished
-  `LayoutTree` and a link table to the main thread, tagged with the tab id.
-  Then it loads every `loading=lazy` image of the page (the window
+  `LayoutTree` and a link table to the main thread, tagged with the tab id:
+  the first paint. It waits for the stylesheets, the parser-blocking
+  scripts, the images and the web fonts, not for `async`, `defer` and module
+  scripts (Chrome paints before them when they are not loaded yet; their
+  sources load on a `huginn-scripts` thread meanwhile). Then it runs those,
+  fires the load events they held up and sends the tree again if they
+  changed the page. Then it loads every `loading=lazy` image of the page (the window
   scrolls, so all can come into view) and sends the tree again; like in
   Chrome, they do not hold up the first paint. A restored scroll position
   the first tree was too short for is applied again then.
@@ -313,7 +320,7 @@ matches media as `screen`), selectable text in the PDF (pages are images).
 ### Live JavaScript and form controls (`live.rs`, `livepage.rs`)
 
 The window keeps each page's script engine after load (`pipeline::load_document`
-with `keep_js`; `huginn render` still drops the isolate before style).
+with `live`; `huginn render` still drops the isolate before style).
 `livepage.rs` runs on the tab's engine thread, `live.rs` on the UI thread.
 
 - **Timers.** The engine thread sleeps until a command or the next timer

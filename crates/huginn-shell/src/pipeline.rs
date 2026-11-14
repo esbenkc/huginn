@@ -4,11 +4,15 @@
 //! (headless PNG) and the `open` window share it.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, NodeData, NodeId, local_name};
+use huginn_js::{ScriptRef, ScriptTiming};
 use huginn_layout::{LayoutEngine, LayoutInput, LayoutTree, Rect, Size};
-use huginn_net::{Client, CorsSettings, ImageStore, Loader, ReferrerPolicy, ResourceKind, Url};
+use huginn_net::{
+    Client, CorsSettings, ImageStore, Loader, NetError, ReferrerPolicy, Resource, ResourceKind, Url,
+};
 use huginn_paint::{CpuRasterizer, Rasterizer};
 use huginn_style::{Origin, StyleEngine, StyleMap, StylesheetLoader, Viewport};
 
@@ -71,9 +75,11 @@ pub struct Page {
     screen: huginn_net::Screen,
     pub js_report: scripts::ScriptReport,
     /// The page's script engine, kept alive by [`load_document`] with
-    /// `keep_js` (the `open` window runs scripts after load). `render` drops
+    /// `live` (the `open` window runs scripts after load). `render` drops
     /// it before style, so its heap never adds to peak RSS there.
     pub js: Option<Box<dyn huginn_js::ScriptEngine>>,
+    /// The window: the scripts that run after the first paint.
+    pub later: Option<LaterScripts>,
     pub fetch_time: Duration,
     pub parse_time: Duration,
     pub script_time: Duration,
@@ -190,8 +196,69 @@ impl Page {
     }
 }
 
+/// Script sources as the loader returns them.
+type Fetched = Vec<Result<Arc<Resource>, NetError>>;
+
+/// The async, defer and module scripts of a page in the window. They do not
+/// hold up the first paint: Chrome paints before them when they are not
+/// loaded yet. Their sources load on a thread of their own meanwhile.
+pub struct LaterScripts {
+    pub scripts: Vec<ScriptRef>,
+    /// The `src` and CORS mode of the external ones, in order.
+    requests: Vec<(Url, CorsSettings)>,
+    fetch: Option<std::thread::JoinHandle<Fetched>>,
+}
+
+impl LaterScripts {
+    /// Start fetching the sources of `scripts`.
+    fn start(loader: &Arc<Loader>, scripts: Vec<ScriptRef>) -> LaterScripts {
+        let requests: Vec<(Url, CorsSettings)> = scripts
+            .iter()
+            .filter_map(|s| Some((s.src.clone()?, s.cors)))
+            .collect();
+        let fetch = if requests.is_empty() {
+            None
+        } else {
+            let (loader, requests) = (loader.clone(), requests.clone());
+            std::thread::Builder::new()
+                .name("huginn-scripts".into())
+                .spawn(move || fetch_scripts(&loader, &requests))
+                .ok()
+        };
+        LaterScripts {
+            scripts,
+            requests,
+            fetch,
+        }
+    }
+
+    /// Wait for the sources. Per script: the fetched source, `None` for
+    /// inline scripts and failed fetches.
+    pub fn sources(&mut self, loader: &Loader) -> Vec<Option<Arc<Resource>>> {
+        let fetched = match self.fetch.take().map(std::thread::JoinHandle::join) {
+            Some(Ok(f)) => f,
+            // No thread could start, or it panicked: fetch them here.
+            _ => fetch_scripts(loader, &self.requests),
+        };
+        let mut fetched = fetched.into_iter();
+        self.scripts
+            .iter()
+            .map(|s| {
+                s.src.as_ref()?;
+                fetched.next()?.ok()
+            })
+            .collect()
+    }
+}
+
+fn fetch_scripts(loader: &Loader, requests: &[(Url, CorsSettings)]) -> Fetched {
+    loader.map_parallel(requests, |(u, cors)| {
+        loader.fetch_with(u, ResourceKind::Script, *cors)
+    })
+}
+
 pub fn render(opts: &RenderOptions, start: Instant) -> Result<String, String> {
-    let loader = Loader::new();
+    let loader = Arc::new(Loader::new());
     let url = huginn_net::parse_target(&opts.target).map_err(|e| e.to_string())?;
     let viewport = Viewport {
         width: opts.width as f32,
@@ -281,7 +348,7 @@ pub fn render(opts: &RenderOptions, start: Instant) -> Result<String, String> {
 /// Fetch, parse, run scripts (if `js`) and style `url`: phases 1-6, everything
 /// before layout. `start` is the time origin for scripts (`performance.now()`).
 pub fn load(
-    loader: &Loader,
+    loader: &Arc<Loader>,
     url: &Url,
     viewport: Viewport,
     js: bool,
@@ -292,17 +359,20 @@ pub fn load(
 
 /// [`load`] with a request body (`post`: a form submission), the page that
 /// started the navigation (`initiator`: its URL and referrer policy decide
-/// `Referer` and `SameSite` cookies), and the option to keep the script
-/// engine alive in [`Page::js`]. The loader's client becomes the new document.
+/// `Referer` and `SameSite` cookies). `live`: the window. It keeps the
+/// script engine alive in [`Page::js`] and runs only the parser-blocking
+/// scripts before style, so the page paints without waiting for async,
+/// defer and module scripts ([`Page::later`]). The loader's client becomes
+/// the new document.
 #[allow(clippy::too_many_arguments)]
 pub fn load_document(
-    loader: &Loader,
+    loader: &Arc<Loader>,
     url: &Url,
     post: Option<&huginn_js::forms::PostBody>,
     initiator: Option<&Client>,
     viewport: Viewport,
     js: bool,
-    keep_js: bool,
+    live: bool,
     start: Instant,
 ) -> Result<Page, String> {
     let screen = huginn_net::Screen {
@@ -352,6 +422,26 @@ pub fn load_document(
         Some(_) => huginn_js::collect_scripts(&doc, &base),
         None => Vec::new(),
     };
+    // The window paints before async, defer and module scripts run, as
+    // Chrome does when they are not loaded yet: only parser-blocking
+    // scripts hold up the first paint. DOMContentLoaded waits for defer and
+    // module scripts, `load` for all of them.
+    let (scripts, later): (Vec<ScriptRef>, Vec<ScriptRef>) = if live {
+        scripts
+            .into_iter()
+            .partition(|s| s.timing == ScriptTiming::Blocking)
+    } else {
+        (scripts, Vec::new())
+    };
+    let until = if !live {
+        scripts::Until::Settled
+    } else if later.iter().any(|s| s.timing == ScriptTiming::Defer) {
+        scripts::Until::Scripts
+    } else if !later.is_empty() {
+        scripts::Until::DomContentLoaded
+    } else {
+        scripts::Until::Load
+    };
 
     // 3. Fetch stylesheets and scripts in parallel. Images wait for style:
     // hidden ones are skipped and the rest are decoded at their displayed size.
@@ -374,6 +464,10 @@ pub fn load_document(
     let fetched = loader.map_parallel(&requests, |(u, kind, cors)| {
         loader.fetch_with(u, *kind, *cors)
     });
+    // The later scripts' sources load while the page is styled, laid out and
+    // painted: after the stylesheets and blocking scripts, which Chrome
+    // gives a higher priority.
+    let later = (!later.is_empty()).then(|| LaterScripts::start(loader, later));
     // Scripts lay out without images (their sizes are not known yet).
     let images = ImageStore::new();
     fetch += t.elapsed();
@@ -440,7 +534,7 @@ pub fn load_document(
             &scripts,
             &sources,
             &mut host,
-            !keep_js,
+            until,
         );
         if doc.generation() != generation {
             let new_sheets = collect_stylesheets(&doc, &base, &screen);
@@ -463,7 +557,7 @@ pub fn load_document(
     // Free the isolate now: its heap must not add to peak RSS during style,
     // layout and paint. A live page keeps it, after a full GC.
     let js_engine = match js_engine {
-        Some(mut e) if keep_js => {
+        Some(mut e) if live => {
             e.trim_memory();
             Some(e)
         }
@@ -511,6 +605,7 @@ pub fn load_document(
         screen,
         js_report,
         js: js_engine,
+        later,
         fetch_time: fetch,
         parse_time: parse,
         script_time,

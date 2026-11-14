@@ -213,12 +213,18 @@ impl LivePage {
         &self.loader
     }
 
-    pub fn new(loader: Loader, start: Instant, page: &mut Page) -> LivePage {
+    /// When the page's load started (the time origin of its scripts).
+    pub fn load_start(&self) -> Instant {
+        self.start
+    }
+
+    pub fn new(loader: Arc<Loader>, start: Instant, page: &mut Page) -> LivePage {
         let inline_handlers = has_inline_handlers(&page.doc);
-        let scripted =
-            inline_handlers || page.js.as_deref_mut().is_some_and(|js| js.heap_bytes() > 0);
+        let scripted = inline_handlers
+            || page.later.is_some()
+            || page.js.as_deref_mut().is_some_and(|js| js.heap_bytes() > 0);
         LivePage {
-            loader: Arc::new(loader),
+            loader,
             start,
             inline_handlers,
             scripted,
@@ -297,6 +303,42 @@ impl LivePage {
             copy: None,
             open_select: None,
         };
+        self.finish(page, layout, viewport, generation, out, notify);
+    }
+
+    /// After the first paint: the async, defer and module scripts (once
+    /// their sources are in), then the load events they held up. Shows what
+    /// they changed, then collects the isolate's garbage.
+    pub fn finish_load(
+        &mut self,
+        page: &mut Page,
+        layout: &mut LayoutEngine,
+        viewport: Viewport,
+        generation: u64,
+        notify: &dyn Fn(EngineEvent),
+    ) {
+        let Some(mut later) = page.later.take() else {
+            return;
+        };
+        let fetched = later.sources(&self.loader);
+        let sources: Vec<Option<(std::borrow::Cow<'_, str>, String)>> = fetched
+            .iter()
+            .map(|r| r.as_ref().map(|r| (r.text(), r.url.to_string())))
+            .collect();
+        let (start, ran_before) = (self.start, page.js_report.scripts > 0);
+        let out = self.call(page, layout, viewport, |_, sink, _| {
+            if let Some(js) = sink.engine.as_deref_mut() {
+                crate::scripts::run_later(js, sink.cx, start, &later.scripts, &sources, ran_before);
+                sink.requests.extend(js.take_requests());
+            }
+            Reply::default()
+        });
+        drop(sources);
+        drop(fetched);
+        self.loader.clear_cache();
+        if let Some(js) = page.js.as_deref_mut() {
+            js.trim_memory();
+        }
         self.finish(page, layout, viewport, generation, out, notify);
     }
 

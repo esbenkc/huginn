@@ -487,6 +487,86 @@ fn lazy_images_load_after_the_first_paint_and_keep_the_restored_scroll() {
     );
 }
 
+/// A page with an inline script that logs DOMContentLoaded (`D`) and load
+/// (`L`) in the title, and `script`, which loads `/slow.js` (`S`). The
+/// server answers `/slow.js` after `SLOW_MS`.
+fn slow_script_page(script: &str) -> String {
+    format!(
+        "<title></title><script>document.addEventListener('DOMContentLoaded', () => \
+         document.title += 'D'); addEventListener('load', () => document.title += 'L')\
+         </script><p>Before</p>{script}<p>After</p>"
+    )
+}
+
+const SLOW_MS: u64 = 2000;
+
+fn serve_slow_script_pages() -> u16 {
+    let (port, _) = serve(|r| match r.path.as_str() {
+        "/async" => html(
+            "",
+            &slow_script_page("<script async src=/slow.js></script>"),
+        ),
+        "/defer" => html(
+            "",
+            &slow_script_page("<script defer src=/slow.js></script>"),
+        ),
+        "/module" => html(
+            "",
+            &slow_script_page("<script type=module src=/slow.js></script>"),
+        ),
+        "/blocking" => html("", &slow_script_page("<script src=/slow.js></script>")),
+        "/slow.js" => {
+            std::thread::sleep(std::time::Duration::from_millis(SLOW_MS));
+            (
+                "200 OK\nContent-Type: text/javascript".into(),
+                "document.title += 'S'".into(),
+            )
+        }
+        _ => ("404 Not Found".into(), String::new()),
+    });
+    port
+}
+
+#[test]
+fn async_defer_and_module_scripts_do_not_hold_up_the_first_paint() {
+    let port = serve_slow_script_pages();
+    let base = format!("http://127.0.0.1:{port}");
+    let s = run(
+        &format!("{base}/async"),
+        &format!(
+            "wait; state; key cmd+l; type {base}/defer; key enter; wait; state; \
+             key cmd+l; type {base}/module; key enter; wait; state"
+        ),
+        &[],
+    );
+    for (s, events) in s.iter().zip(["DSL", "SDL", "SDL"]) {
+        // The page was on screen long before the script came; the load was
+        // complete after it ran.
+        let (first, complete) = (s["load_ms"].as_f64().unwrap(), s["complete_ms"].as_f64());
+        assert!(first < SLOW_MS as f64 * 0.75, "{s}");
+        assert!(complete.is_some_and(|c| c >= SLOW_MS as f64), "{s}");
+        // DOMContentLoaded waits for defer and module scripts, load for
+        // all of them.
+        assert_eq!(title(s), events, "{s}");
+    }
+}
+
+#[test]
+fn a_parser_blocking_script_holds_up_the_content_after_it() {
+    let port = serve_slow_script_pages();
+    let s = run(
+        &format!("http://127.0.0.1:{port}/blocking"),
+        "wait; state",
+        &[],
+    );
+    assert!(
+        s[0]["load_ms"].as_f64().unwrap() >= SLOW_MS as f64,
+        "{}",
+        s[0]
+    );
+    assert_eq!(title(&s[0]), "SDL");
+}
+
 fn huginn_net_file_url(path: &std::path::Path) -> String {
     format!("file://{}", path.to_str().expect("UTF-8 path"))
 }

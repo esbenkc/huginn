@@ -817,6 +817,11 @@ Event loop, owned by the shell (`huginn-shell/src/scripts.rs`):
    500 ms of virtual time or 1.5 s of real time.
 4. If `document.generation()` changed, pick up new stylesheets and images,
    then style, layout and paint once.
+The window (`huginn open`) runs only the `Blocking` scripts in step 1 and
+paints; then the `Async` and `Defer` ones (fetched meanwhile), as Chrome
+does when they are not loaded at the end of parsing. DOMContentLoaded fires
+before the paint unless a `Defer` script is to come, `load` unless any
+script is to come. It skips step 3 (its timers run in real time).
 No V8 isolate is created for pages without scripts: an isolate costs RSS.
 Timer due times (setTimeout, setInterval, rAF one frame later, message and
 fetch tasks) count from the time the engine call started (`cx.now_ms`), not
@@ -826,7 +831,7 @@ from `performance.now()`, so their order does not depend on CPU speed.
 
 The binary. Owner: integration. It is the only crate that
 orders phases. Public surface is the CLI and JSON line under "Rules for all
-crates". Internal to the binary: `pipeline::load(&Loader, &Url, Viewport, js, Instant)
+crates". Internal to the binary: `pipeline::load(&Arc<Loader>, &Url, Viewport, js, Instant)
 -> Result<Page, String>` (phases 1-6, scripts included), `Page::register_fonts`, `Page::layout`,
 `Page::restyle`, and `pipeline::render(&RenderOptions, Instant)` with
 `RenderOptions { target, out, width, height, full_page, js }`. `render` and
@@ -841,7 +846,9 @@ middle right double triple]`, `down`, `up`, `dblclick`, `tripleclick`,
 `shot <png>`, `state`). `--script "<cmds>"` runs the same commands in the
 real window (plus `capture <png>`, a `screencapture` of it) and quits after
 the last one. `state` prints one JSON line: the focused window's
-active tab (`url`, `title`, `error`, `load_ms`, `loading`, `history`,
+active tab (`url`, `title`, `error`, `load_ms` (to the first paint),
+`complete_ms` (to the end of the scripts after it, the load events and the
+lazy images; `null` before), `loading`, `history`,
 `index`, `scroll`, `max_scroll`, `zoom`, `hover`, `strips`, `discarded`,
 `icon`, `favicon`, plus the fields `interact::state` and `live::state` add),
 the window (`tabs` [{`url`, `title`, `loading`, `discarded`, `active`,
