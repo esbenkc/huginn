@@ -377,3 +377,37 @@ fn persistent_cookies_survive_a_restart_but_private_and_session_ones_do_not() {
     assert_eq!(title(&s[0]), "[keep=1]");
     let _ = std::fs::remove_dir_all(&profile);
 }
+
+#[test]
+fn a_web_page_cannot_load_local_files_but_a_local_page_can() {
+    let dir = std::env::temp_dir().join(format!("huginn-net-local-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let js = dir.join("local.js");
+    std::fs::write(&js, "document.title += ' ran';").unwrap();
+    let js_url = huginn_net_file_url(&js);
+    // A script the parser finds and one a script inserts. The local script
+    // adds " ran" to the title each time it runs.
+    let page = format!(
+        "<title>t</title><script src='{js_url}'></script>
+        <script>const s = document.createElement('script'); s.src = '{js_url}';
+        s.onerror = () => document.title += ' blocked'; document.head.appendChild(s);</script>"
+    );
+    let body = page.clone();
+    let (port, _) = serve(move |_| html("", &body));
+    let s = run(
+        &format!("http://127.0.0.1:{port}/"),
+        "wait; sleep 200; state",
+        &[],
+    );
+    assert_eq!(title(&s[0]), "t blocked");
+
+    let local = dir.join("page.html");
+    std::fs::write(&local, &page).unwrap();
+    let s = run(local.to_str().unwrap(), "wait; sleep 200; state", &[]);
+    assert_eq!(title(&s[0]), "t ran ran");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn huginn_net_file_url(path: &std::path::Path) -> String {
+    format!("file://{}", path.to_str().expect("UTF-8 path"))
+}
