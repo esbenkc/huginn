@@ -15,11 +15,13 @@ mod engine;
 #[cfg(target_os = "macos")]
 mod glass;
 mod headless;
+mod history;
 mod input;
 mod interact;
 mod internal_pages;
 mod live;
 mod livepage;
+mod omnibox;
 mod perf;
 mod pipeline;
 mod resources;

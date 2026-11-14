@@ -8,7 +8,9 @@
 //! Names in use: `style`, `layout` (engine threads), `update` (one whole
 //! page update after input or a script: restyle, new images, layout),
 //! `raster` (one strip: display list and rasterizer), `compose` (one frame
-//! put together) and `present` (the frame handed to the window system).
+//! put together), `present` (the frame handed to the window system) and
+//! `suggest` (the address bar's suggestions for one keystroke; the first
+//! one reads the history file).
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

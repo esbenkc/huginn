@@ -174,7 +174,9 @@ window), `session.rs` (all windows and what they share), `browser.rs` (one
 window: tabs, tab strip, toolbar, input routing, frame), `tab.rs` (one tab:
 engine thread, history, page layer, zoom, discarding), `tabstrip.rs`,
 `toolbar.rs`, `shortcuts.rs` (window chords), `internal_pages.rs`
-(`huginn://newtab`, `history`, `bookmarks`, address bar input), `engine.rs`
+(`huginn://newtab`, `history`, `bookmarks`, address bar input),
+`omnibox.rs` (the address bar's autofill and suggestions), `history.rs`
+(the saved browsing history), `engine.rs`
 (the per-tab engine thread), `headless.rs` (the command driver), `input.rs`,
 `ui.rs`, `theme.rs` (colours, font stack, the acrylic material), `clipboard.rs`. In-page modules plug in through fixed hooks:
 `interact/` (selection, find, focus, menus, save, print) and `live.rs` (live
@@ -259,9 +261,52 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
   `~/Library/Application Support/Huginn/bookmarks.tsv` (`url<TAB>title`;
   `HUGINN_PROFILE_DIR` overrides). Address bar text that is not a URL searches
   `https://duckduckgo.com/html/?q=` with no other parameters.
+- **Address bar suggestions** (`omnibox.rs`, `history.rs`), like Chrome's
+  omnibox. Normal windows keep a history: one row per URL with its title,
+  visit count, typed count and last visit (Chrome's `urls` table). A load
+  typed or picked in the address bar counts a visit and a typed visit; a
+  link, form, bookmark or tile a visit; back and forward a visit; a reload
+  or a discarded tab coming back neither. Private windows record nothing
+  (they still get suggestions from it, as in Chrome). The rows are in
+  `history.tsv` in the profile directory (0600; a new profile directory is
+  0700). A visit appends one line that adds to its row, without reading
+  the file, so nothing on the way to a first paint reads it; the address
+  bar reads it on the first keystroke and rewrites it (one line per row)
+  when stale lines pile up.
+  Rows expire after 90 days (Chrome's limit); at most 10,000 are kept.
+  Cmd+Shift+Delete deletes it. Headless runs without `HUGINN_PROFILE_DIR`
+  keep it in memory.
+  - Inline autofill follows Chrome's HistoryURL provider: rows typed once,
+    visited 4 times or in the last 3 days count; a row matches when its URL
+    without `https://`, `http://` and `www.` starts with the input; typed
+    rows rank first, then typed count, visit count and the last visit.
+    While the input is still in the host, the host's root is autofilled
+    (`kr` shows `kran.ai`, `an.ai` selected); a deeper URL only once the
+    input reaches its path. A host needs one typed visit (or 4 visits), a
+    deeper URL two typed visits (or 4 visits). As in Chrome, a bare host
+    shows without its trailing `/`, and Enter goes to the stored URL (with
+    its own scheme). Backspace and Delete remove the completion and no new
+    one comes until the next character; a paste or a caret away from the
+    end gets none either.
+  - The drop-down (up to 6 rows, Forest Mono, under the field) has the
+    default match first, then a "Search DuckDuckGo" row (last for input
+    that is a URL), then history rows whose URL or title contains every
+    word of the input, by frecency: (visits + 20 x typed visits) times a
+    recency weight (1 up to 4 days, 0.7 up to 14, 0.5 up to 31, 0.3 up to
+    90), four times more for rows the input is a URL beginning of. The
+    address bar's own search pages are never suggested.
+  - Cost (2026-11-13, bench-release, headless, a synthetic history of
+    10,000 rows, median of 10 runs): the first keystroke 3.2 ms (it reads
+    the file), then 0.8 ms per keystroke (95th percentile 1.1 ms; `perf`
+    phase `suggest`); peak footprint 9.7 MB against 6.4 MB with no history.
+  - When the default match is a history page on a new origin, the window
+    asks the network to open a connection to it (`Shared::preconnect`, as
+    Chrome preconnects for the omnibox's default match). Until
+    `huginn_net::Network::preconnect` lands (first-load work), the call
+    does nothing.
 - **Tests.** `huginn open <url> --commands "wait; key cmd+t; click 50 100
   cmd; state"` drives the same `Session` without a window and prints JSON
-  (`tests/open.rs`, `tests/tabs.rs`). `--script` runs the same commands in
+  (`tests/open.rs`, `tests/tabs.rs`, `tests/omnibox.rs`). `--script` runs the same commands in
   the real window and quits after the last one; `capture <png>` saves a
   `screencapture` of it.
 - **Measured (2026-11-12, fastdev build with V8, 1280x800 window at 2x,
@@ -292,15 +337,18 @@ Ctrl+Shift+O (bookmarks).
 | Cmd+Opt+Left, Ctrl+Shift+Tab, Cmd+Shift+[ | previous tab | done |
 | Cmd+Q / Cmd+M / Cmd+Ctrl+F | quit / minimize / fullscreen | done |
 | Cmd+L | focus the address bar (select all) | done |
-| Enter / Opt+Enter / Cmd+Enter / Shift+Enter in the address bar | go / new tab / new background tab / new window; non-URLs search DuckDuckGo | done |
-| Left/Right, Opt+Left/Right, Cmd+Left/Right, Home/End, Backspace, Opt+Backspace, Cmd+Backspace, Delete, Cmd+A/C/X/V, Esc in the address bar | caret editing; Esc puts the URL back | done |
+| Enter / Opt+Enter / Cmd+Enter / Shift+Enter in the address bar | go (to the autofilled or picked suggestion) / new tab / new background tab / new window; non-URLs search DuckDuckGo | done |
+| typing in the address bar | inline autofill of a visited host or URL (completion selected) and a drop-down of up to 6 suggestions | done |
+| Backspace / Delete on an autofill; Tab or Right | remove the completion (no new one until the next character); take it | done |
+| Up / Down, click or middle click on a suggestion | pick a row (the field shows it) / open it, middle click in a background tab | done |
+| Left/Right, Opt+Left/Right, Cmd+Left/Right, Home/End, Backspace, Opt+Backspace, Cmd+Backspace, Delete, Cmd+A/C/X/V, Esc in the address bar | caret editing; Esc on a picked suggestion goes back to what was typed, else puts the URL back | done |
 | Cmd+[ / Cmd+Left, Cmd+] / Cmd+Right, mouse buttons 4/5 | back / forward | done |
 | Cmd+R / Cmd+Shift+R | reload (the document is revalidated, the rest may come from the HTTP cache) / hard reload (nothing from the cache) | done |
 | Esc | stop loading (the previous page stays) | done |
 | Cmd+Shift+H | home: `huginn://newtab` | done |
 | Cmd+Y | `huginn://history` in a new tab | done |
 | Cmd+D / Cmd+Opt+B | bookmark toggle (star in the address bar) / `huginn://bookmarks` | done |
-| Cmd+Shift+Delete | clear history (session visits and closed tabs), shows the history page | done |
+| Cmd+Shift+Delete | clear history (the saved history, session visits and closed tabs, with cookies and the HTTP cache), shows the history page | done |
 | Cmd+= / Cmd+- / Cmd+0 | zoom in / out / reset, per site | done |
 | Space, Shift+Space, PageUp/Down, arrows, Home/End, Cmd+Up/Down | scroll | done |
 | click / Cmd+click / Cmd+Shift+click / Shift+click / middle click on a link | open / background tab / foreground tab / new window / background tab | done |
@@ -446,10 +494,11 @@ with `live`; `huginn render` still drops the isolate before style).
 
 `crates/huginn-shell/src/perf.rs` records how long the phases take while the
 window runs: `style` and `layout` (engine threads), `update` (one whole page
-update after input or a script), `raster` (one strip), `compose` (one frame)
-and `present`. It keeps the count, the total, the maximum and the last 512
-durations per phase. The `perf` command of the command driver prints them as
-one JSON line (median and 95th percentile); `perf reset` forgets them. The
+update after input or a script), `raster` (one strip), `compose` (one frame),
+`present` and `suggest` (the address bar's suggestions for one keystroke).
+It keeps the count, the total, the maximum and the last 512 durations per
+phase. The `perf` command of the command driver prints them as one JSON
+line (median and 95th percentile); `perf reset` forgets them. The
 `frame` command composes a frame without a window. `bench/perf.py` uses these
 to time scrolling, hover, typing, script changes and resizing on synthetic
 pages.

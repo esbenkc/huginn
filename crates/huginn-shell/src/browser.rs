@@ -12,8 +12,9 @@ use huginn_net::{DecodedImage, Url};
 use huginn_paint::CpuRasterizer;
 
 use crate::engine::EngineEvent;
-use crate::input::{CursorKind, Key, KeyEvent, MouseButton, MouseEvent, MouseKind};
-use crate::internal_pages::{self, parse_input};
+use crate::input::{CursorKind, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind};
+use crate::internal_pages::{self, parse_input, parse_url};
+use crate::omnibox::{self, Kind, Popup};
 use crate::session::{ClosedTab, Shared, ZOOM_LEVELS};
 use crate::shortcuts::{self, Action};
 use crate::tab::{Opener, PAGE_TOP, Request, TABSTRIP_HEIGHT, Tab, TabId};
@@ -53,6 +54,8 @@ pub enum WindowOp {
 enum Press {
     Strip(Option<StripHit>),
     Toolbar(Option<ToolbarHit>),
+    /// The address bar's drop-down (the row).
+    Suggestions(Option<usize>),
     Page,
 }
 
@@ -77,6 +80,8 @@ pub struct Browser {
     height: u32,
     scale: f32,
     toolbar: Toolbar,
+    /// The address bar's suggestions while the user types.
+    omnibox: Popup,
     strip: TabStrip,
     /// For the strip, toolbar and status bubble (the page's lives on the engine thread).
     layout: LayoutEngine,
@@ -113,6 +118,7 @@ impl Browser {
             height: height.max(1),
             scale,
             toolbar: Toolbar::default(),
+            omnibox: Popup::default(),
             strip: TabStrip::default(),
             layout: LayoutEngine::new(),
             raster: CpuRasterizer::new(),
@@ -281,6 +287,42 @@ impl Browser {
         set("private", self.private.into());
         set("address", self.address_text().into());
         set("focused", self.toolbar.focused.into());
+        set(
+            "address_selection",
+            match self.toolbar.selection().filter(|_| self.toolbar.focused) {
+                Some((a, b)) => serde_json::json!([a, b]),
+                None => serde_json::Value::Null,
+            },
+        );
+        let suggestions: Vec<serde_json::Value> = self
+            .omnibox
+            .result
+            .matches
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "kind": match m.kind {
+                        Kind::History => "history",
+                        Kind::Typed => "typed",
+                        Kind::Search => "search",
+                    },
+                    "url": m.url.as_str(),
+                    "title": m.title,
+                })
+            })
+            .collect();
+        set("suggestions", suggestions.into());
+        let (selected, rect) = if self.omnibox.is_open() {
+            let r = self.omnibox.rect();
+            (
+                self.omnibox.selected.into(),
+                serde_json::json!([r.x, r.y, r.width, r.height]),
+            )
+        } else {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        };
+        set("suggestion", selected);
+        set("suggestions_rect", rect);
         set("bookmarked", bookmarked.into());
         set("fullscreen", self.fullscreen.into());
         set("minimized", self.minimized.into());
@@ -311,8 +353,7 @@ impl Browser {
         let new_tab_page = url.is_none();
         tab.navigate_with(
             url.unwrap_or_else(|| internal_pages::url(internal_pages::NEW_TAB)),
-            from.post,
-            from.initiator,
+            from,
         );
         let at = at.unwrap_or(self.tabs.len()).min(self.tabs.len());
         self.tabs.insert(at, tab);
@@ -324,7 +365,7 @@ impl Browser {
         } else {
             self.activate(at);
             if new_tab_page {
-                self.toolbar.focus(String::new());
+                self.focus_field(String::new());
             }
         }
         self.strip.invalidate();
@@ -346,7 +387,7 @@ impl Browser {
         let tab = &mut self.tabs[i];
         tab.last_active = clock;
         tab.set_visible(true);
-        self.toolbar.blur();
+        self.blur_address();
         self.status = None;
         self.dirty = true;
     }
@@ -517,14 +558,14 @@ impl Browser {
             Action::Back => self.tab_mut_active().back(),
             Action::Forward => self.tab_mut_active().forward(),
             Action::Reload | Action::HardReload => {
-                self.toolbar.blur();
+                self.blur_address();
                 self.tab_mut_active()
                     .reload(matches!(a, Action::HardReload));
             }
             Action::Home => {
                 self.tab_mut_active()
                     .navigate(internal_pages::url(internal_pages::NEW_TAB));
-                self.toolbar.focus(String::new());
+                self.focus_field(String::new());
             }
             Action::History => {
                 self.open_tab(
@@ -579,8 +620,20 @@ impl Browser {
             .filter(|u| !internal_pages::is_new_tab(u))
             .map(Url::to_string)
             .unwrap_or_default();
-        self.toolbar.focus(text);
+        self.focus_field(text);
         self.dirty = true;
+    }
+
+    /// Focus the address field with `text` selected; no suggestions yet.
+    fn focus_field(&mut self, text: String) {
+        self.toolbar.focus(text);
+        self.omnibox.close();
+    }
+
+    /// Leave the address field and close its suggestions.
+    fn blur_address(&mut self) {
+        self.toolbar.blur();
+        self.omnibox.close();
     }
 
     // ----- input -------------------------------------------------------------
@@ -609,21 +662,26 @@ impl Browser {
             return;
         }
         if self.toolbar.focused {
+            if self.suggestions_key(&ev) {
+                self.dirty = true;
+                return;
+            }
             match self.toolbar.edit(&ev) {
                 Edit::Go => self.go(&ev),
-                Edit::Cancel => self.toolbar.blur(),
-                Edit::Changed => {}
+                Edit::Cancel => self.blur_address(),
+                Edit::Text { inline } => self.autocomplete(inline),
+                Edit::Caret => {}
                 // Page chords the field does not use (Cmd+F/G/E/P/S/U) work
                 // from the address bar too, like Chrome's omnibox.
                 Edit::Ignored if ev.mods.cmd => {
-                    self.toolbar.blur();
+                    self.blur_address();
                     let a = self.active;
                     self.tabs[a].key(&ev);
                     self.run_requests(a);
                 }
                 Edit::Ignored => {
                     if ev.key == Key::Tab {
-                        self.toolbar.blur();
+                        self.blur_address();
                     }
                 }
             }
@@ -635,24 +693,142 @@ impl Browser {
         self.run_requests(a);
     }
 
+    /// Keys the drop-down takes: Up and Down pick a row (the field shows
+    /// it), Esc on a picked row goes back to what the user typed.
+    fn suggestions_key(&mut self, ev: &KeyEvent) -> bool {
+        let m = ev.mods;
+        if !self.omnibox.is_open() || m.cmd || m.alt || m.ctrl {
+            return false;
+        }
+        let n = self.omnibox.result.matches.len();
+        let to = match ev.key {
+            Key::Up => self.omnibox.selected.saturating_sub(1),
+            Key::Down => (self.omnibox.selected + 1).min(n - 1),
+            Key::Escape if self.omnibox.selected > 0 => 0,
+            _ => return false,
+        };
+        self.pick(to);
+        true
+    }
+
+    /// Select row `i` of the drop-down; the field shows its text (row 0:
+    /// what the user typed and the inline completion).
+    fn pick(&mut self, i: usize) {
+        if i == self.omnibox.selected {
+            return;
+        }
+        self.omnibox.select(i);
+        if i == 0 {
+            self.toolbar.set_text(self.omnibox.user_text.clone());
+            let inline = self.omnibox.result.inline.clone();
+            self.toolbar.set_completion(&inline);
+        } else {
+            let fill = self.omnibox.result.matches[i].fill.clone();
+            self.toolbar.set_text(fill);
+        }
+    }
+
+    /// The field's text changed: new suggestions, and the inline
+    /// completion if `inline` allows one.
+    fn autocomplete(&mut self, inline: bool) {
+        let text = self.toolbar.text.clone();
+        let result = {
+            let _span = crate::perf::span("suggest");
+            let mut shared = self.shared.borrow_mut();
+            omnibox::suggest(
+                shared.history.rows(),
+                &text,
+                inline,
+                crate::history::now_ms(),
+            )
+        };
+        if result.matches.is_empty() {
+            self.omnibox.close();
+            return;
+        }
+        self.toolbar.set_completion(&result.inline);
+        self.omnibox.set(text, result);
+        self.place_suggestions();
+        // Like Chrome, warm up a connection to a default match from history
+        // while the user is still typing.
+        if let Some(m) = self.omnibox.result.matches.first()
+            && m.kind == Kind::History
+            && matches!(m.url.scheme(), "http" | "https")
+        {
+            let origin = m.url.origin().ascii_serialization();
+            if self.omnibox.preconnected.as_deref() != Some(origin.as_str()) {
+                self.shared.borrow().preconnect(self.private, &m.url);
+                self.omnibox.preconnected = Some(origin);
+            }
+        }
+    }
+
+    /// Put the drop-down under the address field as it is on screen.
+    fn place_suggestions(&mut self) {
+        if !self.omnibox.is_open() {
+            return;
+        }
+        self.prepare_chrome();
+        let f = self.toolbar.field();
+        self.omnibox.place(Rect {
+            y: f.y + TABSTRIP_HEIGHT,
+            ..f
+        });
+    }
+
+    /// Where Enter (or a click on row `row`) goes, and whether history
+    /// counts it as typed: the picked row, else the default match while the
+    /// field shows it, else the text as a URL or a search.
+    fn destination(&self, row: Option<usize>) -> Option<(Url, bool)> {
+        let p = &self.omnibox;
+        let picked = match row {
+            Some(i) => p.result.matches.get(i),
+            None if p.selected > 0 => p.result.matches.get(p.selected),
+            None => p
+                .result
+                .matches
+                .first()
+                .filter(|_| self.toolbar.text == p.default_text()),
+        };
+        if let Some(m) = picked {
+            return Some((m.url.clone(), m.kind != Kind::Search));
+        }
+        let text = &self.toolbar.text;
+        // Enter on the URL the field was focused with is not typed.
+        let typed = p.is_open();
+        match parse_url(text) {
+            Some(u) => Some((u, typed)),
+            None => parse_input(text).map(|u| (u, false)),
+        }
+    }
+
     /// Enter in the address field. Option: new tab; Cmd: new background
     /// tab; Shift: new window.
     fn go(&mut self, ev: &KeyEvent) {
-        let Some(url) = parse_input(&self.toolbar.text) else {
-            return;
+        if let Some((url, typed)) = self.destination(None) {
+            self.open_from_address(url, typed, ev.mods, false);
+        }
+    }
+
+    /// Open `url` from the address bar; modifiers as for Enter, `middle`
+    /// (a middle click on a suggestion): a new background tab.
+    fn open_from_address(&mut self, url: Url, typed: bool, m: Modifiers, middle: bool) {
+        self.blur_address();
+        let from = Opener {
+            typed,
+            ..Opener::default()
         };
-        self.toolbar.blur();
-        let m = ev.mods;
-        if m.alt || m.cmd {
-            self.open_tab(Some(url), m.cmd && !m.alt, Some(self.active + 1));
+        if m.alt || m.cmd || middle {
+            let background = (m.cmd || middle) && !m.alt;
+            self.open_tab_from(Some(url), from, background, Some(self.active + 1));
         } else if m.shift {
             self.ops.push(WindowOp::NewWindow {
                 url: Some(url),
                 private: self.private,
-                opener: Box::default(),
+                opener: Box::new(from),
             });
         } else {
-            self.tab_mut_active().navigate(url);
+            self.tab_mut_active().navigate_with(url, from);
         }
     }
 
@@ -686,12 +862,23 @@ impl Browser {
         if ev.y < PAGE_TOP {
             self.prepare_chrome();
         }
+        self.place_suggestions();
         if ev.kind == MouseKind::Down {
             ev.clicks = self.count_clicks(&ev);
         }
+        let in_suggestions = {
+            let r = self.omnibox.rect();
+            self.omnibox.is_open()
+                && ev.x >= r.x
+                && ev.x < r.right()
+                && ev.y >= r.y
+                && ev.y < r.bottom()
+        };
         let area = match (ev.kind, self.press) {
             (MouseKind::Down, _) | (_, None) => {
-                if ev.y < TABSTRIP_HEIGHT {
+                if in_suggestions {
+                    Press::Suggestions(self.omnibox.row_at(ev.x, ev.y))
+                } else if ev.y < TABSTRIP_HEIGHT {
                     Press::Strip(self.strip.hit(ev.x, ev.y))
                 } else if ev.y < PAGE_TOP {
                     Press::Toolbar(self.toolbar.hit(ev.x, ev.y - TABSTRIP_HEIGHT))
@@ -708,10 +895,27 @@ impl Browser {
         let cursor = match area {
             Press::Strip(hit) => {
                 self.toolbar.set_hover(None);
+                self.omnibox.hover(None);
                 self.strip_mouse(&ev, hit);
                 CursorKind::Default
             }
+            Press::Suggestions(pressed) => {
+                self.toolbar.set_hover(None);
+                self.set_strip_hover(None);
+                let here = self.omnibox.row_at(ev.x, ev.y);
+                self.omnibox.hover(here);
+                // A click is a press and release on the same row.
+                if release
+                    && ev.button != MouseButton::Right
+                    && let Some(i) = here.filter(|&i| Some(i) == pressed)
+                    && let Some((url, typed)) = self.destination(Some(i))
+                {
+                    self.open_from_address(url, typed, ev.mods, ev.button == MouseButton::Middle);
+                }
+                CursorKind::Default
+            }
             Press::Toolbar(hit) => {
+                self.omnibox.hover(None);
                 if ev.kind == MouseKind::Down && ev.button == MouseButton::Left {
                     self.toolbar_click(hit);
                 }
@@ -726,8 +930,9 @@ impl Browser {
             Press::Page => {
                 self.toolbar.set_hover(None);
                 self.set_strip_hover(None);
+                self.omnibox.hover(None);
                 if ev.kind == MouseKind::Down {
-                    self.toolbar.blur();
+                    self.blur_address();
                 }
                 let a = self.active;
                 self.tabs[a].mouse(&ev);
@@ -872,9 +1077,7 @@ impl Browser {
             Some(ToolbarHit::Star) => self.act(Action::Bookmark),
             Some(ToolbarHit::Field) => {
                 if self.toolbar.focused {
-                    self.toolbar.select_all = false;
-                    self.toolbar.caret = self.toolbar.text.chars().count();
-                    self.toolbar.invalidate();
+                    self.toolbar.caret_to_end();
                 } else {
                     self.focus_address_bar();
                 }
@@ -887,6 +1090,7 @@ impl Browser {
     /// The pointer left the window.
     pub fn mouse_leave(&mut self) {
         self.set_strip_hover(None);
+        self.omnibox.hover(None);
         self.tab_mut_active().mouse_leave();
     }
 
@@ -966,7 +1170,8 @@ impl Browser {
             );
         }
 
-        // Window overlays: find bar, menus, popups.
+        // Window overlays: find bar, menus, popups, then the address bar's
+        // suggestions over all of them.
         let mut canvas = Canvas {
             frame,
             width: w,
@@ -975,6 +1180,13 @@ impl Browser {
             clip: (0, 0, w, h),
         };
         self.tabs[a].draw_window_overlays(&mut canvas);
+        self.place_suggestions();
+        self.omnibox.draw(
+            &mut canvas,
+            &mut self.layout,
+            &mut self.raster,
+            self.private,
+        );
     }
 
     fn toolbar_info(&self) -> ToolbarInfo {

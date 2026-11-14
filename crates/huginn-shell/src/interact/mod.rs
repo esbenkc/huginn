@@ -899,7 +899,7 @@ fn open_context_menu(tab: &mut Tab, x: f32, y: f32) {
     if let Some(url) = &link {
         let page = Opener {
             initiator: tab.initiator(),
-            post: None,
+            ..Opener::default()
         };
         add(
             MenuItem::new("Open Link in New Tab"),

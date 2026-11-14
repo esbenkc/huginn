@@ -1,6 +1,7 @@
 //! All windows of `huginn open` and what they share: the visit log
-//! (`huginn://history`), bookmarks, per-site zoom, favicons, recently
-//! closed tabs, and engine threads (one per tab). `window.rs` maps winit
+//! (`huginn://history`), the history of the address bar's suggestions,
+//! bookmarks, per-site zoom, favicons, recently closed tabs, and engine
+//! threads (one per tab). `window.rs` maps winit
 //! windows onto [`Session::windows`]; `headless.rs` drives it directly.
 
 use std::cell::RefCell;
@@ -13,6 +14,7 @@ use huginn_net::{CookieJar, DecodedImage, HttpCache, Network, Url};
 
 use crate::browser::{Browser, WindowOp};
 use crate::engine::{self, EngineEvent, EngineTx};
+use crate::history::{History, Transition};
 use crate::internal_pages::{self, Bookmark};
 use crate::tab::{HistoryEntry, Opener, TabId};
 
@@ -64,6 +66,8 @@ pub struct Shared {
     next_tab: TabId,
     /// Visits of normal (not private) windows, oldest first.
     pub visits: Vec<Visit>,
+    /// The browsing history of normal windows (saved in the profile).
+    pub history: History,
     pub bookmarks: Vec<Bookmark>,
     /// `None`: bookmarks are not saved (headless without `HUGINN_PROFILE_DIR`).
     bookmarks_path: Option<PathBuf>,
@@ -136,10 +140,13 @@ impl Shared {
         }
     }
 
-    pub(crate) fn visit(&mut self, url: &Url, title: &str) {
+    /// A page of a normal window loaded (`how`: typed, link, ...).
+    pub(crate) fn visit(&mut self, url: &Url, title: &str, how: Transition) {
         if url.scheme() == "huginn" || url.scheme() == "view-source" {
             return;
         }
+        self.history
+            .record(url, title, how, crate::history::now_ms());
         if let Some(last) = self.visits.last_mut()
             && last.url == *url
         {
@@ -152,10 +159,29 @@ impl Shared {
         });
     }
 
+    /// A page of a normal window changed its title after it loaded.
+    pub(crate) fn title_changed(&mut self, url: &Url, title: &str) {
+        self.history.set_title(url, title);
+    }
+
+    /// Warm up a connection to `url`'s host for the address bar's default
+    /// match (Chrome preconnects to it while the user types).
+    pub(crate) fn preconnect(&self, private: bool, url: &Url) {
+        let net = if private {
+            self.private_net.as_ref()
+        } else {
+            Some(&self.net)
+        };
+        if let Some(net) = net {
+            preconnect(net, url);
+        }
+    }
+
     /// Clear browsing data: history, recently closed tabs, cookies and the
     /// HTTP cache (of normal and private windows).
     pub fn clear_history(&mut self) {
         self.visits.clear();
+        self.history.clear();
         self.closed.clear();
         self.net.cookies().clear();
         if let Err(e) = self.net.cookies().save() {
@@ -235,6 +261,10 @@ impl Session {
             internal_pages::profile_dir()
         };
         let bookmarks_path = profile.as_ref().map(|d| d.join("bookmarks.tsv"));
+        let history = match &profile {
+            Some(d) => History::persistent(d.join("history.tsv")),
+            None => History::in_memory(),
+        };
         let bookmarks = bookmarks_path
             .as_deref()
             .map(internal_pages::load_bookmarks)
@@ -264,6 +294,7 @@ impl Session {
                 notify,
                 next_tab: 0,
                 visits: Vec::new(),
+                history,
                 bookmarks,
                 bookmarks_path,
                 zoom: HashMap::new(),
@@ -430,7 +461,8 @@ impl Session {
         if let Some(w) = self.windows.get(self.focused) {
             w.state(&mut out);
         }
-        let shared = self.shared.borrow();
+        let mut shared = self.shared.borrow_mut();
+        out.insert("history_rows".into(), shared.history.len().into());
         out.insert("windows".into(), self.windows.len().into());
         out.insert("window".into(), self.focused.into());
         out.insert("visits".into(), shared.visits.len().into());
@@ -463,6 +495,13 @@ impl Drop for Session {
             eprintln!("huginn: cannot save cookies: {e}");
         }
     }
+}
+
+/// Open a connection to `url`'s host ahead of a request: DNS, TCP and TLS.
+/// `huginn_net::Network::preconnect` lands with the first-load work
+/// (branch `perf/first-load`); until then this does nothing.
+fn preconnect(net: &Network, url: &Url) {
+    let _ = (net, url);
 }
 
 /// This process's `phys_footprint` in bytes (`proc_pid_rusage`, macOS).

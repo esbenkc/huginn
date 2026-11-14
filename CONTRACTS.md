@@ -869,17 +869,23 @@ lazy images; `null` before), `loading`, `history`,
 `icon`, `favicon`, plus the fields `interact::state` and `live::state` add),
 the window (`tabs` [{`url`, `title`, `loading`, `discarded`, `active`,
 `zoom`}], `active_tab`, `private`, `address`, `focused` (address bar),
-`bookmarked`, `fullscreen`, `minimized`, `page_top`, `size`, `scale`) and the
-session (`windows`, `window`, `visits`, `closed`, `bookmarks`, `clipboard`,
-`engines`). Env: `HUGINN_PROFILE_DIR` (bookmarks file; headless saves none
-without it), `HUGINN_LIVE_TABS` (background tabs kept in memory, default 8).
+`address_selection` ([start, end] in chars, or null), `suggestions`
+[{`kind` (`history`, `typed`, `search`), `url`, `title`}], `suggestion` (the
+picked row, null when the drop-down is closed), `suggestions_rect` ([x, y,
+width, height] in window CSS px, or null), `bookmarked`, `fullscreen`,
+`minimized`, `page_top`, `size`, `scale`) and the session (`windows`,
+`window`, `visits`, `history_rows` (rows of the saved history), `closed`,
+`bookmarks`, `clipboard`, `engines`). Env: `HUGINN_PROFILE_DIR` (bookmarks
+and history files; headless saves none without it), `HUGINN_LIVE_TABS`
+(background tabs kept in memory, default 8).
 
 ### huginn-shell window: tab hooks
 
 Modules: `session.rs` (all windows, shared state), `browser.rs` (one
 window: tabs, strip, toolbar, routing), `tab.rs` (one tab: engine thread,
-history, page layer, zoom), `tabstrip.rs`, `toolbar.rs`, `shortcuts.rs`,
-`internal_pages.rs`, `input.rs`, `ui.rs`, `clipboard.rs`. In-page modules
+history, page layer, zoom), `tabstrip.rs`, `toolbar.rs`, `omnibox.rs`
+(address bar suggestions), `history.rs` (saved browsing history),
+`shortcuts.rs`, `internal_pages.rs`, `input.rs`, `ui.rs`, `clipboard.rs`. In-page modules
 plug in through fixed functions: `interact/` (in-page interaction) and `live.rs`
 (live JavaScript). Their owners change bodies freely; signatures change only
 with this file.
@@ -897,8 +903,10 @@ pub enum CursorKind { Default, Pointer, Text }
 
 // tab.rs
 pub const PAGE_TOP: f32 = 80.0;          // tab strip 40 + toolbar 40, window CSS px
-pub enum Request { Navigate(Url), OpenTab { url: Url, background: bool },
-                   OpenWindow { url: Url, private: bool }, Back, Forward, Reload, ViewSource }
+pub enum Request { Navigate(Url), OpenTab { url: Url, background: bool, opener: Box<Opener> },
+                   OpenWindow { url: Url, private: bool, opener: Box<Opener> }, Back, Forward, Reload, ViewSource }
+pub struct Opener { pub initiator: Option<Client>, pub post: Option<PostData>,
+                    pub typed: bool /* address bar: history counts a typed visit */ }
 pub struct View { pub tree: LayoutTree, pub links: Links }
 impl Tab {
     pub view: Option<View>; pub scroll: f32; pub zoom: f32; pub title: String;

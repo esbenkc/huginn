@@ -113,8 +113,8 @@ macOS; the list is in [ARCHITECTURE.md](ARCHITECTURE.md#shortcuts-and-gestures-c
 |---|---|
 | ![huginn://newtab](docs/img/newtab.png) | ![A test page rendered by huginn render](docs/img/render-text.png) |
 
-Environment variables: `HUGINN_PROFILE_DIR` (where bookmarks and cookies are
-saved; the default is `~/Library/Application Support/Huginn`, on Linux
+Environment variables: `HUGINN_PROFILE_DIR` (where bookmarks, cookies and
+history are saved; the default is `~/Library/Application Support/Huginn`, on Linux
 `~/.config/huginn`; the HTTP cache is then in its `Cache` folder, else in
 `~/Library/Caches/Huginn` or `~/.cache/huginn`), `HUGINN_NO_JS=1`,
 `HUGINN_NET_LOOPBACK_ONLY=1` (no network except 127.0.0.1), `HUGINN_NET_LOG=1`
@@ -126,8 +126,8 @@ plain dark chrome instead of the see-through acrylic one).
 
 Works: HTML parsing, most of modern CSS (through Stylo), block, flex, grid,
 float and table layout, web fonts, SVG images, JavaScript with a DOM, forms,
-tabs and windows, history, bookmarks, zoom, find in page, view source, save,
-and print to PDF.
+tabs and windows, history with address bar autofill and suggestions,
+bookmarks, zoom, find in page, view source, save, and print to PDF.
 
 Missing or incomplete:
 
@@ -141,7 +141,8 @@ Missing or incomplete:
   text for what did not change, but still lays out the whole tree.
 - JavaScript: no iframes, no IME, no `contenteditable`. `fetch` and XHR
   after load block the tab.
-- No disk cache. History lasts for one session.
+- No disk cache. The history page shows this session only (the address
+  bar's suggestions use the saved history).
 
 ARCHITECTURE.md has a task list per crate.
 
