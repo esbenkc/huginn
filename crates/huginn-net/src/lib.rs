@@ -22,10 +22,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
@@ -45,6 +43,7 @@ mod netlog;
 mod referrer;
 mod srcset;
 mod svg;
+mod transport;
 pub mod ua;
 
 use cache::CacheMode;
@@ -285,36 +284,55 @@ impl fmt::Display for NetError {
 
 impl std::error::Error for NetError {}
 
+/// One of [`MAX_DECODES`] slots for decoding an image; freed when dropped.
+struct DecodePermit;
+
+static DECODES: (Mutex<usize>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+impl DecodePermit {
+    fn take() -> DecodePermit {
+        let (lock, cv) = &DECODES;
+        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *n >= MAX_DECODES {
+            n = cv.wait(n).unwrap_or_else(|e| e.into_inner());
+        }
+        *n += 1;
+        DecodePermit
+    }
+}
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        let (lock, cv) = &DECODES;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        cv.notify_one();
+    }
+}
+
 /// Max body size accepted for one resource (64 MiB).
 const MAX_BODY: u64 = 64 << 20;
-/// Max parallel fetches in [`Loader::fetch_all`]. Same as Chrome's per-host HTTP/1.1 limit.
-const MAX_PARALLEL: usize = 6;
+/// Threads of [`Loader::map_parallel`] (fetches in flight from one batch).
+/// HTTP/2 carries them all on one connection per host; for HTTP/1.1 the
+/// transport still opens at most 6 connections per host, like Chrome.
+const MAX_PARALLEL: usize = 32;
+/// Images decoded at the same time in the whole process: the CPU and memory
+/// of decoding stay where they were with 6 fetch threads.
+const MAX_DECODES: usize = 6;
 /// Redirects followed per request (Fetch's limit).
 const MAX_REDIRECTS: usize = 20;
-/// Idle connections kept per host (one for each parallel fetch) and in all.
-const IDLE_PER_HOST: usize = MAX_PARALLEL;
-const IDLE_TOTAL: usize = 32;
-/// How long an idle connection is kept: Chrome's limit for sockets that
-/// were used once. A connection the server closed is found and skipped.
-const IDLE_AGE: Duration = Duration::from_secs(300);
 /// Bodies of redirects and errors up to this size are read to the end,
 /// so that their connection can carry the next request.
 const DRAIN_MAX: u64 = 64 << 10;
 
 /// What the loaders of one profile share, like Chrome's network context:
-/// idle connections (6 per host, for up to 5 minutes, with their TLS
-/// sessions for resumption), resolved host names (for 1 minute), the
-/// [`HttpCache`] and the [`CookieJar`]. All tabs of a profile share one
-/// `Network`; each page has its own [`Loader`] on top of it.
+/// connections (one HTTP/2 connection per host, or up to 6 HTTP/1.1 ones;
+/// idle ones for up to 5 minutes, with their TLS sessions for resumption),
+/// resolved host names (for 1 minute), the [`HttpCache`] and the
+/// [`CookieJar`]. All tabs of a profile share one `Network`; each page has
+/// its own [`Loader`] on top of it.
 pub struct Network {
-    agent: ureq::Agent,
-    /// Same, but its resolver drops loopback and private addresses:
-    /// subresources and script requests of a public page (Local Network
-    /// Access). Made on first use.
-    public_agent: std::sync::OnceLock<ureq::Agent>,
-    config: ureq::config::Config,
+    transport: transport::Transport,
     loopback_only: bool,
-    dns: Arc<DnsCache>,
     cookies: Arc<CookieJar>,
     cache: HttpCache,
 }
@@ -333,37 +351,22 @@ impl Network {
     }
 
     fn build(loopback_only: bool, cookies: Arc<CookieJar>, cache: HttpCache) -> Arc<Network> {
-        let config = ureq::Agent::config_builder()
-            .user_agent(ua::USER_AGENT)
-            // Bodies are decoded here, after they are read to the end.
-            .accept_encoding(compression::ACCEPT_ENCODING)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            // Redirects are followed here, hop by hop, for cookies and CORS.
-            .max_redirects(0)
-            .allow_non_standard_methods(true)
-            .max_idle_connections(IDLE_TOTAL)
-            .max_idle_connections_per_host(IDLE_PER_HOST)
-            .max_idle_age(IDLE_AGE)
-            .build();
-        let dns = Arc::new(DnsCache::default());
-        let agent = ureq::Agent::with_parts(
-            config.clone(),
-            netlog::TimedConnector::default(),
-            HostResolver {
-                loopback_only,
-                dns: dns.clone(),
-                ..HostResolver::default()
-            },
-        );
         Arc::new(Network {
-            agent,
-            public_agent: std::sync::OnceLock::new(),
-            config,
+            transport: transport::Transport::new(loopback_only),
             loopback_only,
-            dns,
             cookies,
             cache,
+        })
+    }
+
+    /// A network on this transport (tests: one that trusts a test CA).
+    #[cfg(test)]
+    fn with_transport(transport: transport::Transport) -> Arc<Network> {
+        Arc::new(Network {
+            transport,
+            loopback_only: false,
+            cookies: Arc::new(CookieJar::in_memory()),
+            cache: HttpCache::off(),
         })
     }
 
@@ -375,25 +378,6 @@ impl Network {
     /// The HTTP cache.
     pub fn cache(&self) -> &HttpCache {
         &self.cache
-    }
-
-    /// The agent for loopback and private addresses too, or the one for
-    /// public addresses only.
-    fn agent(&self, public_only: bool) -> &ureq::Agent {
-        if !public_only || self.loopback_only {
-            return &self.agent;
-        }
-        self.public_agent.get_or_init(|| {
-            ureq::Agent::with_parts(
-                self.config.clone(),
-                netlog::TimedConnector::default(),
-                HostResolver {
-                    public_only: true,
-                    dns: self.dns.clone(),
-                    ..HostResolver::default()
-                },
-            )
-        })
     }
 }
 
@@ -479,20 +463,19 @@ impl Loader {
         ))
     }
 
-    /// The agent for a request: requests from a public page that are not
-    /// top-level navigations may not reach loopback or private addresses
-    /// (Local Network Access). The check is on the resolved addresses, so
-    /// DNS rebinding cannot get around it.
-    fn agent_for(&self, mode: Mode, client: Option<&Client>) -> &ureq::Agent {
-        let public_only = mode != Mode::Navigate
+    /// Whether a request may reach public addresses only: requests from a
+    /// public page that are not top-level navigations may not reach
+    /// loopback or private addresses (Local Network Access). The check is
+    /// on the resolved addresses, so DNS rebinding cannot get around it.
+    fn public_only(&self, mode: Mode, client: Option<&Client>) -> bool {
+        mode != Mode::Navigate
             && !self.net.loopback_only
             && client.is_some_and(|c| {
                 *self
                     .client_public
                     .lock()
                     .get_or_insert_with(|| is_public_url(&c.url))
-            });
-        self.net.agent(public_only)
+            })
     }
 
     /// The network this loader uses.
@@ -554,7 +537,7 @@ impl Loader {
         Ok(res)
     }
 
-    /// Fetch many URLs in parallel (at most 6 at a time). Results are in input order.
+    /// Fetch many URLs in parallel (at most 32 at a time). Results are in input order.
     pub fn fetch_all(
         &self,
         requests: &[(Url, ResourceKind)],
@@ -570,7 +553,7 @@ impl Loader {
         drop(old);
     }
 
-    /// Run `f` over `items` on up to 6 scoped threads; results keep input order.
+    /// Run `f` over `items` on up to 32 scoped threads; results keep input order.
     /// Used for fetching and for decoding fetched images off the main thread.
     pub fn map_parallel<T: Sync, R: Send>(
         &self,
@@ -816,7 +799,7 @@ impl Loader {
         mut req: Request<'_>,
     ) -> Result<(Resource, Option<String>), NetError> {
         let origin = req.client.as_ref().map(|c| c.url.origin());
-        let agent = self.agent_for(req.mode, req.client.as_ref());
+        let public_only = self.public_only(req.mode, req.client.as_ref());
         // Browser-UI navigations: the site the user asked for. A redirect
         // to another site makes the rest of the chain cross-site.
         let first_url = req.url.clone();
@@ -878,7 +861,7 @@ impl Loader {
                             referer.as_deref(),
                             req.credentials == Credentials::Include,
                             relation,
-                            agent,
+                            public_only,
                         )?;
                     }
                 }
@@ -924,7 +907,7 @@ impl Loader {
                 ResourceKind::Font => "font/woff2,font/woff,font/ttf,*/*;q=0.5",
                 ResourceKind::Script | ResourceKind::Other => "*/*",
             };
-            let mut b = ureq::http::Request::builder()
+            let mut b = http::Request::builder()
                 .method(req.method.as_str())
                 .uri(url.as_str());
             if !req.headers.iter().any(|(n, _)| n == "accept") {
@@ -1062,7 +1045,7 @@ impl Loader {
             let mut response = if fresh {
                 None
             } else {
-                Some(self.run(agent, b, req.body, &url, &mut exchange)?)
+                Some(self.run(public_only, b, req.body, &url, &mut exchange)?)
             };
             exchange.head();
             let response_time = cache::now_ms();
@@ -1074,8 +1057,8 @@ impl Loader {
                     (e.status, e.headers.clone())
                 }
                 Some(resp) => {
-                    let mut headers = Vec::with_capacity(resp.headers().len());
-                    for (n, v) in resp.headers() {
+                    let mut headers = Vec::with_capacity(resp.headers.len());
+                    for (n, v) in &resp.headers {
                         let v = String::from_utf8_lossy(v.as_bytes());
                         if n == "set-cookie" || n == "set-cookie2" {
                             if include_credentials && n == "set-cookie" {
@@ -1085,7 +1068,7 @@ impl Loader {
                         }
                         headers.push((n.as_str().to_owned(), v.into_owned()));
                     }
-                    (resp.status().as_u16(), headers)
+                    (resp.status, headers)
                 }
             };
             // The stored body, when the cache answers.
@@ -1098,7 +1081,7 @@ impl Loader {
                 && let Some(mut e) = stored.take()
                 && let Some(mut resp) = response.take()
             {
-                drain(&mut resp);
+                resp.drain(DRAIN_MAX);
                 e.refresh(&headers, request_time, response_time);
                 if let Some(k) = &cache_key {
                     self.net.cache.put(k, &e);
@@ -1162,7 +1145,7 @@ impl Loader {
                 .filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308));
             if let Some(location) = location {
                 if let Some(resp) = response.as_mut() {
-                    drain(resp);
+                    resp.drain(DRAIN_MAX);
                     store(status, headers, Vec::new());
                 }
                 exchange.end(
@@ -1234,7 +1217,7 @@ impl Loader {
 
             if !req.any_status && !(200..300).contains(&status) {
                 if let Some(resp) = response.as_mut() {
-                    drain(resp);
+                    resp.drain(DRAIN_MAX);
                 }
                 exchange.end(
                     &req.method,
@@ -1317,41 +1300,22 @@ impl Loader {
         Some(format!("{anonymous}{site} {url}"))
     }
 
-    /// Send a request and wait for the response head. A request that went
-    /// out on a kept-alive connection the server has closed in the
-    /// meantime is sent again once, on a new connection, as in Chrome.
+    /// Send a request and wait for the response head (see
+    /// `transport.rs`: HTTP/2 or HTTP/1.1, pooled connections, one retry on
+    /// a new connection when a kept-alive one fails).
     fn run(
         &self,
-        agent: &ureq::Agent,
-        b: ureq::http::request::Builder,
+        public_only: bool,
+        b: http::request::Builder,
         body: Option<&[u8]>,
         url: &Url,
         exchange: &mut netlog::Exchange,
-    ) -> Result<ureq::http::Response<ureq::Body>, NetError> {
-        fn request<T>(parts: &ureq::http::request::Parts, body: T) -> ureq::http::Request<T> {
-            let mut r = ureq::http::Request::new(body);
-            *r.method_mut() = parts.method.clone();
-            *r.uri_mut() = parts.uri.clone();
-            *r.version_mut() = parts.version;
-            *r.headers_mut() = parts.headers.clone();
-            r
-        }
-        let (parts, ()) = b
+    ) -> Result<transport::Response, NetError> {
+        let (head, ()) = b
             .body(())
             .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?
             .into_parts();
-        let send = || match body {
-            Some(body) => agent.run(request(&parts, body)),
-            None => agent.run(request(&parts, ())),
-        };
-        let mut result = send();
-        if matches!(result, Err(ureq::Error::Io(_) | ureq::Error::Protocol(_)))
-            && !exchange.connected()
-        {
-            *exchange = netlog::Exchange::begin();
-            result = send();
-        }
-        result.map_err(|e| NetError::Transport(format!("{url}: {e}")))
+        self.net.transport.send(head, body, public_only, exchange)
     }
 
     /// A CORS preflight (`OPTIONS`) for a request to `url`: no cookies; the
@@ -1366,9 +1330,9 @@ impl Loader {
         referer: Option<&str>,
         credentials: bool,
         relation: SiteRelation,
-        agent: &ureq::Agent,
+        public_only: bool,
     ) -> Result<(), NetError> {
-        let mut b = ureq::http::Request::builder()
+        let mut b = http::Request::builder()
             .method("OPTIONS")
             .uri(url.as_str())
             .header("Accept", "*/*")
@@ -1396,14 +1360,11 @@ impl Loader {
         for (k, v) in ua::client_hint_headers(url) {
             b = b.header(*k, *v);
         }
-        let built = b
-            .body(())
-            .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?;
-        let resp = agent
-            .run(built)
-            .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
+        let mut exchange = netlog::Exchange::begin();
+        let mut resp = self.run(public_only, b, None, url, &mut exchange)?;
+        resp.drain(DRAIN_MAX);
         let headers: Vec<(String, String)> = resp
-            .headers()
+            .headers
             .iter()
             .map(|(n, v)| {
                 (
@@ -1412,7 +1373,7 @@ impl Loader {
                 )
             })
             .collect();
-        let ok = (200..300).contains(&resp.status().as_u16())
+        let ok = (200..300).contains(&resp.status)
             && cors::cors_check(&headers, origin, credentials)
             && cors::preflight_allows(&headers, method, unsafe_names, credentials);
         if ok {
@@ -1478,105 +1439,8 @@ fn charset_param(content_type: &str) -> Option<&str> {
     })
 }
 
-/// Resolved addresses for a minute, like Chrome's host cache. ureq
-/// resolves the host before it looks for an idle connection, so without
-/// it every request, on a new connection or not, asked the system
-/// resolver again (1 to 15 ms each, measured).
-#[derive(Debug, Default)]
-struct DnsCache(
-    parking_lot::Mutex<
-        HashMap<(String, u16), (ureq::unversioned::resolver::ResolvedSocketAddrs, Instant)>,
-    >,
-);
-
-/// How long a resolved address is used: Chrome's default for answers of
-/// the system resolver.
-const DNS_TTL: Duration = Duration::from_secs(60);
-
-/// Resolves hosts for the loader. `localhost` and `*.localhost` always go
-/// to loopback (127.0.0.1, then ::1), never to DNS, like Chrome: the cookie
-/// jar treats them as secure. `loopback_only`: other hosts are "host not
-/// found" (no DNS lookup). `public_only`: loopback and private addresses
-/// are dropped from the answer (Local Network Access).
-#[derive(Debug, Default)]
-struct HostResolver {
-    inner: ureq::unversioned::resolver::DefaultResolver,
-    loopback_only: bool,
-    public_only: bool,
-    dns: Arc<DnsCache>,
-}
-
-impl ureq::unversioned::resolver::Resolver for HostResolver {
-    fn resolve(
-        &self,
-        uri: &ureq::http::Uri,
-        config: &ureq::config::Config,
-        timeout: ureq::unversioned::transport::NextTimeout,
-    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-        let host = uri.host().unwrap_or("");
-        let host = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        let port = uri
-            .port_u16()
-            .unwrap_or(if uri.scheme_str() == Some("https") {
-                443
-            } else {
-                80
-            });
-        if host == "localhost" || host.ends_with(".localhost") {
-            if self.public_only {
-                return Err(ureq::Error::HostNotFound);
-            }
-            let mut out = self.empty();
-            out.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
-            out.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
-            return Ok(out);
-        }
-        if self.loopback_only && !matches!(host.as_str(), "127.0.0.1" | "::1") {
-            return Err(ureq::Error::HostNotFound);
-        }
-        let key = (host, port);
-        let cached = self
-            .dns
-            .0
-            .lock()
-            .get(&key)
-            .filter(|(_, at)| at.elapsed() < DNS_TTL)
-            .map(|(a, _)| a.clone());
-        let addrs = match cached {
-            Some(a) => a,
-            None => {
-                let t = Instant::now();
-                let addrs = self.inner.resolve(uri, config, timeout);
-                netlog::dns(t.elapsed());
-                let addrs = addrs?;
-                self.dns
-                    .0
-                    .lock()
-                    .insert(key, (addrs.clone(), Instant::now()));
-                addrs
-            }
-        };
-        if !self.public_only {
-            return Ok(addrs);
-        }
-        let mut out = self.empty();
-        for a in addrs.iter().filter(|a| !is_local_ip(a.ip())) {
-            out.push(*a);
-        }
-        if out.is_empty() {
-            return Err(ureq::Error::HostNotFound);
-        }
-        Ok(out)
-    }
-}
-
 /// The value of request header `name` (all its lines, joined by `, `).
-fn header_text(headers: &ureq::http::HeaderMap, name: &str) -> Option<String> {
+fn header_text(headers: &http::HeaderMap, name: &str) -> Option<String> {
     let values: Vec<&str> = headers
         .get_all(name)
         .iter()
@@ -1585,33 +1449,15 @@ fn header_text(headers: &ureq::http::HeaderMap, name: &str) -> Option<String> {
     (!values.is_empty()).then(|| values.join(", "))
 }
 
-/// Read a small body (a redirect, an error, a `304`) to its end, so the
-/// connection can carry the next request; a big one is left (and its
-/// connection closed).
-fn drain(resp: &mut ureq::http::Response<ureq::Body>) {
-    let _ = resp
-        .body_mut()
-        .with_config()
-        .limit(DRAIN_MAX)
-        .reader()
-        .read_to_end(&mut Vec::new());
-}
-
 /// Read a body to its end (the connection goes back to the pool), then
 /// undo its `Content-Encoding`.
 fn read_body(
-    resp: &mut ureq::http::Response<ureq::Body>,
+    resp: &mut transport::Response,
     headers: &[(String, String)],
     url: &Url,
 ) -> Result<Vec<u8>, NetError> {
-    // Size the buffer from Content-Length so read_to_end does not double it.
-    let mut raw =
-        Vec::with_capacity(resp.body().content_length().unwrap_or(0).min(MAX_BODY) as usize);
-    resp.body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .reader()
-        .read_to_end(&mut raw)
+    let raw = resp
+        .read(MAX_BODY)
         .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
     compression::decode(
         cors::header_value(headers, "content-encoding").as_deref(),
@@ -1813,6 +1659,7 @@ pub fn decode_image(bytes: &[u8], display: Option<(u32, u32)>) -> Result<Decoded
     if svg::is_svg(bytes) {
         return decode_svg(bytes, display);
     }
+    let _permit = DecodePermit::take();
     let (img, has_alpha) = decode_raster(bytes)?;
     let (w, h) = (img.width(), img.height());
     let img = match display {
@@ -1911,6 +1758,58 @@ impl ImageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_all_keeps_a_burst_in_flight_over_http2() {
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        let s = transport::test_server::server(
+            &[b"h2", b"http/1.1"],
+            Duration::from_millis(300),
+            usize::MAX,
+        );
+        let loader =
+            Loader::with_network(Network::with_transport(transport::test_server::client()));
+        let requests: Vec<(Url, ResourceKind)> = (0..24)
+            .map(|k| {
+                let url = format!("https://127.0.0.1:{}/{k}.css", s.port);
+                (Url::parse(&url).unwrap(), ResourceKind::Stylesheet)
+            })
+            .collect();
+        let started = Instant::now();
+        let got = loader.fetch_all(&requests);
+        let took = started.elapsed();
+        for (k, r) in got.iter().enumerate() {
+            assert_eq!(r.as_ref().unwrap().text(), format!("HTTP/2.0 /{k}.css"));
+        }
+        assert_eq!(s.connections.load(Ordering::SeqCst), 1);
+        assert!(s.max_in_flight.load(Ordering::SeqCst) > 12);
+        // 24 x 300 ms, 6 at a time, would take 1.2 s.
+        assert!(took < Duration::from_millis(1100), "{took:?}");
+    }
+
+    #[test]
+    fn at_most_six_images_decode_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, peak, done) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        std::thread::scope(|s| {
+            for _ in 0..24 {
+                s.spawn(|| {
+                    let _permit = DecodePermit::take();
+                    peak.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 24);
+        assert!(peak.load(Ordering::SeqCst) <= MAX_DECODES);
+    }
 
     #[test]
     fn data_url_and_cache() {

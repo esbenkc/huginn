@@ -21,7 +21,7 @@ Huginn puts existing Rust libraries together with its own engine code.
 | Layout | box tree, inline layout, tables, positioning | [Taffy](https://github.com/DioxusLabs/taffy) for block, flex and grid (vendored with small fixes), [Parley](https://github.com/linebender/parley) for text shaping and line breaks |
 | Paint | display list, paint order, stacking contexts, clips | [vello_cpu](https://github.com/linebender/vello) rasterizes |
 | JavaScript | the DOM bindings, the event loop, timers, forms | [V8](https://v8.dev) through [rusty_v8](https://github.com/denoland/rusty_v8) |
-| Network and images | fetching, caching, which resources a page needs | ureq and rustls for HTTP, image, resvg and wuff for decoding |
+| Network and images | fetching, caching, which resources a page needs | hyper and rustls for HTTP/1.1 and HTTP/2, image, resvg and wuff for decoding |
 | Window | tabs, toolbar, address bar, internal pages, selection, find, print to PDF | winit and softbuffer |
 
 V8 is Chrome's JavaScript engine, and Stylo is the CSS engine of Servo and

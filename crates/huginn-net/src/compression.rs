@@ -1,8 +1,8 @@
 //! `Content-Encoding`. Huginn asks for `gzip, deflate, br` and decodes a
-//! body after reading all of it. ureq's own streaming decoders stopped at
-//! the end of the compressed data and left the end of a chunked body
-//! unread, so the connection was closed instead of used again: on brotli
-//! sites every request paid for a new TCP and TLS handshake.
+//! body after reading all of it. A streaming decoder can stop at the end of
+//! the compressed data and leave the end of a chunked body unread; then the
+//! connection is closed instead of used again (ureq did that: on brotli
+//! sites every request paid for a new TCP and TLS handshake).
 
 use std::io::Read;
 
@@ -10,7 +10,7 @@ use std::io::Read;
 pub(crate) const ACCEPT_ENCODING: &str = "gzip, deflate, br";
 
 /// Undo `encoding` (codings in the order they were applied, `gzip, br`).
-/// Unknown codings are left as they are, like ureq did. The result may be
+/// Unknown codings are left as they are. The result may be
 /// at most `limit` bytes.
 pub(crate) fn decode(encoding: Option<&str>, raw: Vec<u8>, limit: u64) -> Result<Vec<u8>, String> {
     let Some(encoding) = encoding else {

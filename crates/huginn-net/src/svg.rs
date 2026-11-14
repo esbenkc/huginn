@@ -41,6 +41,7 @@ pub fn is_svg(bytes: &[u8]) -> bool {
 /// (`preserveAspectRatio="xMidYMid meet"`). Text elements are not drawn (no
 /// font database).
 pub fn decode_svg(bytes: &[u8], size_hint: Option<(u32, u32)>) -> Result<DecodedImage, NetError> {
+    let _permit = crate::DecodePermit::take();
     let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
         .map_err(|e| NetError::Decode(format!("SVG: {e}")))?;
     let size = tree.size();

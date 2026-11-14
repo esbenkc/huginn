@@ -17,7 +17,7 @@ The interfaces between crates are in [CONTRACTS.md](CONTRACTS.md).
 | `huginn-style` | CSS parsing, selector matching, cascade, computed style (`StyleEngine`, `StyleMap`, `ComputedStyle`) | huginn-dom, cssparser |
 | `huginn-layout` | Box tree, block/flex/grid layout, inline text layout (`LayoutEngine`, `LayoutTree`) | huginn-dom, huginn-style, huginn-net, Taffy, Parley |
 | `huginn-paint` | Display list (`DisplayList`) and the CPU rasterizer (`CpuRasterizer`), PNG encoding | huginn-layout, huginn-style, huginn-net, vello_cpu, png |
-| `huginn-net` | Fetching (`Loader`: http, https, file, data), the profile's `Network` (kept-alive connections, DNS cache, HTTP cache in memory or on disk), cookies (`CookieJar`), CORS and referrer policy, charset and `Content-Encoding` decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | ureq, url, data-url, psl, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs, flate2, brotli-decompressor |
+| `huginn-net` | Fetching (`Loader`: http, https, file, data), the profile's `Network` (kept-alive connections, DNS cache, HTTP cache in memory or on disk), cookies (`CookieJar`), CORS and referrer policy, charset and `Content-Encoding` decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | hyper, tokio, rustls, url, data-url, psl, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs, flate2, brotli-decompressor |
 | `huginn-js` | Script engine: V8 (cargo feature `v8`, on by default), the JavaScript DOM layer (prelude), native DOM operations, modules | huginn-dom, huginn-net, huginn-style, v8 |
 | `huginn-shell` | The `huginn` binary. Runs the page-load pipeline and prints the timing JSON | all of the above |
 
@@ -37,7 +37,7 @@ ordered.
  Document (arena of Node)           huginn-dom    NodeId per node
    |  collect <style>, <link rel=stylesheet media=...>
    v
- Loader::fetch_all(stylesheets)     huginn-net    up to 6 threads, cached for @import
+ Loader::fetch_all(stylesheets)     huginn-net    up to 32 threads, cached for @import
    |  StyleEngine::add_stylesheet (UA sheet + author sheets, @import); then Loader::clear_cache
    v
  StyleEngine::compute(&Document)    huginn-style  StyleMap: Arc<ComputedStyle> per element
@@ -87,8 +87,16 @@ network; Linux only, `null` elsewhere). `--no-js` (or `HUGINN_NO_JS=1`) turns sc
 - `main` parses the arguments and spawns one `render` thread with a 256 MiB
   stack. Style and layout recurse on deep DOMs. Only touched stack pages are
   committed, so the big stack costs no RSS.
-- `Loader::map_parallel` runs fetches and image decodes on up to 6 scoped
-  threads. Results keep input order.
+- `Loader::map_parallel` runs fetches and image decodes on up to 32 scoped
+  threads. Results keep input order. HTTP/2 carries all of a host's
+  requests at once, so more threads mean more requests in flight; image
+  decoding is limited to 6 at a time in the whole process, so its CPU and
+  memory stay where they were with 6 threads.
+- Each `Network` has one network thread (`huginn-net`, a tokio worker, made
+  on the first HTTP request). It drives every connection: reads, writes,
+  TLS records and HTTP/2 frames. Callers block until their response
+  arrives. Name lookups, TCP connects and TLS handshakes run on the thread
+  that needs the new connection, so they run in parallel.
 - Parsing, style, layout and paint run on the render thread. They are
   single-threaded today.
 - `Document` is not `Send` or `Sync`. Its strings are `StrTendril`, which has a
@@ -449,7 +457,7 @@ Why:
   serves the current page. Other new engines also borrow tokens: Servo
   sends a Firefox string with `Servo/1.0` in it.
 - No `Chrome/` token. Bot filters compare a Chrome claim with the TLS and
-  HTTP fingerprint of the connection. Huginn's (rustls, HTTP/1.1) is not
+  HTTP fingerprint of the connection. Huginn's (rustls, hyper) is not
   Chrome's, so a Chrome claim reads as a bot and gets a hard 403. Huginn
   does not imitate Chrome's fingerprint; that would be bot-detection
   evasion. Each cell below is one or more live requests (2026-11-12, no
@@ -489,8 +497,10 @@ Why:
   `ua::CHROME_MAJOR` does not. As in Chrome, the client hints go only to
   `https:` and loopback URLs, and only these low-entropy ones; Huginn
   ignores `Accept-CH`.
-- HTTP/2 would be a separate improvement (for speed), not a way to look
-  like Chrome.
+- HTTP/2 is there for speed, not to look like Chrome: hyper's HTTP/2
+  settings and header order are not Chrome's. Checked on 2026-11-13: 20 of
+  the sites above (this string, no cookies) give the same status over
+  HTTP/2 as over HTTP/1.1.
 
 The image `Accept` header lists only formats `decode_image` decodes:
 `image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.8`. Image servers and
@@ -540,8 +550,8 @@ redirects itself, one hop at a time, so every hop gets its own `Cookie`,
   redirects to another site, the rest of it is cross-site.
 - Local Network Access: requests from a page on a public address, other
   than top-level navigations, may not reach loopback or private addresses.
-  The check runs in the resolver on the resolved addresses (a second ureq
-  agent, made on first use), so DNS rebinding cannot get around it.
+  The check runs on the resolved addresses, and such requests get
+  connections of their own, so DNS rebinding cannot get around it.
   `localhost` and `*.localhost` always resolve to loopback, never through
   DNS, because the jar treats them as secure.
 - Eviction (180 cookies per site, 3300 in total) removes expired cookies,
@@ -556,22 +566,29 @@ Private windows share another one, dropped with the last private window.
 `huginn render` makes a fresh one with no HTTP cache, so every benchmark
 run loads from the network.
 
+- **HTTP/2 and HTTP/1.1** (`transport.rs`, hyper). TLS offers `h2` and
+  `http/1.1` (ALPN) and the server picks, as in Chrome; plain `http:` is
+  HTTP/1.1. An HTTP/2 host gets one connection, which carries all its
+  requests at the same time. While the first TLS connection to a host is
+  being opened, other requests to it wait for it (Chrome does the same),
+  so a page that asks for 60 scripts at once opens one connection, not 6.
+  HTTP/1.1 hosts get at most 6 connections, one request at a time each.
+  Flow-control windows are Chrome's (6 MB per stream, 15 MB per
+  connection).
 - **Connections.** Idle connections stay open for 5 minutes (Chrome's
-  limit for used sockets), at most 6 per host and 32 in all, with their
-  TLS sessions for resumption. A request that goes out on a kept-alive
-  connection that the server closed meanwhile is sent once more on a new
-  one, as in Chrome. Redirects, errors and `304`s up to 64 KiB are read to
-  the end, so their connection is used again.
+  limit for used sockets), at most 32 idle HTTP/1.1 ones in all, with
+  their TLS sessions for resumption. A request that fails on a kept-alive
+  connection (the server closed it, or an HTTP/2 connection went away) is
+  sent once more on a new one, as in Chrome. Redirects, errors and `304`s
+  up to 64 KiB are read to the end, so their connection is used again.
 - **Content-Encoding.** Huginn asks for `gzip, deflate, br` and decodes a
-  body after reading all of it (`compression.rs`). ureq's own streaming
-  decoders stopped at the end of the brotli data, before the end of the
-  chunked body, so ureq closed the connection: on brotli sites every
-  request paid for a new TCP and TLS handshake (MDN: 57 new connections
-  for 60 requests). No `zstd`: there is no pure-Rust decoder in the tree,
-  and servers fall back to `br`.
-- **DNS.** Answers are kept for a minute, like Chrome's host cache. ureq
-  resolves the host before it looks for an idle connection, so each
-  request asked the system resolver again (1 to 15 ms each).
+  body after reading all of it (`compression.rs`), so the connection goes
+  back to the pool. (ureq, the client before hyper, stopped reading a
+  chunked body at the end of the brotli data and closed the connection:
+  MDN made 57 new connections for 60 requests.) No `zstd`: there is no
+  pure-Rust decoder in the tree, and servers fall back to `br`.
+- **DNS.** Answers are kept for a minute, like Chrome's host cache. Only
+  new connections look up their host.
 - **HTTP cache** (`cache.rs`, RFC 9111, a private cache). Fresh entries
   answer without a request (`max-age`, else `Expires`, else Chrome's
   heuristics: 10 % of the age since `Last-Modified`, and no limit for
@@ -598,12 +615,11 @@ run loads from the network.
   back show the document from the cache even when stale.
 - **`HUGINN_NET_LOG=1`** prints one line per HTTP exchange to stderr: start
   time, status, `network`, `hit` or `revalidated`, new or reused
-  connection, and ms for DNS, connect (TCP and TLS), the response head and
-  the body (`netlog.rs`).
-- **Not done.** HTTP/2 (ureq speaks HTTP/1.1; Chrome uses h2 on most of
-  these sites, so it needs no handshakes beyond one per host and has no 6
-  per host limit), `stale-while-revalidate`, a CORS preflight cache,
-  `zstd`.
+  connection, `h1` or `h2`, and ms for DNS, connect (TCP and TLS), the
+  response head and the body (`netlog.rs`).
+- **Not done.** HTTP/3 (QUIC), request priorities (HTTP/2 sends requests
+  in the order the threads start them), `stale-while-revalidate`, a CORS
+  preflight cache, `zstd`.
 
 ## External crates
 
@@ -624,7 +640,9 @@ Versions are the ones in `Cargo.lock`.
 | resvg (usvg, tiny-skia) | 0.50.0 | huginn-net | SVG images, CSS SVG backgrounds and inline `<svg>`. Features off: no text (it would load a font database on every page), no raster images inside SVG. tiny-skia's premultiplied RGBA moves into vello's pixmap without a conversion. |
 | wuff | 0.2.10 | huginn-net | Pure-Rust WOFF and WOFF2 to sfnt (the WOFF2 glyf/loca transform included), as in Blitz. Every web font in the corpus is WOFF2. |
 | encoding_rs | 0.8.44 | huginn-net | WHATWG Encoding Standard decoders for non-UTF-8 documents and stylesheets. UTF-8 input is borrowed, not copied. |
-| ureq (rustls) | 3.5.1 | huginn-net | Small blocking HTTP/1.1 client, with a connection pool. Its gzip and brotli features are off: huginn-net decodes bodies itself (see "Network and HTTP cache"). The corpus is HTTP/1.1 on 127.0.0.1; an async stack (tokio, hyper) would add threads and memory for nothing. Six scoped worker threads fetch and decode in parallel. |
+| hyper (h2, httparse) | 1.12.0 (h2 0.4.20) | huginn-net | HTTP/1.1 and HTTP/2 client connections (`client::conn`, no pool: `transport.rs` keeps the connections). The HTTP/2 implementation (`h2`) used by most Rust servers and clients. ureq, the client before, speaks only HTTP/1.1, so every host got up to 6 TLS handshakes and 6 requests at a time. Cost: a clean build of huginn-net takes 10 s longer (48 to 59 s, fastdev, 14 cores). |
+| tokio, tokio-rustls, hyper-util | 1.54.1 / 0.26.6 / 0.1.21 | huginn-net | hyper's I/O: one worker thread per `Network` drives all connections (no blocking pool, no timers beyond request timeouts). Features: `rt-multi-thread`, `net`, `time`, `sync`. |
+| rustls, webpki-roots | 0.23.46 / 1.0.12 | huginn-net | TLS (ring provider, TLS 1.2 and 1.3, session resumption) with the Mozilla root certificates. |
 | flate2 / brotli-decompressor | 1.1.11 / 6.3.1 | huginn-net, huginn-js | `Content-Encoding` (gzip, deflate, br) and `CompressionStream`. Both were in the tree already (png, wuff). |
 | url / data-url | 2.5.8 / 0.3.2 | huginn-net, all | WHATWG URL parsing and `data:` URLs. |
 | psl | 2.1 | huginn-net | The Public Suffix List compiled into lookup code: cookie `Domain` checks and site boundaries (`SameSite`, `Sec-Fetch-Site`). No list is parsed at run time, so it costs no heap. |
@@ -639,7 +657,7 @@ Licenses of all dependencies: [THIRD-PARTY.md](THIRD-PARTY.md).
 
 | part | ours | library |
 |---|---|---|
-| Fetching, cache, redirects, MIME | `huginn-net` (`Loader`) | ureq does HTTP; url does URLs |
+| Fetching, cache, redirects, MIME, connection pool | `huginn-net` (`Loader`, `transport.rs`) | hyper does HTTP/1.1 and HTTP/2, rustls TLS; url does URLs |
 | HTML tokenizing and tree building | tree sink (`huginn-dom/src/parse.rs`) | html5ever |
 | DOM storage and mutation API | all of `huginn-dom` | atoms from markup5ever |
 | CSS parsing, selectors, cascade | glue in `huginn-style` (`dom.rs`, `engine.rs`, `hints.rs`, `convert.rs`, `query.rs`), `ua.css` | Stylo 0.24 |

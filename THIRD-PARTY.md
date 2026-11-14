@@ -33,7 +33,9 @@ The browser uses system fonts only; no font files are included.
 | avif-parse | 2.1.0 | MPL-2.0 | AVIF (HEIF) container parsing | https://github.com/kornelski/avif-parse |
 | png | 0.18.1 | MIT OR Apache-2.0 | PNG encoding | https://github.com/image-rs/image-png |
 | wuff | 0.2.10 | MIT | WOFF and WOFF2 decoding | https://github.com/nicoburns/wuff |
-| ureq (rustls, ring, webpki-roots) | 3.5.1 | MIT OR Apache-2.0 (ring: Apache-2.0 AND ISC; webpki-roots: CDLA-Permissive-2.0) | HTTP client and TLS | https://github.com/algesten/ureq |
+| hyper, h2, hyper-util | 1.12.0 / 0.4.20 / 0.1.21 | MIT | HTTP/1.1 and HTTP/2 | https://github.com/hyperium/hyper |
+| tokio, tokio-rustls | 1.54.1 / 0.26.6 | MIT (tokio-rustls: MIT OR Apache-2.0) | the network thread and its I/O | https://github.com/tokio-rs/tokio |
+| rustls (ring, webpki-roots) | 0.23.46 | Apache-2.0 OR ISC OR MIT (ring: Apache-2.0 AND ISC; webpki-roots: CDLA-Permissive-2.0) | TLS | https://github.com/rustls/rustls |
 | url, data-url | 2.5.8 / 0.3.2 | MIT OR Apache-2.0 | URL parsing | https://github.com/servo/rust-url |
 | psl, psl-types | 2.1.252 / 2.0.11 | MIT OR Apache-2.0 (the Public Suffix List data in it: MPL-2.0) | cookie domains and site boundaries | https://github.com/addr-rs/psl |
 | encoding_rs | 0.8.44 | (Apache-2.0 OR MIT) AND BSD-3-Clause | character encodings | https://github.com/hsivonen/encoding_rs |
@@ -62,14 +64,14 @@ https://github.com/kornelski/avif-parse).
 
 ## License summary
 
-321 third-party crates are in the dependency graph for macOS arm64 (281 linked or used at
+336 third-party crates are in the dependency graph for macOS arm64 (296 linked or used at
 compile time by the crates, 40 used only by build scripts). None is GPL, LGPL or AGPL.
 
 | license expression | crates |
 |---|---|
-| MIT OR Apache-2.0 | 137 |
-| MIT | 57 |
-| Apache-2.0 OR MIT | 32 |
+| MIT OR Apache-2.0 | 139 |
+| MIT | 69 |
+| Apache-2.0 OR MIT | 33 |
 | Unicode-3.0 | 27 |
 | MPL-2.0 | 15 |
 | Zlib OR Apache-2.0 OR MIT | 8 |
@@ -96,7 +98,7 @@ compile time by the crates, 40 used only by build scripts). None is GPL, LGPL or
 
 ## All crates
 
-Generated from `cargo metadata --filter-platform aarch64-apple-darwin` on 2026-11-12.
+Generated from `cargo metadata --filter-platform aarch64-apple-darwin` on 2026-11-13.
 The Linux build adds crates that are not in this list yet (the X11 and Wayland
 backends of winit and softbuffer, fontconfig bindings, arboard and their
 dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-linux-gnu`.
@@ -113,12 +115,12 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | arrayref | 0.3.9 | BSD-2-Clause |  |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 |  |
 | assert_matches | 1.5.0 | MIT/Apache-2.0 |  |
+| atomic-waker | 1.1.2 | Apache-2.0 OR MIT |  |
 | atomic_refcell | 0.1.14 | Apache-2.0 OR MIT |  |
 | atomig | 0.4.3 | MIT/Apache-2.0 |  |
 | atomig-macro | 0.4.0 | MIT/Apache-2.0 |  |
 | autocfg | 1.5.1 | Apache-2.0 OR MIT | build |
 | avif-parse | 2.1.0 | MPL-2.0 |  |
-| base64 | 0.23.1 | MIT OR Apache-2.0 |  |
 | bindgen | 0.72.1 | BSD-3-Clause | build |
 | bitflags | 1.3.2 | MIT/Apache-2.0 |  |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |  |
@@ -187,19 +189,28 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | foreign-types-shared | 0.3.1 | MIT/Apache-2.0 |  |
 | form_urlencoded | 1.2.2 | MIT OR Apache-2.0 |  |
 | fslock | 0.2.1 | MIT | build |
+| futures-channel | 0.3.34 | MIT OR Apache-2.0 |  |
+| futures-core | 0.3.34 | MIT OR Apache-2.0 |  |
+| futures-sink | 0.3.34 | MIT OR Apache-2.0 |  |
 | getrandom | 0.2.17 | MIT OR Apache-2.0 |  |
 | gif | 0.14.2 | MIT OR Apache-2.0 |  |
 | glifo | 0.5.0 | Apache-2.0 OR MIT |  |
 | glob | 0.3.4 | MIT OR Apache-2.0 | build |
 | guillotiere | 0.7.0 | MIT/Apache-2.0 |  |
 | gzip-header | 1.1.0 | MIT/Apache-2.0 | build |
+| h2 | 0.4.20 | MIT |  |
 | harfrust | 0.12.0 | MIT |  |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 |  |
 | heck | 0.5.0 | MIT OR Apache-2.0 |  |
 | home | 0.5.12 | MIT OR Apache-2.0 | build |
 | html5ever | 0.40.1 | MIT OR Apache-2.0 |  |
 | http | 1.5.0 | MIT OR Apache-2.0 |  |
+| http-body | 1.1.0 | MIT |  |
+| http-body-util | 0.1.5 | MIT |  |
 | httparse | 1.10.1 | MIT OR Apache-2.0 |  |
+| httpdate | 1.0.3 | MIT OR Apache-2.0 |  |
+| hyper | 1.12.0 | MIT |  |
+| hyper-util | 0.1.21 | MIT |  |
 | icu_calendar | 2.4.0 | Unicode-3.0 |  |
 | icu_calendar_data | 2.4.0 | Unicode-3.0 |  |
 | icu_collections | 2.4.0 | Unicode-3.0 |  |
@@ -242,6 +253,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | minimal-lexical | 0.2.1 | MIT/Apache-2.0 | build |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 |  |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 |  |
+| mio | 1.2.5 | MIT |  |
 | moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 |  |
 | multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT |  |
 | nasm-rs | 0.3.2 | MIT OR Apache-2.0 | build |
@@ -338,10 +350,12 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | siphasher | 1.0.4 | MIT OR Apache-2.0 |  |
 | skrifa | 0.44.0 | MIT OR Apache-2.0 |  |
 | skrifa | 0.49.0 | MIT OR Apache-2.0 |  |
+| slab | 0.4.12 | MIT |  |
 | slotmap | 1.1.1 | Zlib |  |
 | smallbitvec | 2.6.1 | MIT OR Apache-2.0 |  |
 | smallvec | 1.16.5 | MIT OR Apache-2.0 |  |
 | smol_str | 0.2.2 | MIT OR Apache-2.0 |  |
+| socket2 | 0.6.5 | MIT OR Apache-2.0 |  |
 | softbuffer | 0.4.8 | MIT OR Apache-2.0 |  |
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 |  |
 | static_assertions | 1.1.0 | MIT OR Apache-2.0 |  |
@@ -380,20 +394,22 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | to_method | 1.1.0 | CC0-1.0 |  |
 | to_shmem | 0.8.0 | MPL-2.0 |  |
 | to_shmem_derive | 0.3.0 | MPL-2.0 |  |
+| tokio | 1.54.1 | MIT |  |
+| tokio-macros | 2.7.2 | MIT |  |
+| tokio-rustls | 0.26.6 | MIT OR Apache-2.0 |  |
+| tokio-util | 0.7.20 | MIT |  |
 | toml | 1.2.1+spec-1.1.0 | MIT OR Apache-2.0 | build |
 | toml_datetime | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | build |
 | toml_parser | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 | build |
 | toml_writer | 1.2.0+spec-1.1.0 | MIT OR Apache-2.0 | build |
 | tracing | 0.1.44 | MIT |  |
 | tracing-core | 0.1.36 | MIT |  |
+| try-lock | 0.2.5 | MIT |  |
 | uluru | 3.1.0 | MPL-2.0 |  |
 | unicode-ident | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |  |
 | untrusted | 0.9.0 | ISC |  |
-| ureq | 3.5.1 | MIT OR Apache-2.0 |  |
-| ureq-proto | 0.7.1 | MIT OR Apache-2.0 |  |
 | url | 2.5.8 | MIT OR Apache-2.0 |  |
 | usvg | 0.50.0 | Apache-2.0 OR MIT |  |
-| utf8-zero | 0.8.1 | MIT OR Apache-2.0 |  |
 | utf8_iter | 1.1.0 | Apache-2.0 OR MIT |  |
 | utf_types | 1.0.0 | Apache-2.0 OR MIT |  |
 | v8 | 152.2.0 | MIT |  |
@@ -402,6 +418,7 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | version_check | 0.9.5 | MIT/Apache-2.0 | build |
 | void | 1.0.2 | MIT |  |
 | walkdir | 2.5.0 | Unlicense/MIT | build |
+| want | 0.3.2 | MIT |  |
 | web_atoms | 0.3.0 | MIT OR Apache-2.0 |  |
 | webpki-roots | 1.0.12 | CDLA-Permissive-2.0 |  |
 | weezl | 0.1.12 | MIT OR Apache-2.0 |  |

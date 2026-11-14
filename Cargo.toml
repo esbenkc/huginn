@@ -73,11 +73,19 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 avif-parse = "2.1.0"
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
-# Networking
-# Without its gzip and brotli features: huginn-net reads each body to the end
-# and decodes it itself, so connections go back to the pool (see
-# crates/huginn-net/src/compression.rs).
-ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+# Networking: HTTP/1.1 and HTTP/2 (hyper, on one tokio worker thread) over
+# TLS (rustls with ring and the Mozilla roots), behind the blocking API in
+# crates/huginn-net/src/transport.rs. Bodies are decoded by huginn-net after
+# they are read (crates/huginn-net/src/compression.rs).
+hyper = { version = "1.8", default-features = false, features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1.47", default-features = false, features = ["rt-multi-thread", "net", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 url = "2.5"
 data-url = "0.3"
 # Public Suffix List compiled into code (no list parsed at run time): cookie
