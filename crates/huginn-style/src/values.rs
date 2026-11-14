@@ -281,6 +281,16 @@ pub enum Visibility {
     Collapse,
 }
 
+/// `pointer-events` (the HTML values; the SVG ones are Gecko only in Stylo).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum PointerEvents {
+    #[default]
+    Auto,
+    /// The box is never the target of pointer events; they go to what is
+    /// under it.
+    None,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum BorderStyle {
     #[default]

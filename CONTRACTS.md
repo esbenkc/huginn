@@ -221,7 +221,7 @@ CSS initial values with 16px serif, `ComputedStyle::inherit_from(&parent)`,
 
 | group | fields |
 |---|---|
-| box generation | `display: Display`, `position: Position`, `float: Float`, `clear: Clear`, `box_sizing: BoxSizing`, `inset: Edges<LengthPercentageAuto>`, `z_index: Option<i32>`, `overflow_x/overflow_y: Overflow`, `visibility: Visibility`, `opacity: f32` |
+| box generation | `display: Display`, `position: Position`, `float: Float`, `clear: Clear`, `box_sizing: BoxSizing`, `inset: Edges<LengthPercentageAuto>`, `z_index: Option<i32>`, `overflow_x/overflow_y: Overflow`, `visibility: Visibility`, `pointer_events: PointerEvents` (`Auto`, `None`; inherited), `opacity: f32` |
 | sizing | `width`, `height`, `min_width`, `min_height`, `max_width`, `max_height` (all `LengthPercentageAuto`; `Auto` = `none` for max-*), `aspect_ratio: Option<f32>` |
 | box model | `margin: Edges<LengthPercentageAuto>`, `padding: Edges<LengthPercentage>`, `border_width: Edges<f32>`, `border_style: Edges<BorderStyle>`, `border_color: Edges<Color>`, `border_radius: Corners<LengthPercentage>` |
 | background | `background_color: Color`, `background_image: Option<BackgroundImage>` (`Url(Arc<str>)` absolute, `LinearGradient(Arc<Gradient>)`, `RadialGradient(Arc<Gradient>)`; the topmost drawable layer), `background_repeat: BackgroundRepeat`, `background_size: BackgroundSize`, `background_position: (LengthPercentage, LengthPercentage)` (keywords resolved: `right 10px` = `Calc{px:-10, percent:100}`) |
@@ -244,7 +244,7 @@ Value types in `huginn_style::values` (re-exported at the crate root): `Color`,
 InlineFlex, Grid, InlineGrid, Table, InlineTable, TableRowGroup,
 TableHeaderGroup, TableFooterGroup, TableRow, TableCell, TableColumnGroup,
 TableColumn, TableCaption`), `Position`, `Float`, `Clear`, `BoxSizing`,
-`Overflow`, `Visibility`, `BorderStyle`, `FontStyle`, `LineHeight`,
+`Overflow`, `Visibility`, `PointerEvents`, `BorderStyle`, `FontStyle`, `LineHeight`,
 `TextAlign`, `TextDecorationLine`, `TextTransform`, `WhiteSpace`,
 `VerticalAlign`, `ListStyleType`, `ListStylePosition`, `FlexDirection`,
 `FlexWrap`, `Alignment`, `BackgroundImage`, `Gradient { repeating, shape:
@@ -337,6 +337,7 @@ pub struct LayoutBox {
     pub rect: Rect,                          // border box, absolute
     pub border: Edges<f32>, pub padding: Edges<f32>,   // used values (border-collapse may drop sides)
     pub scroll_size: Size,                   // scrolling area from the padding box origin (scrollWidth/Height)
+    pub scroll_offset: Option<(f32, f32)>,   // (left, top) of a scroll container, clamped; None otherwise (and for viewport overflow)
     pub background_image: Option<DecodedImage>,
     pub mask_image: Option<DecodedImage>,    // decoded mask-image URL, if it loaded
     pub parent: Option<BoxId>, pub first_child: Option<BoxId>, pub next_sibling: Option<BoxId>,
@@ -838,6 +839,7 @@ impl Tab {
     pub fn doc_to_window(&self, r: Rect) -> Rect;
     pub fn page_size(&self) -> (f32, f32);                   // viewport in document CSS px
     pub fn set_scroll(&mut self, y: f32);  pub fn scroll_by(&mut self, dy: f32);
+    pub fn wheel(&mut self, x: f32, y: f32, dy: f32);       // innermost scrollable container under the pointer, else the page
     pub fn set_zoom(&mut self, zoom: f32);
     pub fn redraw(&mut self);                                // overlays changed
     pub fn request(&mut self, r: Request);                   // run by the window after the event
@@ -897,6 +899,8 @@ in-page modules. Text positions are byte offsets into the page's
 // interact/hit.rs: the innermost node at a document point: last box that
 // contains it, then the innermost inline fragment of its IFC (inline links).
 pub fn node_at(tree: &LayoutTree, x: f32, y: f32) -> Option<NodeId>;
+// The box painted on top at a point; `pointer-events: none` boxes let it through.
+pub fn topmost_box(tree: &LayoutTree, x: f32, y: f32) -> Option<BoxId>;
 // interact/focus.rs: sequential focus order (tabindex > 0, then tree order;
 // rendered, not disabled/inert). None after the last: focus leaves the page.
 pub fn next_focusable(doc: &Document, styles: &StyleMap, from: Option<NodeId>, backward: bool) -> Option<NodeId>;

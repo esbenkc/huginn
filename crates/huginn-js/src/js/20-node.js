@@ -235,8 +235,8 @@ const NODE_CONSTS = {
   DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
 };
 for (const k in NODE_CONSTS) {
-  defProp(Node, k, { value: NODE_CONSTS[k] });
-  defProp(Node.prototype, k, { value: NODE_CONSTS[k] });
+  defProp(Node, k, { value: NODE_CONSTS[k], enumerable: true });
+  defProp(Node.prototype, k, { value: NODE_CONSTS[k], enumerable: true });
 }
 expose(Node);
 

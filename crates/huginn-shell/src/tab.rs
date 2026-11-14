@@ -844,6 +844,24 @@ impl Tab {
         self.set_scroll(self.scroll + dy);
     }
 
+    /// A wheel turn of `dy` with the pointer at window point (`x`, `y`). Like
+    /// Chrome's scroll chaining: the innermost scroll container under the
+    /// pointer that the user may scroll (`overflow-y: auto` or `scroll`) and
+    /// that can still move that way scrolls (on the engine thread, which
+    /// fires `scroll` and lays out again); otherwise the page does.
+    pub fn wheel(&mut self, x: f32, y: f32, dy: f32) {
+        if y >= PAGE_TOP
+            && let Some(view) = &self.view
+        {
+            let (doc_x, doc_y) = self.to_doc(x, y);
+            if let Some((node, max)) = inner_scroller(&view.tree, doc_x, doc_y, dy) {
+                self.input(live::PageInput::Scroll { node, dy, max });
+                return;
+            }
+        }
+        self.scroll_by(dy);
+    }
+
     pub fn set_scroll(&mut self, y: f32) {
         let y = y.clamp(0.0, self.max_scroll());
         if y != self.scroll {
@@ -1075,6 +1093,28 @@ pub(crate) fn same_document(a: &Url, b: &Url) -> bool {
         u
     };
     strip(a) == strip(b)
+}
+
+/// For a wheel turn of `dy` at document point (`x`, `y`): the innermost
+/// user-scrollable container on the box path under the point that can still
+/// move by `dy`, and its largest scroll offset.
+fn inner_scroller(tree: &LayoutTree, x: f32, y: f32, dy: f32) -> Option<(NodeId, f32)> {
+    use huginn_style::Overflow::{Auto, Scroll};
+    let mut cur = interact::hit::topmost_box(tree, x, y);
+    while let Some(id) = cur {
+        let b = tree.get(id);
+        if let (Some(node), Some((_, top))) = (b.node, b.scroll_offset)
+            && matches!(b.style.overflow_y, Auto | Scroll)
+        {
+            let max = b.scroll_size.height - b.padding_rect().height;
+            // Half a pixel of slack: offsets come from float layout.
+            if (dy > 0.0 && top < max - 0.5) || (dy < 0.0 && top > 0.5) {
+                return Some((node, max));
+            }
+        }
+        cur = b.parent;
+    }
+    None
 }
 
 #[cfg(test)]

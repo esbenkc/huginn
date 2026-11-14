@@ -168,6 +168,31 @@ fn set_interval_runs_in_real_time() {
 }
 
 #[test]
+fn wheel_scrolls_the_container_under_the_pointer_then_the_page() {
+    // #box: a 300x200 `overflow: auto` box at (0, 0) with 1000 px of content,
+    // under a full-window `pointer-events: none` layer. The page is 2000 px.
+    let s = run(
+        &page("scroll.html"),
+        "wait; move 100 180; scroll 300; wait; state; scroll 5000; wait; state; \
+         scroll 100; wait; state",
+    );
+    assert_eq!(
+        title(&s[0]),
+        "scrolled 300",
+        "the box scrolls, not the page"
+    );
+    assert_eq!(s[0]["scroll"].as_f64(), Some(0.0));
+    assert_eq!(
+        title(&s[1]),
+        "scrolled 800",
+        "clamped to scrollHeight - clientHeight"
+    );
+    // At its end the box cannot move: the page scrolls (scroll chaining).
+    assert_eq!(title(&s[2]), "scrolled 800");
+    assert_eq!(s[2]["scroll"].as_f64(), Some(100.0));
+}
+
+#[test]
 fn post_form_sends_its_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

@@ -407,7 +407,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 };
                 if let Some(b) = self.session.window_mut(key) {
-                    b.scroll_by(dy);
+                    b.wheel(dy);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {

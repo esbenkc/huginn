@@ -41,6 +41,13 @@ pub enum PageInput {
     },
     /// The pointer left the page area.
     Leave,
+    /// A wheel turn over a scroll container (`Tab::wheel` picked it):
+    /// scroll it by `dy` CSS px, to at most `max`, and fire `scroll` at it.
+    Scroll {
+        node: NodeId,
+        dy: f32,
+        max: f32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -168,8 +175,10 @@ pub struct LivePage {
     hover: Option<NodeId>,
     pressed: Option<NodeId>,
     field: Option<Field>,
-    /// Document generation and interaction state of the tree on screen.
+    /// Document generation, scroll generation and interaction state of the
+    /// tree on screen.
     shown_generation: u64,
+    shown_scroll: u64,
     shown_state: InteractionState,
     status: Status,
     /// Image URLs fetched after load (failures are not retried).
@@ -201,6 +210,7 @@ impl LivePage {
             pressed: None,
             field: None,
             shown_generation: page.doc.generation(),
+            shown_scroll: page.doc.scroll_generation(),
             shown_state: page.doc.interaction().clone(),
             status: Status::default(),
             tried: HashSet::new(),
@@ -320,6 +330,17 @@ impl LivePage {
             }
             PageInput::Leave => {
                 me.set_hover(sink, None, None);
+                Reply::default()
+            }
+            PageInput::Scroll { node, dy, max } => {
+                let doc = sink.document();
+                let (x, y) = doc.scroll_offset(node);
+                let to = (y + dy).clamp(0.0, max.max(0.0));
+                if to != y {
+                    doc.set_scroll_offset(node, x, to);
+                    // CSSOM View: `scroll` at the element, not bubbling.
+                    sink.fire(EventTarget::Node(node), &Event::new("scroll", false, false));
+                }
                 Reply::default()
             }
         });
@@ -446,7 +467,19 @@ impl LivePage {
                 title: Some(crate::engine::title(&page.doc)),
             });
             self.shown_generation = page.doc.generation();
+        } else if page.doc.scroll_generation() != self.shown_scroll {
+            // Only scroll offsets changed (the wheel, or `scrollTop` from a
+            // script): the styles hold, lay out again.
+            let _span = crate::perf::span("update");
+            let tree = page.layout(layout, viewport);
+            notify(EngineEvent::Relaid {
+                generation,
+                tree,
+                links: None,
+                title: None,
+            });
         }
+        self.shown_scroll = page.doc.scroll_generation();
         self.shown_state = state;
         if let Some(node) = out.open_select {
             let opts = forms::options(&page.doc, node);

@@ -605,8 +605,8 @@ class XMLHttpRequest extends EventTarget {
   }
 }
 for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {
-  defProp(XMLHttpRequest, k, { value: v });
-  defProp(XMLHttpRequest.prototype, k, { value: v });
+  defProp(XMLHttpRequest, k, { value: v, enumerable: true });
+  defProp(XMLHttpRequest.prototype, k, { value: v, enumerable: true });
 }
 addHandlerProps(XMLHttpRequest.prototype, ['readystatechange', 'loadstart', 'loadend', 'progress', 'timeout']);
 expose(XMLHttpRequest);
@@ -631,7 +631,7 @@ class WebSocket extends EventTarget {
   send() {}
   close() { this.readyState = 3; }
 }
-for (const [k, v] of [['CONNECTING', 0], ['OPEN', 1], ['CLOSING', 2], ['CLOSED', 3]]) defProp(WebSocket, k, { value: v });
+for (const [k, v] of [['CONNECTING', 0], ['OPEN', 1], ['CLOSING', 2], ['CLOSED', 3]]) defProp(WebSocket, k, { value: v, enumerable: true });
 addHandlerProps(WebSocket.prototype, ['open', 'message', 'close']);
 expose(WebSocket);
 const CloseEvent = eventClass('CloseEvent', Event, { code: 0, reason: '', wasClean: false });

@@ -103,6 +103,9 @@ pub(crate) struct State {
     /// Compression streams in progress, by the id the prelude holds.
     codecs: HashMap<u32, codec::Codec>,
     next_codec: u32,
+    /// The watchdog's clock; native operations stop it while they wait for
+    /// the network.
+    clock: WatchClock,
 }
 
 struct Hooks {
@@ -113,7 +116,7 @@ struct Hooks {
 }
 
 impl State {
-    fn new(options: EngineOptions) -> State {
+    fn new(options: EngineOptions, clock: WatchClock) -> State {
         State {
             cx: std::ptr::null_mut(),
             options,
@@ -133,6 +136,7 @@ impl State {
             clicking: Vec::new(),
             codecs: HashMap::new(),
             next_codec: 0,
+            clock,
         }
     }
 
@@ -155,9 +159,16 @@ impl State {
 
 pub(crate) type SharedState = Rc<RefCell<State>>;
 
+/// Run `wait`, a blocking wait for the network, with the watchdog stopped
+/// (see [`WatchClock::paused`]).
+fn network_wait<R>(state: &SharedState, wait: impl FnOnce() -> R) -> R {
+    let clock = state.borrow().clock.clone();
+    clock.paused(wait)
+}
+
 /// Terminates the running script when an engine call passes its budget.
 struct Watchdog {
-    shared: Arc<(Mutex<WatchState>, Condvar)>,
+    clock: WatchClock,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -166,16 +177,55 @@ struct WatchState {
     quit: bool,
 }
 
+/// The watchdog's deadline, shared by the engine thread and the watchdog
+/// thread.
+#[derive(Clone)]
+struct WatchClock(Arc<(Mutex<WatchState>, Condvar)>);
+
+impl WatchClock {
+    fn set(&self, deadline: Option<Instant>) {
+        let (lock, cv) = &*self.0;
+        if let Ok(mut st) = lock.lock() {
+            st.deadline = deadline;
+            cv.notify_one();
+        }
+    }
+
+    /// Run `wait` with the clock stopped. Fetches are synchronous, and time
+    /// the thread waits for the network is not script time: a task that
+    /// makes several requests must not be terminated in the middle of its
+    /// script.
+    fn paused<R>(&self, wait: impl FnOnce() -> R) -> R {
+        let left = {
+            let (lock, cv) = &*self.0;
+            let Ok(mut st) = lock.lock() else {
+                return wait();
+            };
+            let left = st
+                .deadline
+                .take()
+                .map(|d| d.saturating_duration_since(Instant::now()));
+            cv.notify_one();
+            left
+        };
+        let r = wait();
+        if let Some(left) = left {
+            self.set(Some(Instant::now() + left));
+        }
+        r
+    }
+}
+
 impl Watchdog {
     fn new(handle: v8::IsolateHandle) -> Watchdog {
-        let shared = Arc::new((
+        let clock = WatchClock(Arc::new((
             Mutex::new(WatchState {
                 deadline: None,
                 quit: false,
             }),
             Condvar::new(),
-        ));
-        let s = shared.clone();
+        )));
+        let s = clock.0.clone();
         let thread = std::thread::Builder::new()
             .name("huginn-js-watchdog".into())
             .stack_size(64 * 1024)
@@ -208,22 +258,18 @@ impl Watchdog {
                 }
             })
             .ok();
-        Watchdog { shared, thread }
+        Watchdog { clock, thread }
     }
 
     fn set(&self, deadline: Option<Instant>) {
-        let (lock, cv) = &*self.shared;
-        if let Ok(mut st) = lock.lock() {
-            st.deadline = deadline;
-            cv.notify_one();
-        }
+        self.clock.set(deadline);
     }
 }
 
 impl Drop for Watchdog {
     fn drop(&mut self) {
         {
-            let (lock, cv) = &*self.shared;
+            let (lock, cv) = &*self.clock.0;
             if let Ok(mut st) = lock.lock() {
                 st.quit = true;
                 cv.notify_one();
@@ -338,13 +384,13 @@ impl Runtime {
         // Scripts look elements up by id often; walking the tree each time
         // is quadratic on script-heavy pages.
         cx.document.index_ids();
-        let mut state = State::new(options);
+        let watchdog = Watchdog::new(handle.clone());
+        let mut state = State::new(options, watchdog.clock.clone());
         for n in cx.document.elements_by_local_name(&local_name!("script")) {
             state.started.insert(n);
         }
         let state: SharedState = Rc::new(RefCell::new(state));
         isolate.set_slot(state.clone());
-        let watchdog = Watchdog::new(handle.clone());
 
         let context = {
             v8::scope!(let scope, &mut isolate);
@@ -594,7 +640,19 @@ impl ScriptEngine for V8Engine {
                 )
             };
             let at = v8::Number::new(scope, at).into();
-            while ran < MAX_TIMERS_PER_ROUND {
+            // Each task gets the whole budget, so a task is not terminated
+            // because earlier ones in the round were slow. A round starts no
+            // new task once the budget is spent (it runs at least one); the
+            // rest stay due for the next call, and the shell can lay out in
+            // between.
+            let (budget, round_end) = {
+                let st = state.borrow();
+                let budget = Duration::from_millis(st.options.call_budget_ms);
+                (budget, st.call_start + budget)
+            };
+            let mut timers = 0;
+            while ran < MAX_TIMERS_PER_ROUND && (timers == 0 || Instant::now() < round_end) {
+                state.borrow().clock.set(Some(Instant::now() + budget));
                 v8::tc_scope!(let tc, scope);
                 let Some(r) = f.call(tc, recv.into(), &[at]) else {
                     let msg = exception_message(tc);
@@ -608,6 +666,7 @@ impl ScriptEngine for V8Engine {
                     break;
                 }
                 ran += 1;
+                timers += 1;
                 tc.perform_microtask_checkpoint();
             }
             Ok(ran)

@@ -1841,13 +1841,7 @@ const lib = {
 for (const k of STREAM_NAMES) {
   const C = lib[k];
   tag(C, k);
-  // Interface members are enumerable, like WebIDL attributes and operations.
-  for (const m of Object.getOwnPropertyNames(C.prototype)) {
-    if (m === 'constructor') continue;
-    const d = Object.getOwnPropertyDescriptor(C.prototype, m);
-    d.enumerable = true;
-    defProp(C.prototype, m, d);
-  }
+  idlEnumerable(C);
 }
 return lib;
 }

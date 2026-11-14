@@ -181,7 +181,7 @@ fn fetch_module(loader: &huginn_net::Loader, url: &Url) -> Result<(String, Strin
 
 fn fetch_source(scope: &v8::PinScope<'_, '_>, url: &Url) -> Result<(String, String), String> {
     let cx = ops::host(scope).ok_or("no host context")?;
-    fetch_module(cx.loader, url)
+    super::network_wait(&ops::state(scope), || fetch_module(cx.loader, url))
 }
 
 /// Fetch `urls` in parallel; results keep their order.
@@ -190,7 +190,9 @@ fn fetch_all(scope: &v8::PinScope<'_, '_>, urls: &[Url]) -> Vec<Result<(String, 
         return urls.iter().map(|_| Err("no host context".into())).collect();
     };
     let loader = cx.loader;
-    loader.map_parallel(urls, |u| fetch_module(loader, u))
+    super::network_wait(&ops::state(scope), || {
+        loader.map_parallel(urls, |u| fetch_module(loader, u))
+    })
 }
 
 /// Compile `source` (whose imports resolve against `base`) and fetch and

@@ -15,7 +15,7 @@ class CSSRule {
     return styleProxy(t);
   }
 }
-for (const [k, v] of [['STYLE_RULE', 1], ['MEDIA_RULE', 4], ['FONT_FACE_RULE', 5], ['KEYFRAMES_RULE', 7]]) defProp(CSSRule, k, { value: v });
+for (const [k, v] of [['STYLE_RULE', 1], ['MEDIA_RULE', 4], ['FONT_FACE_RULE', 5], ['KEYFRAMES_RULE', 7]]) defProp(CSSRule, k, { value: v, enumerable: true });
 expose(CSSRule);
 expose(class CSSStyleRule extends CSSRule {}, 'CSSStyleRule');
 expose(class CSSMediaRule extends CSSRule {}, 'CSSMediaRule');
