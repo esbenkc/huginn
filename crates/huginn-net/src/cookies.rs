@@ -741,8 +741,10 @@ fn parse_set_cookie(s: &str, now: i64) -> Option<Parsed> {
     Some(p)
 }
 
-/// RFC 6265bis 5.1.1 cookie-date: Unix seconds, or `None` if invalid.
-fn parse_cookie_date(s: &str) -> Option<i64> {
+/// RFC 6265bis 5.1.1 cookie-date: Unix seconds, or `None` if invalid. It
+/// also reads all three HTTP-date forms (IMF-fixdate, RFC 850, asctime),
+/// so the HTTP cache uses it for `Date`, `Expires` and `Last-Modified`.
+pub(crate) fn parse_cookie_date(s: &str) -> Option<i64> {
     let delim = |c: char| matches!(c, '\t' | ' '..='/' | ';'..='@' | '['..='`' | '{'..='~');
     let (mut time, mut day, mut month, mut year) = (None, None, None, None);
     for tok in s.split(delim).filter(|t| !t.is_empty()) {

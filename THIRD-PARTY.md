@@ -106,9 +106,8 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 |---|---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 |  |
 | aho-corasick | 1.1.5 | Unlicense OR MIT | build |
-| alloc-no-stdlib | 2.0.4 | BSD-3-Clause |  |
 | alloc-no-stdlib | 3.0.0 | BSD-3-Clause |  |
-| alloc-stdlib | 0.2.4 | BSD-3-Clause |  |
+| alloc-stdlib | 0.3.0 | BSD-3-Clause |  |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 |  |
 | app_units | 0.7.8 | MPL-2.0 |  |
 | arrayref | 0.3.9 | BSD-2-Clause |  |
@@ -125,7 +124,6 @@ dependencies); list them with `cargo metadata --filter-platform x86_64-unknown-l
 | bitflags | 2.13.2 | MIT OR Apache-2.0 |  |
 | bitreader | 0.3.11 | MIT OR Apache-2.0 |  |
 | block2 | 0.5.1 | MIT |  |
-| brotli-decompressor | 5.0.3 | BSD-3-Clause/MIT |  |
 | brotli-decompressor | 6.3.1 | BSD-3-Clause/MIT |  |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT |  |
 | bytemuck_derive | 1.12.1 | Zlib OR Apache-2.0 OR MIT |  |

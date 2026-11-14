@@ -280,6 +280,25 @@ pub fn profile_dir() -> Option<PathBuf> {
         .map(|d| d.join("huginn"))
 }
 
+/// Where the HTTP cache lives: `$HUGINN_PROFILE_DIR/Cache`, else the
+/// user's cache directory: `~/Library/Caches/Huginn` on macOS and
+/// `$XDG_CACHE_HOME/huginn` (`~/.cache/huginn`) elsewhere. The system may
+/// delete it at any time, and backups skip it.
+pub fn cache_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("HUGINN_PROFILE_DIR") {
+        return Some(PathBuf::from(d).join("Cache"));
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home.map(|h| h.join("Library/Caches/Huginn"));
+    }
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
+        .or(home.map(|h| h.join(".cache")))
+        .map(|d| d.join("huginn"))
+}
+
 /// The bookmarks file: one bookmark per line, `url<TAB>title`.
 pub fn load_bookmarks(path: &std::path::Path) -> Vec<Bookmark> {
     let Ok(text) = std::fs::read_to_string(path) else {

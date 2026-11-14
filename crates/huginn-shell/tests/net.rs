@@ -408,6 +408,85 @@ fn a_web_page_cannot_load_local_files_but_a_local_page_can() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn revisits_use_the_http_cache_and_a_hard_reload_skips_it() {
+    let (port, log) = serve(|r| match r.path.as_str() {
+        "/" if r.header("if-none-match") == "\"p1\"" => ("304 Not Modified".into(), String::new()),
+        "/" => html(
+            "Cache-Control: no-cache\nETag: \"p1\"",
+            "<link rel=stylesheet href=/s.css><title>Cached</title><p>hi",
+        ),
+        "/s.css" => (
+            "200 OK\nContent-Type: text/css\nCache-Control: max-age=600".into(),
+            "p { color: red }".into(),
+        ),
+        _ => ("404 Not Found".into(), String::new()),
+    });
+    let url = format!("http://127.0.0.1:{port}/");
+    let blank = "key cmd+l; type about:blank; key enter; wait";
+    let s = run(
+        &url,
+        &format!(
+            "wait; {blank}; key cmd+l; type {url}; key enter; wait; state; \
+             key cmd+r; wait; state; key cmd+shift+r; wait; state"
+        ),
+        &[],
+    );
+    assert!(s.iter().all(|s| title(s) == "Cached"), "{s:?}");
+    let log = log.lock().unwrap();
+    let get = |path: &str| log.iter().filter(|r| r.path == path).collect::<Vec<_>>();
+    // The stylesheet: once, then from the cache on the revisit and the
+    // reload; the hard reload fetches it again.
+    let css = get("/s.css");
+    assert_eq!(css.len(), 2);
+    assert_eq!(css[1].header("cache-control"), "no-cache");
+    assert_eq!(css[1].header("pragma"), "no-cache");
+    // The document (`no-cache`): revalidated on the revisit and the reload,
+    // fetched whole on the hard reload.
+    let doc = get("/");
+    assert_eq!(doc.len(), 4);
+    assert_eq!(doc[0].header("if-none-match"), "");
+    assert_eq!(doc[1].header("if-none-match"), "\"p1\"");
+    assert_eq!(doc[2].header("if-none-match"), "\"p1\"");
+    assert_eq!(doc[2].header("cache-control"), "max-age=0");
+    assert_eq!(doc[3].header("if-none-match"), "");
+}
+
+#[test]
+fn lazy_images_load_after_the_first_paint_and_keep_the_restored_scroll() {
+    let (port, log) = serve(|r| match r.path.as_str() {
+        "/" => html(
+            "",
+            "<title>Lazy</title><p>top<p><img loading=lazy src=/tall.svg>",
+        ),
+        "/tall.svg" => (
+            "200 OK\nContent-Type: image/svg+xml\nCache-Control: max-age=600".into(),
+            "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='3000'/>".into(),
+        ),
+        _ => ("404 Not Found".into(), String::new()),
+    });
+    let s = run(
+        &format!("http://127.0.0.1:{port}/"),
+        "wait; state; scroll 2500; state; key cmd+r; wait; state",
+        &[],
+    );
+    // The window still loads every lazy image, so the page is tall.
+    assert!(s[0]["max_scroll"].as_f64().unwrap() > 2500.0, "{}", s[0]);
+    assert_eq!(s[1]["scroll"], 2500.0);
+    // The reload shows the page before the image makes it tall; the
+    // scroll position comes back once it is.
+    assert_eq!(s[2]["scroll"], 2500.0, "{}", s[2]);
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path == "/tall.svg")
+            .count(),
+        1,
+        "the reload takes the image from the cache"
+    );
+}
+
 fn huginn_net_file_url(path: &std::path::Path) -> String {
     format!("file://{}", path.to_str().expect("UTF-8 path"))
 }

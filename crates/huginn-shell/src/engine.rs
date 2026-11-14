@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, NodeId, local_name, ns};
 use huginn_layout::{LayoutEngine, LayoutTree};
-use huginn_net::{Client, CookieJar, Loader, ReferrerPolicy, Url};
+use huginn_net::{Client, LoadKind, Loader, Network, ReferrerPolicy, Url};
 use huginn_style::Viewport;
 
 use crate::input::Modifiers;
@@ -32,6 +32,7 @@ pub enum Command {
     /// Load `url` and lay it out for `viewport`. `generation` tags the answer.
     /// `html`: the document itself (internal `huginn:` pages), shown at `url`.
     /// `initiator`: the page that started the navigation (`None`: the user).
+    /// `kind`: how the load uses the HTTP cache (reload, back and forward).
     Load {
         seq: u64,
         generation: u64,
@@ -40,6 +41,7 @@ pub enum Command {
         post: Option<PostData>,
         html: Option<String>,
         initiator: Option<Client>,
+        kind: LoadKind,
     },
     /// Restyle and lay out the current page for a new viewport.
     Resize {
@@ -194,16 +196,16 @@ pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
 /// Start one tab's engine thread. It ends when the returned sender is
 /// dropped (the tab closed or was discarded), freeing the page.
-/// `js`: run page scripts (when built with the `v8` feature). `cookies`:
-/// the jar of the tab's profile (the private one in private windows).
-pub fn spawn(js: bool, cookies: Arc<CookieJar>, notify: Notify) -> Sender<Command> {
+/// `js`: run page scripts (when built with the `v8` feature). `net`: the
+/// network of the tab's profile (the private one in private windows).
+pub fn spawn(js: bool, net: Arc<Network>, notify: Notify) -> Sender<Command> {
     let (tx, rx) = channel();
     // Style and layout recurse on deep DOMs: same big stack as `render`. Only
     // touched stack pages are committed, so idle tabs cost no stack memory.
     std::thread::Builder::new()
         .name("engine".into())
         .stack_size(256 << 20)
-        .spawn(move || run(&rx, js, &cookies, &*notify))
+        .spawn(move || run(&rx, js, &net, &*notify))
         .expect("spawn engine thread");
     tx
 }
@@ -220,7 +222,7 @@ pub(crate) struct Current {
     pub live: LivePage,
 }
 
-fn run(rx: &Receiver<Command>, js: bool, cookies: &Arc<CookieJar>, notify: &dyn Fn(EngineEvent)) {
+fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(EngineEvent)) {
     let mut current: Option<Current> = None;
     // Whether the tab is the active one in its window.
     let mut visible = true;
@@ -273,6 +275,7 @@ fn run(rx: &Receiver<Command>, js: bool, cookies: &Arc<CookieJar>, notify: &dyn 
                     post,
                     html,
                     initiator,
+                    kind,
                     ..
                 } => {
                     // Drop the old page first: lower peak memory.
@@ -285,7 +288,8 @@ fn run(rx: &Receiver<Command>, js: bool, cookies: &Arc<CookieJar>, notify: &dyn 
                         post,
                         html,
                         initiator.as_ref(),
-                        cookies,
+                        kind,
+                        net,
                     );
                     notify(EngineEvent::Loaded(Box::new(loaded)));
                     cur.live.set_visible(&mut cur.page, visible);
@@ -296,10 +300,28 @@ fn run(rx: &Receiver<Command>, js: bool, cookies: &Arc<CookieJar>, notify: &dyn 
                         cur.generation,
                         notify,
                     );
+                    // `loading=lazy` images after the page is on screen, as
+                    // in Chrome (on bbc.com they held up the first paint by
+                    // seconds); then the page is laid out again.
+                    if cur.page.load_all_lazy(cur.live.loader()) {
+                        let tree = cur.page.layout(&mut cur.layout, cur.viewport);
+                        notify(EngineEvent::Relaid {
+                            generation: cur.generation,
+                            tree,
+                            links: None,
+                            title: None,
+                        });
+                    }
+                    // The load is done: from now on the page's requests use
+                    // the cache as usual, also after a hard reload.
+                    cur.live.loader().set_load_kind(LoadKind::Normal);
                     current = Some(cur);
                     // Off the UI thread, at most every 30 s; the session
                     // saves the rest when it ends.
-                    if let Err(e) = cookies.save_unless_saved_within(Duration::from_secs(30)) {
+                    if let Err(e) = net
+                        .cookies()
+                        .save_unless_saved_within(Duration::from_secs(30))
+                    {
                         eprintln!("huginn: cannot save cookies: {e}");
                     }
                 }
@@ -379,12 +401,15 @@ fn load(
     post: Option<PostData>,
     html: Option<String>,
     initiator: Option<&Client>,
-    cookies: &Arc<CookieJar>,
+    kind: LoadKind,
+    net: &Arc<Network>,
 ) -> (Current, Loaded) {
     let t = Instant::now();
-    // One loader per page: its cache dies after the load; scripts keep
-    // fetching through it (XMLHttpRequest, fetch) while the page lives.
-    let loader = Loader::with_cookies(cookies.clone());
+    // One loader per page, on the profile's network (idle connections and
+    // the HTTP cache outlive the page); scripts keep fetching through it
+    // (XMLHttpRequest, fetch) while the page lives.
+    let loader = Loader::with_network(net.clone());
+    loader.set_load_kind(kind);
     let internal;
     let (mut page, error) = {
         // Internal schemes: `huginn:` pages come with their HTML;
@@ -417,10 +442,7 @@ fn load(
             true,
             t,
         ) {
-            Ok(mut page) => {
-                page.load_all_lazy(&loader);
-                (page, failed)
-            }
+            Ok(page) => (page, failed),
             Err(e) => {
                 let page =
                     pipeline::load(&loader, &data_url(&error_page(url, &e)), viewport, false, t)

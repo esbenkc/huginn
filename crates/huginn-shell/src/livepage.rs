@@ -208,6 +208,11 @@ struct Outcome {
 }
 
 impl LivePage {
+    /// The page's loader (scripts' requests, images added later).
+    pub fn loader(&self) -> &Loader {
+        &self.loader
+    }
+
     pub fn new(loader: Loader, start: Instant, page: &mut Page) -> LivePage {
         let inline_handlers = has_inline_handlers(&page.doc);
         let scripted =

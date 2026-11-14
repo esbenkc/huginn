@@ -25,7 +25,7 @@ use std::fmt;
 use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
 
@@ -34,16 +34,21 @@ pub use vello_common::pixmap::Pixmap;
 
 #[cfg(feature = "avif")]
 mod avif;
+mod cache;
 mod charset;
+mod compression;
 mod cookies;
 mod cors;
 mod font;
 mod media;
+mod netlog;
 mod referrer;
 mod srcset;
 mod svg;
 pub mod ua;
 
+use cache::CacheMode;
+pub use cache::{HttpCache, LoadKind};
 pub use charset::{decode_html, decode_text};
 pub use cookies::{CookieContext, CookieJar, SameSite, registrable_domain, same_site, site_key};
 pub use font::{FontFormat, decode_font, font_format, size_adjust_font};
@@ -286,25 +291,127 @@ const MAX_BODY: u64 = 64 << 20;
 const MAX_PARALLEL: usize = 6;
 /// Redirects followed per request (Fetch's limit).
 const MAX_REDIRECTS: usize = 20;
+/// Idle connections kept per host (one for each parallel fetch) and in all.
+const IDLE_PER_HOST: usize = MAX_PARALLEL;
+const IDLE_TOTAL: usize = 32;
+/// How long an idle connection is kept: Chrome's limit for sockets that
+/// were used once. A connection the server closed is found and skipped.
+const IDLE_AGE: Duration = Duration::from_secs(300);
+/// Bodies of redirects and errors up to this size are read to the end,
+/// so that their connection can carry the next request.
+const DRAIN_MAX: u64 = 64 << 10;
 
-/// Fetches resources and caches them in memory for the life of the loader.
-///
-/// `Loader` is `Sync`: share one per page (or per process) by reference.
-/// Requests carry the cookies of its [`CookieJar`] and the `Origin` and
-/// `Referer` of its [`Client`], the document it fetches for.
-pub struct Loader {
+/// What the loaders of one profile share, like Chrome's network context:
+/// idle connections (6 per host, for up to 5 minutes, with their TLS
+/// sessions for resumption), resolved host names (for 1 minute), the
+/// [`HttpCache`] and the [`CookieJar`]. All tabs of a profile share one
+/// `Network`; each page has its own [`Loader`] on top of it.
+pub struct Network {
     agent: ureq::Agent,
-    /// Same agent, but its resolver drops loopback and private addresses:
+    /// Same, but its resolver drops loopback and private addresses:
     /// subresources and script requests of a public page (Local Network
     /// Access). Made on first use.
     public_agent: std::sync::OnceLock<ureq::Agent>,
     config: ureq::config::Config,
     loopback_only: bool,
-    cache: Mutex<HashMap<Url, Arc<Resource>>>,
+    dns: Arc<DnsCache>,
     cookies: Arc<CookieJar>,
+    cache: HttpCache,
+}
+
+impl Network {
+    /// A network with this cookie jar and HTTP cache.
+    /// `HUGINN_NET_LOOPBACK_ONLY=1` in the environment makes it reach only
+    /// loopback, like [`Loader::loopback_only`]. The benchmark sets it so
+    /// Huginn is offline there like Chrome and Ladybird.
+    pub fn new(cookies: Arc<CookieJar>, cache: HttpCache) -> Arc<Network> {
+        Network::build(
+            std::env::var_os("HUGINN_NET_LOOPBACK_ONLY").is_some_and(|v| v == "1"),
+            cookies,
+            cache,
+        )
+    }
+
+    fn build(loopback_only: bool, cookies: Arc<CookieJar>, cache: HttpCache) -> Arc<Network> {
+        let config = ureq::Agent::config_builder()
+            .user_agent(ua::USER_AGENT)
+            // Bodies are decoded here, after they are read to the end.
+            .accept_encoding(compression::ACCEPT_ENCODING)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            // Redirects are followed here, hop by hop, for cookies and CORS.
+            .max_redirects(0)
+            .allow_non_standard_methods(true)
+            .max_idle_connections(IDLE_TOTAL)
+            .max_idle_connections_per_host(IDLE_PER_HOST)
+            .max_idle_age(IDLE_AGE)
+            .build();
+        let dns = Arc::new(DnsCache::default());
+        let agent = ureq::Agent::with_parts(
+            config.clone(),
+            netlog::TimedConnector::default(),
+            HostResolver {
+                loopback_only,
+                dns: dns.clone(),
+                ..HostResolver::default()
+            },
+        );
+        Arc::new(Network {
+            agent,
+            public_agent: std::sync::OnceLock::new(),
+            config,
+            loopback_only,
+            dns,
+            cookies,
+            cache,
+        })
+    }
+
+    /// The cookie jar.
+    pub fn cookies(&self) -> &Arc<CookieJar> {
+        &self.cookies
+    }
+
+    /// The HTTP cache.
+    pub fn cache(&self) -> &HttpCache {
+        &self.cache
+    }
+
+    /// The agent for loopback and private addresses too, or the one for
+    /// public addresses only.
+    fn agent(&self, public_only: bool) -> &ureq::Agent {
+        if !public_only || self.loopback_only {
+            return &self.agent;
+        }
+        self.public_agent.get_or_init(|| {
+            ureq::Agent::with_parts(
+                self.config.clone(),
+                netlog::TimedConnector::default(),
+                HostResolver {
+                    public_only: true,
+                    dns: self.dns.clone(),
+                    ..HostResolver::default()
+                },
+            )
+        })
+    }
+}
+
+/// Fetches resources for one document, through its profile's [`Network`].
+///
+/// `Loader` is `Sync`: share one per page by reference. Requests carry the
+/// cookies of the network's [`CookieJar`] and the `Origin` and `Referer`
+/// of its [`Client`], the document it fetches for. It also keeps responses
+/// in memory, so a stylesheet used twice (`@import`) is fetched once, until
+/// [`Loader::clear_cache`].
+pub struct Loader {
+    net: Arc<Network>,
+    cache: Mutex<HashMap<Url, Arc<Resource>>>,
     client: RwLock<Option<Client>>,
     /// Whether the client document is on a public address (cached).
     client_public: parking_lot::Mutex<Option<bool>>,
+    /// How this load uses the HTTP cache.
+    load: parking_lot::Mutex<LoadKind>,
 }
 
 impl Default for Loader {
@@ -328,6 +435,7 @@ struct Request<'a> {
     client: Option<Client>,
     /// Return non-2xx responses (with their body) instead of an error.
     any_status: bool,
+    cache: CacheMode,
 }
 
 /// What a request's chain of URLs has been relative to its client, for `Sec-Fetch-Site`.
@@ -339,56 +447,36 @@ enum SiteRelation {
 }
 
 impl Loader {
-    /// A loader with its own in-memory cookie jar. `HUGINN_NET_LOOPBACK_ONLY=1`
-    /// in the environment makes it [`Loader::loopback_only`]. The benchmark
-    /// sets it so Huginn is offline there like Chrome and Ladybird.
+    /// A loader with a network of its own: an in-memory cookie jar and no
+    /// HTTP cache (`huginn render`, tests). `HUGINN_NET_LOOPBACK_ONLY=1`
+    /// makes it [`Loader::loopback_only`].
     pub fn new() -> Loader {
-        Loader::with_cookies(Arc::new(CookieJar::in_memory()))
+        Loader::with_network(Network::new(
+            Arc::new(CookieJar::in_memory()),
+            HttpCache::off(),
+        ))
     }
 
-    /// A loader that stores and sends cookies in `jar` (shared by the tabs
-    /// of a profile).
-    pub fn with_cookies(jar: Arc<CookieJar>) -> Loader {
-        Loader::build(
-            std::env::var_os("HUGINN_NET_LOOPBACK_ONLY").is_some_and(|v| v == "1"),
-            jar,
-        )
+    /// A loader on a profile's network (shared by the tabs of the profile).
+    pub fn with_network(net: Arc<Network>) -> Loader {
+        Loader {
+            net,
+            cache: Mutex::new(HashMap::new()),
+            client: RwLock::new(None),
+            client_public: parking_lot::Mutex::new(None),
+            load: parking_lot::Mutex::new(LoadKind::Normal),
+        }
     }
 
     /// A loader that reaches only 127.0.0.1, localhost and ::1. Every other
     /// host fails at once as "host not found" (no DNS lookup, no connect,
     /// redirects included).
     pub fn loopback_only() -> Loader {
-        Loader::build(true, Arc::new(CookieJar::in_memory()))
-    }
-
-    fn build(loopback_only: bool, cookies: Arc<CookieJar>) -> Loader {
-        let config = ureq::Agent::config_builder()
-            .user_agent(ua::USER_AGENT)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)
-            // Redirects are followed here, hop by hop, for cookies and CORS.
-            .max_redirects(0)
-            .allow_non_standard_methods(true)
-            .build();
-        let agent = ureq::Agent::with_parts(
-            config.clone(),
-            ureq::unversioned::transport::DefaultConnector::default(),
-            HostResolver {
-                loopback_only,
-                ..HostResolver::default()
-            },
-        );
-        Loader {
-            agent,
-            public_agent: std::sync::OnceLock::new(),
-            config,
-            loopback_only,
-            cache: Mutex::new(HashMap::new()),
-            cookies,
-            client: RwLock::new(None),
-            client_public: parking_lot::Mutex::new(None),
-        }
+        Loader::with_network(Network::build(
+            true,
+            Arc::new(CookieJar::in_memory()),
+            HttpCache::off(),
+        ))
     }
 
     /// The agent for a request: requests from a public page that are not
@@ -396,32 +484,32 @@ impl Loader {
     /// (Local Network Access). The check is on the resolved addresses, so
     /// DNS rebinding cannot get around it.
     fn agent_for(&self, mode: Mode, client: Option<&Client>) -> &ureq::Agent {
-        if mode == Mode::Navigate || self.loopback_only {
-            return &self.agent;
-        }
-        let Some(c) = client else { return &self.agent };
-        let public = *self
-            .client_public
-            .lock()
-            .get_or_insert_with(|| is_public_url(&c.url));
-        if !public {
-            return &self.agent;
-        }
-        self.public_agent.get_or_init(|| {
-            ureq::Agent::with_parts(
-                self.config.clone(),
-                ureq::unversioned::transport::DefaultConnector::default(),
-                HostResolver {
-                    public_only: true,
-                    ..HostResolver::default()
-                },
-            )
-        })
+        let public_only = mode != Mode::Navigate
+            && !self.net.loopback_only
+            && client.is_some_and(|c| {
+                *self
+                    .client_public
+                    .lock()
+                    .get_or_insert_with(|| is_public_url(&c.url))
+            });
+        self.net.agent(public_only)
+    }
+
+    /// The network this loader uses.
+    pub fn network(&self) -> &Arc<Network> {
+        &self.net
     }
 
     /// The cookie jar requests use (and `document.cookie` reads).
     pub fn cookies(&self) -> &Arc<CookieJar> {
-        &self.cookies
+        &self.net.cookies
+    }
+
+    /// How the next navigation and its subresources use the HTTP cache
+    /// (reload, hard reload, back and forward). Set it back to
+    /// [`LoadKind::Normal`] when the load is done.
+    pub fn set_load_kind(&self, kind: LoadKind) {
+        *self.load.lock() = kind;
     }
 
     /// Set the document this loader fetches for. Call once the document's
@@ -437,8 +525,8 @@ impl Loader {
     }
 
     /// Fetch one URL as a `no-cors` subresource of the client document.
-    /// Cached results are returned without a new request. Non-2xx HTTP
-    /// responses are errors.
+    /// Responses this loader already has are returned without a new
+    /// request. Non-2xx HTTP responses are errors.
     pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError> {
         self.fetch_with(url, kind, CorsSettings::NoCors)
     }
@@ -474,9 +562,9 @@ impl Loader {
         self.map_parallel(requests, |(url, kind)| self.fetch(url, *kind))
     }
 
-    /// Drop every cached response. Call when the cached bodies (document,
-    /// stylesheets) are parsed and no longer needed; later fetches go to the
-    /// network again.
+    /// Drop the responses this loader keeps in memory. Call when their
+    /// bodies (stylesheets, scripts) are parsed and no longer needed; later
+    /// fetches go to the HTTP cache and the network again.
     pub fn clear_cache(&self) {
         let old = std::mem::take(&mut *self.cache.lock().expect("cache poisoned"));
         drop(old);
@@ -518,10 +606,10 @@ impl Loader {
             .collect()
     }
 
-    /// Fetch without touching the cache. Use for bodies that are decoded once
-    /// and then dropped (images, fonts), so they do not stay in memory.
-    /// `ResourceKind::Document` is a navigation started by the browser
-    /// itself (view source, save page).
+    /// Fetch without keeping the response in this loader's memory (the
+    /// HTTP cache still answers). Use for bodies that are decoded once and
+    /// then dropped (images, fonts). `ResourceKind::Document` is a
+    /// navigation started by the browser itself (view source, save page).
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError> {
         if kind == ResourceKind::Document {
             return self.navigate(url, None, None).map(|(r, _)| r);
@@ -554,6 +642,9 @@ impl Loader {
     ) -> Result<Resource, NetError> {
         self.check_local(url)?;
         let (mode, credentials) = cors.mode();
+        // Not in the struct literal below: the guard would live until the
+        // request is done and make parallel fetches wait for each other.
+        let cache = self.load.lock().subresources();
         match url.scheme() {
             // Modules from `file:` are refused like in Chrome (opaque origin).
             "file" if mode == Mode::Cors => Err(NetError::Blocked(format!(
@@ -570,6 +661,7 @@ impl Loader {
                 redirect: RedirectMode::Follow,
                 client: self.client(),
                 any_status: false,
+                cache,
             }),
             _ => fetch_local(url),
         }
@@ -600,6 +692,7 @@ impl Loader {
             ),
             None => ("GET", Vec::new(), None),
         };
+        let cache = self.load.lock().document();
         let (res, referrer) = self.send_with_referrer(Request {
             url: url.clone(),
             method: method.into(),
@@ -611,6 +704,7 @@ impl Loader {
             redirect: RedirectMode::Follow,
             client: initiator.cloned(),
             any_status: false,
+            cache,
         })?;
         Ok((res, referrer))
     }
@@ -673,6 +767,7 @@ impl Loader {
                 body: hit.body.clone(),
             });
         }
+        let cache = script_cache_mode(&headers);
         let mut res = self.send(Request {
             url: req.url,
             method,
@@ -684,6 +779,7 @@ impl Loader {
             redirect: req.redirect,
             client,
             any_status: true,
+            cache,
         })?;
         match res.response_type {
             ResponseType::Basic => {}
@@ -877,7 +973,7 @@ impl Loader {
                     );
                 }
             }
-            if include_credentials && let Some(c) = self.cookies.header_for(&url, cookie_cx) {
+            if include_credentials && let Some(c) = self.net.cookies.header_for(&url, cookie_cx) {
                 b = b.header("Cookie", c);
             }
             if cookies::is_secure(&url) {
@@ -909,30 +1005,142 @@ impl Loader {
             if req.mode == Mode::Navigate {
                 b = b.header("Upgrade-Insecure-Requests", "1");
             }
-            let built = b
-                .body(req.body.unwrap_or(&[]))
-                .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?;
-            let mut resp = if req.body.is_some() {
-                agent.run(built)
-            } else {
-                let (parts, _) = built.into_parts();
-                agent.run(ureq::http::Request::from_parts(parts, ()))
+            // Fetch's cache mode headers.
+            let has = |name: &str| req.headers.iter().any(|(n, _)| n == name);
+            match req.cache {
+                CacheMode::NoCache if !has("cache-control") => {
+                    b = b.header("Cache-Control", "max-age=0");
+                }
+                CacheMode::NoStore | CacheMode::Reload => {
+                    if !has("pragma") {
+                        b = b.header("Pragma", "no-cache");
+                    }
+                    if !has("cache-control") {
+                        b = b.header("Cache-Control", "no-cache");
+                    }
+                }
+                _ => {}
             }
-            .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
+
+            // The HTTP cache: a fresh entry answers; a stale one with a
+            // validator makes this a conditional request.
+            let cache_key = self
+                .cache_key(&req, &url, include_credentials)
+                .filter(|_| req.method == "GET" && req.cache != CacheMode::NoStore);
+            let sent = cache_key.as_ref().and_then(|_| b.headers_ref().cloned());
+            let value_of = |name: &str| sent.as_ref().and_then(|h| header_text(h, name));
+            let mut stored = cache_key
+                .as_ref()
+                .filter(|_| {
+                    matches!(
+                        req.cache,
+                        CacheMode::Default | CacheMode::NoCache | CacheMode::ForceCache
+                    )
+                })
+                .and_then(|k| self.net.cache.get(k))
+                .filter(|e| e.matches(value_of));
+            let fresh = stored.as_ref().is_some_and(|e| match req.cache {
+                CacheMode::ForceCache => true,
+                CacheMode::Default => e.is_fresh(cache::now_ms()),
+                _ => false,
+            });
+            if !fresh {
+                stored = stored.filter(|e| e.validators() != (None, None));
+                if let Some(e) = &stored {
+                    let (etag, modified) = e.validators();
+                    if let Some(v) = etag {
+                        b = b.header("If-None-Match", v);
+                    }
+                    if let Some(v) = modified {
+                        b = b.header("If-Modified-Since", v);
+                    }
+                }
+            }
+
+            let mut exchange = netlog::Exchange::begin();
+            let request_time = cache::now_ms();
+            let mut response = if fresh {
+                None
+            } else {
+                Some(self.run(agent, b, req.body, &url, &mut exchange)?)
+            };
+            exchange.head();
+            let response_time = cache::now_ms();
 
             // Response headers; cookies go to the jar.
-            let status = resp.status().as_u16();
-            let mut headers = Vec::with_capacity(resp.headers().len());
-            for (n, v) in resp.headers() {
-                let v = String::from_utf8_lossy(v.as_bytes());
-                if n == "set-cookie" || n == "set-cookie2" {
-                    if include_credentials && n == "set-cookie" {
-                        self.cookies.set_from_header(&url, &v, cookie_cx);
-                    }
-                    continue;
+            let (mut status, mut headers) = match &response {
+                None => {
+                    let e = stored.as_ref().expect("a fresh entry");
+                    (e.status, e.headers.clone())
                 }
-                headers.push((n.as_str().to_owned(), v.into_owned()));
+                Some(resp) => {
+                    let mut headers = Vec::with_capacity(resp.headers().len());
+                    for (n, v) in resp.headers() {
+                        let v = String::from_utf8_lossy(v.as_bytes());
+                        if n == "set-cookie" || n == "set-cookie2" {
+                            if include_credentials && n == "set-cookie" {
+                                self.net.cookies.set_from_header(&url, &v, cookie_cx);
+                            }
+                            continue;
+                        }
+                        headers.push((n.as_str().to_owned(), v.into_owned()));
+                    }
+                    (resp.status().as_u16(), headers)
+                }
+            };
+            // The stored body, when the cache answers.
+            let mut cached_body = None;
+            let mut how = "network";
+            if response.is_none() {
+                cached_body = stored.take().map(|e| e.body);
+                how = "hit";
+            } else if status == 304
+                && let Some(mut e) = stored.take()
+                && let Some(mut resp) = response.take()
+            {
+                drain(&mut resp);
+                e.refresh(&headers, request_time, response_time);
+                if let Some(k) = &cache_key {
+                    self.net.cache.put(k, &e);
+                }
+                (status, headers, cached_body) = (e.status, e.headers, Some(e.body));
+                how = "revalidated";
+            } else if response.is_some()
+                && !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+                && status < 400
+            {
+                // An unsafe method changed the resource (RFC 9111 4.4).
+                for credentialed in [true, false] {
+                    if let Some(k) = self.cache_key(&req, &url, credentialed) {
+                        self.net.cache.remove(&k);
+                    }
+                }
             }
+            // Stores a network response that may be stored.
+            let store = |status: u16, headers: Vec<(String, String)>, body: Vec<u8>| {
+                let entry = cache::Entry {
+                    vary: cache::vary_names(&headers)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|n| {
+                            let v = value_of(&n);
+                            (n, v)
+                        })
+                        .collect(),
+                    status,
+                    headers,
+                    request_time,
+                    response_time,
+                    body,
+                };
+                if let Some(k) = &cache_key
+                    && cache::storable(&entry)
+                {
+                    self.net.cache.put(k, &entry);
+                }
+                (entry.headers, entry.body)
+            };
+
             if tainting == ResponseType::Cors
                 && !cors::cors_check(
                     &headers,
@@ -953,6 +1161,18 @@ impl Loader {
             let location = cors::header_value(&headers, "location")
                 .filter(|_| matches!(status, 301 | 302 | 303 | 307 | 308));
             if let Some(location) = location {
+                if let Some(resp) = response.as_mut() {
+                    drain(resp);
+                    store(status, headers, Vec::new());
+                }
+                exchange.end(
+                    &req.method,
+                    status,
+                    how,
+                    0,
+                    req.kind.destination(),
+                    url.as_str(),
+                );
                 match req.redirect {
                     RedirectMode::Error => {
                         return Err(NetError::Blocked(format!("{url}: unexpected redirect")));
@@ -1013,6 +1233,17 @@ impl Loader {
             }
 
             if !req.any_status && !(200..300).contains(&status) {
+                if let Some(resp) = response.as_mut() {
+                    drain(resp);
+                }
+                exchange.end(
+                    &req.method,
+                    status,
+                    how,
+                    0,
+                    req.kind.destination(),
+                    url.as_str(),
+                );
                 return Err(NetError::Http {
                     url: url.to_string(),
                     status,
@@ -1027,18 +1258,25 @@ impl Loader {
                     .to_ascii_lowercase()
             });
             let charset = header.as_deref().and_then(charset_param).map(str::to_owned);
-            // Size the buffer from Content-Length so read_to_end does not double it.
-            let mut body = Vec::with_capacity(
-                resp.body().content_length().unwrap_or(0).min(MAX_BODY) as usize,
+            let body = match (response.as_mut(), cached_body) {
+                (_, Some(body)) => body,
+                (Some(_), None) if req.method == "HEAD" => Vec::new(),
+                (Some(resp), None) => {
+                    let body = read_body(resp, &headers, &url)?;
+                    let (h, body) = store(status, headers, body);
+                    headers = h;
+                    body
+                }
+                (None, None) => unreachable!("the cache or the network answered"),
+            };
+            exchange.end(
+                &req.method,
+                status,
+                how,
+                body.len(),
+                req.kind.destination(),
+                url.as_str(),
             );
-            if req.method != "HEAD" {
-                resp.body_mut()
-                    .with_config()
-                    .limit(MAX_BODY)
-                    .reader()
-                    .read_to_end(&mut body)
-                    .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
-            }
             return Ok((
                 Resource {
                     url,
@@ -1057,6 +1295,63 @@ impl Loader {
             "{}: too many redirects",
             req.url
         )))
+    }
+
+    /// The HTTP cache key of a request to `url`: the top-level site it is
+    /// for (the URL's own for navigations) and the URL without fragment;
+    /// requests without cookies get entries of their own, as in Chrome.
+    /// `None` without a cache, or for an opaque top-level origin (`file:`,
+    /// `data:`), which has no partition.
+    fn cache_key(&self, req: &Request<'_>, url: &Url, credentialed: bool) -> Option<String> {
+        if self.net.cache.is_off() {
+            return None;
+        }
+        let top = match &req.client {
+            Some(c) if req.mode != Mode::Navigate => &c.url,
+            _ => url,
+        };
+        let site = cookies::site_key(top)?;
+        let mut url = url.clone();
+        url.set_fragment(None);
+        let anonymous = if credentialed { "" } else { "_cn " };
+        Some(format!("{anonymous}{site} {url}"))
+    }
+
+    /// Send a request and wait for the response head. A request that went
+    /// out on a kept-alive connection the server has closed in the
+    /// meantime is sent again once, on a new connection, as in Chrome.
+    fn run(
+        &self,
+        agent: &ureq::Agent,
+        b: ureq::http::request::Builder,
+        body: Option<&[u8]>,
+        url: &Url,
+        exchange: &mut netlog::Exchange,
+    ) -> Result<ureq::http::Response<ureq::Body>, NetError> {
+        fn request<T>(parts: &ureq::http::request::Parts, body: T) -> ureq::http::Request<T> {
+            let mut r = ureq::http::Request::new(body);
+            *r.method_mut() = parts.method.clone();
+            *r.uri_mut() = parts.uri.clone();
+            *r.version_mut() = parts.version;
+            *r.headers_mut() = parts.headers.clone();
+            r
+        }
+        let (parts, ()) = b
+            .body(())
+            .map_err(|e| NetError::InvalidUrl(format!("{url}: {e}")))?
+            .into_parts();
+        let send = || match body {
+            Some(body) => agent.run(request(&parts, body)),
+            None => agent.run(request(&parts, ())),
+        };
+        let mut result = send();
+        if matches!(result, Err(ureq::Error::Io(_) | ureq::Error::Protocol(_)))
+            && !exchange.connected()
+        {
+            *exchange = netlog::Exchange::begin();
+            result = send();
+        }
+        result.map_err(|e| NetError::Transport(format!("{url}: {e}")))
     }
 
     /// A CORS preflight (`OPTIONS`) for a request to `url`: no cookies; the
@@ -1183,6 +1478,21 @@ fn charset_param(content_type: &str) -> Option<&str> {
     })
 }
 
+/// Resolved addresses for a minute, like Chrome's host cache. ureq
+/// resolves the host before it looks for an idle connection, so without
+/// it every request, on a new connection or not, asked the system
+/// resolver again (1 to 15 ms each, measured).
+#[derive(Debug, Default)]
+struct DnsCache(
+    parking_lot::Mutex<
+        HashMap<(String, u16), (ureq::unversioned::resolver::ResolvedSocketAddrs, Instant)>,
+    >,
+);
+
+/// How long a resolved address is used: Chrome's default for answers of
+/// the system resolver.
+const DNS_TTL: Duration = Duration::from_secs(60);
+
 /// Resolves hosts for the loader. `localhost` and `*.localhost` always go
 /// to loopback (127.0.0.1, then ::1), never to DNS, like Chrome: the cookie
 /// jar treats them as secure. `loopback_only`: other hosts are "host not
@@ -1193,6 +1503,7 @@ struct HostResolver {
     inner: ureq::unversioned::resolver::DefaultResolver,
     loopback_only: bool,
     public_only: bool,
+    dns: Arc<DnsCache>,
 }
 
 impl ureq::unversioned::resolver::Resolver for HostResolver {
@@ -1209,17 +1520,17 @@ impl ureq::unversioned::resolver::Resolver for HostResolver {
             .trim_end_matches(']')
             .trim_end_matches('.')
             .to_ascii_lowercase();
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
         if host == "localhost" || host.ends_with(".localhost") {
             if self.public_only {
                 return Err(ureq::Error::HostNotFound);
             }
-            let port = uri
-                .port_u16()
-                .unwrap_or(if uri.scheme_str() == Some("https") {
-                    443
-                } else {
-                    80
-                });
             let mut out = self.empty();
             out.push(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
             out.push(SocketAddr::from((Ipv6Addr::LOCALHOST, port)));
@@ -1228,7 +1539,28 @@ impl ureq::unversioned::resolver::Resolver for HostResolver {
         if self.loopback_only && !matches!(host.as_str(), "127.0.0.1" | "::1") {
             return Err(ureq::Error::HostNotFound);
         }
-        let addrs = self.inner.resolve(uri, config, timeout)?;
+        let key = (host, port);
+        let cached = self
+            .dns
+            .0
+            .lock()
+            .get(&key)
+            .filter(|(_, at)| at.elapsed() < DNS_TTL)
+            .map(|(a, _)| a.clone());
+        let addrs = match cached {
+            Some(a) => a,
+            None => {
+                let t = Instant::now();
+                let addrs = self.inner.resolve(uri, config, timeout);
+                netlog::dns(t.elapsed());
+                let addrs = addrs?;
+                self.dns
+                    .0
+                    .lock()
+                    .insert(key, (addrs.clone(), Instant::now()));
+                addrs
+            }
+        };
         if !self.public_only {
             return Ok(addrs);
         }
@@ -1240,6 +1572,74 @@ impl ureq::unversioned::resolver::Resolver for HostResolver {
             return Err(ureq::Error::HostNotFound);
         }
         Ok(out)
+    }
+}
+
+/// The value of request header `name` (all its lines, joined by `, `).
+fn header_text(headers: &ureq::http::HeaderMap, name: &str) -> Option<String> {
+    let values: Vec<&str> = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    (!values.is_empty()).then(|| values.join(", "))
+}
+
+/// Read a small body (a redirect, an error, a `304`) to its end, so the
+/// connection can carry the next request; a big one is left (and its
+/// connection closed).
+fn drain(resp: &mut ureq::http::Response<ureq::Body>) {
+    let _ = resp
+        .body_mut()
+        .with_config()
+        .limit(DRAIN_MAX)
+        .reader()
+        .read_to_end(&mut Vec::new());
+}
+
+/// Read a body to its end (the connection goes back to the pool), then
+/// undo its `Content-Encoding`.
+fn read_body(
+    resp: &mut ureq::http::Response<ureq::Body>,
+    headers: &[(String, String)],
+    url: &Url,
+) -> Result<Vec<u8>, NetError> {
+    // Size the buffer from Content-Length so read_to_end does not double it.
+    let mut raw =
+        Vec::with_capacity(resp.body().content_length().unwrap_or(0).min(MAX_BODY) as usize);
+    resp.body_mut()
+        .with_config()
+        .limit(MAX_BODY)
+        .reader()
+        .read_to_end(&mut raw)
+        .map_err(|e| NetError::Transport(format!("{url}: {e}")))?;
+    compression::decode(
+        cors::header_value(headers, "content-encoding").as_deref(),
+        raw,
+        MAX_BODY,
+    )
+    .map_err(|e| NetError::Decode(format!("{url}: {e}")))
+}
+
+/// The cache mode of a script's request (Fetch): one with a conditional
+/// header (`If-None-Match`, ...) bypasses the cache, so the script sees the
+/// server's own answer; `Cache-Control: no-store`, `no-cache` (or
+/// `max-age=0`) and `Pragma: no-cache` from the script count too (RFC 9111
+/// 5.2.1).
+fn script_cache_mode(headers: &[(String, String)]) -> CacheMode {
+    let conditional = headers.iter().any(|(n, _)| {
+        matches!(
+            n.as_str(),
+            "if-modified-since" | "if-none-match" | "if-unmodified-since" | "if-match" | "if-range"
+        )
+    });
+    let d = cache::Directives::parse(headers.iter().map(|(n, v)| (n.as_str(), v.as_str())));
+    if conditional || d.no_store {
+        CacheMode::NoStore
+    } else if d.no_cache || d.max_age == Some(0) {
+        CacheMode::NoCache
+    } else {
+        CacheMode::Default
     }
 }
 
@@ -1937,7 +2337,11 @@ mod tests {
     #[test]
     fn localhost_subdomains_resolve_to_loopback_without_dns() {
         let (port, seen) = security_server();
-        let loader = Loader::build(false, Arc::new(CookieJar::in_memory()));
+        let loader = Loader::with_network(Network::build(
+            false,
+            Arc::new(CookieJar::in_memory()),
+            HttpCache::off(),
+        ));
         let url = Url::parse(&format!("http://app.localhost:{port}/x")).unwrap();
         loader.fetch(&url, ResourceKind::Other).unwrap();
         let log = seen.lock().unwrap();
@@ -1950,7 +2354,11 @@ mod tests {
     #[test]
     fn public_pages_cannot_reach_local_addresses() {
         let (port, seen) = security_server();
-        let loader = Loader::build(false, Arc::new(CookieJar::in_memory()));
+        let loader = Loader::with_network(Network::build(
+            false,
+            Arc::new(CookieJar::in_memory()),
+            HttpCache::off(),
+        ));
         // A page on a public address (an IP literal: no DNS in the test).
         let page = Client::new(Url::parse("http://93.184.215.14/").unwrap());
         loader.set_client(Some(page.clone()));

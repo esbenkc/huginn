@@ -17,7 +17,7 @@ The interfaces between crates are in [CONTRACTS.md](CONTRACTS.md).
 | `huginn-style` | CSS parsing, selector matching, cascade, computed style (`StyleEngine`, `StyleMap`, `ComputedStyle`) | huginn-dom, cssparser |
 | `huginn-layout` | Box tree, block/flex/grid layout, inline text layout (`LayoutEngine`, `LayoutTree`) | huginn-dom, huginn-style, huginn-net, Taffy, Parley |
 | `huginn-paint` | Display list (`DisplayList`) and the CPU rasterizer (`CpuRasterizer`), PNG encoding | huginn-layout, huginn-style, huginn-net, vello_cpu, png |
-| `huginn-net` | Fetching (`Loader`: http, https, file, data), in-memory cache, cookies (`CookieJar`), CORS and referrer policy, charset decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | ureq, url, data-url, psl, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs |
+| `huginn-net` | Fetching (`Loader`: http, https, file, data), the profile's `Network` (kept-alive connections, DNS cache, HTTP cache in memory or on disk), cookies (`CookieJar`), CORS and referrer policy, charset and `Content-Encoding` decoding, image/SVG/font decoding (`ImageStore`, `decode_font`), media queries and `srcset` for resource choice, the user agent (`ua`) | ureq, url, data-url, psl, image, avif-parse, rav1d, vello_common, resvg, wuff, encoding_rs, flate2, brotli-decompressor |
 | `huginn-js` | Script engine: V8 (cargo feature `v8`, on by default), the JavaScript DOM layer (prelude), native DOM operations, modules | huginn-dom, huginn-net, huginn-style, v8 |
 | `huginn-shell` | The `huginn` binary. Runs the page-load pipeline and prints the timing JSON | all of the above |
 
@@ -127,6 +127,10 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
   touched pages committed) that owns its `Page` (the `Document` is not
   `Send`). It runs `pipeline::load` and layout and sends the finished
   `LayoutTree` and a link table to the main thread, tagged with the tab id.
+  Then it loads every `loading=lazy` image of the page (the window
+  scrolls, so all can come into view) and sends the tree again; like in
+  Chrome, they do not hold up the first paint. A restored scroll position
+  the first tree was too short for is applied again then.
   Windows stay responsive while pages load. Commands carry a navigation
   generation; stale answers are dropped. A burst of resizes is coalesced.
   Closing or discarding a tab drops its command sender; the thread ends and
@@ -228,7 +232,7 @@ Ctrl+Shift+O (bookmarks).
 | Enter / Opt+Enter / Cmd+Enter / Shift+Enter in the address bar | go / new tab / new background tab / new window; non-URLs search DuckDuckGo | done |
 | Left/Right, Opt+Left/Right, Cmd+Left/Right, Home/End, Backspace, Opt+Backspace, Cmd+Backspace, Delete, Cmd+A/C/X/V, Esc in the address bar | caret editing; Esc puts the URL back | done |
 | Cmd+[ / Cmd+Left, Cmd+] / Cmd+Right, mouse buttons 4/5 | back / forward | done |
-| Cmd+R / Cmd+Shift+R | reload / hard reload (pages are never cached, so the same) | done |
+| Cmd+R / Cmd+Shift+R | reload (the document is revalidated, the rest may come from the HTTP cache) / hard reload (nothing from the cache) | done |
 | Esc | stop loading (the previous page stays) | done |
 | Cmd+Shift+H | home: `huginn://newtab` | done |
 | Cmd+Y | `huginn://history` in a new tab | done |
@@ -386,6 +390,8 @@ to time scrolling, hover, typing, script changes and resizing on synthetic
 pages.
 
 `HUGINN_V8_FLAGS` replaces the V8 flags, to measure other settings.
+`HUGINN_NET_LOG=1` prints where the time of each HTTP exchange goes (see
+"Network and HTTP cache").
 
 ## Memory strategy
 
@@ -415,7 +421,8 @@ our biggest memory lever, so keep it that way: no helper processes.
 - **Paint only the viewport.** The display list culls boxes outside the
   viewport, and the rasterizer allocates only `width x height` pixels.
 - **Bodies are not kept.** The document, images and fonts are fetched without
-  the cache and dropped right after parsing or decoding. Stylesheets are
+  the loader's memory and dropped right after parsing or decoding (the
+  window's HTTP cache keeps them on disk, not in memory). Stylesheets are
   cached only until CSS parsing ends (`Loader::clear_cache`). Images are
   decoded only when they generate a box, at most at about twice their
   displayed size, and `loading=lazy` images only when layout puts them in
@@ -541,6 +548,63 @@ redirects itself, one hop at a time, so every hop gets its own `Cookie`,
   then non-secure ones, then the least recently used, so an insecure origin
   cannot flood out a Secure cookie and shadow it.
 
+## Network and HTTP cache
+
+All tabs of a profile share one `huginn_net::Network` (`session.rs`), like
+Chrome's network context; each page has its own `Loader` on top of it.
+Private windows share another one, dropped with the last private window.
+`huginn render` makes a fresh one with no HTTP cache, so every benchmark
+run loads from the network.
+
+- **Connections.** Idle connections stay open for 5 minutes (Chrome's
+  limit for used sockets), at most 6 per host and 32 in all, with their
+  TLS sessions for resumption. A request that goes out on a kept-alive
+  connection that the server closed meanwhile is sent once more on a new
+  one, as in Chrome. Redirects, errors and `304`s up to 64 KiB are read to
+  the end, so their connection is used again.
+- **Content-Encoding.** Huginn asks for `gzip, deflate, br` and decodes a
+  body after reading all of it (`compression.rs`). ureq's own streaming
+  decoders stopped at the end of the brotli data, before the end of the
+  chunked body, so ureq closed the connection: on brotli sites every
+  request paid for a new TCP and TLS handshake (MDN: 57 new connections
+  for 60 requests). No `zstd`: there is no pure-Rust decoder in the tree,
+  and servers fall back to `br`.
+- **DNS.** Answers are kept for a minute, like Chrome's host cache. ureq
+  resolves the host before it looks for an idle connection, so each
+  request asked the system resolver again (1 to 15 ms each).
+- **HTTP cache** (`cache.rs`, RFC 9111, a private cache). Fresh entries
+  answer without a request (`max-age`, else `Expires`, else Chrome's
+  heuristics: 10 % of the age since `Last-Modified`, and no limit for
+  `301`/`308`). Stale entries with an `ETag` or `Last-Modified` are
+  revalidated; a `304` refreshes the stored headers. `no-store`, `Vary: *`
+  and `Set-Cookie` are never stored; `Vary` picks the variant (one per URL,
+  like Chrome). Keys are the top-level site and the URL (Chrome's cache
+  partitioning). A `POST` (or another unsafe method) drops the entry of
+  its URL. A script request with a conditional header (`If-None-Match`,
+  ...) bypasses the cache, as Fetch says.
+- **Storage.** Normal windows: one file per entry in
+  `~/Library/Caches/Huginn` (macOS) or `$XDG_CACHE_HOME/huginn`
+  (`~/.cache/huginn`), or `$HUGINN_PROFILE_DIR/Cache`; 0700 directory, 0600
+  files, 256 MB, least recently used first out. An entry is written to a
+  temp file and renamed, so tabs and processes that share the directory
+  never read half an entry; each file holds its key, so a hash collision
+  is a miss. Private windows, and headless runs without
+  `HUGINN_PROFILE_DIR`, keep at most 32 MB in memory. Cmd+Shift+Delete
+  clears the cache with the cookies.
+- **Load kinds** (`LoadKind`, Chrome's): a reload revalidates the document
+  (`Cache-Control: max-age=0`) and takes subresources from the cache; a
+  hard reload sends `Cache-Control: no-cache` and `Pragma: no-cache` and
+  uses nothing from the cache; back, forward and a discarded tab coming
+  back show the document from the cache even when stale.
+- **`HUGINN_NET_LOG=1`** prints one line per HTTP exchange to stderr: start
+  time, status, `network`, `hit` or `revalidated`, new or reused
+  connection, and ms for DNS, connect (TCP and TLS), the response head and
+  the body (`netlog.rs`).
+- **Not done.** HTTP/2 (ureq speaks HTTP/1.1; Chrome uses h2 on most of
+  these sites, so it needs no handshakes beyond one per host and has no 6
+  per host limit), `stale-while-revalidate`, a CORS preflight cache,
+  `zstd`.
+
 ## External crates
 
 Versions are the ones in `Cargo.lock`.
@@ -560,7 +624,8 @@ Versions are the ones in `Cargo.lock`.
 | resvg (usvg, tiny-skia) | 0.50.0 | huginn-net | SVG images, CSS SVG backgrounds and inline `<svg>`. Features off: no text (it would load a font database on every page), no raster images inside SVG. tiny-skia's premultiplied RGBA moves into vello's pixmap without a conversion. |
 | wuff | 0.2.10 | huginn-net | Pure-Rust WOFF and WOFF2 to sfnt (the WOFF2 glyf/loca transform included), as in Blitz. Every web font in the corpus is WOFF2. |
 | encoding_rs | 0.8.44 | huginn-net | WHATWG Encoding Standard decoders for non-UTF-8 documents and stylesheets. UTF-8 input is borrowed, not copied. |
-| ureq (rustls) | 3.5.1 | huginn-net | Small blocking HTTP/1.1 client with gzip and brotli. The corpus is HTTP/1.1 on 127.0.0.1; an async stack (tokio, hyper) would add threads and memory for nothing. Six scoped worker threads fetch and decode in parallel. |
+| ureq (rustls) | 3.5.1 | huginn-net | Small blocking HTTP/1.1 client, with a connection pool. Its gzip and brotli features are off: huginn-net decodes bodies itself (see "Network and HTTP cache"). The corpus is HTTP/1.1 on 127.0.0.1; an async stack (tokio, hyper) would add threads and memory for nothing. Six scoped worker threads fetch and decode in parallel. |
+| flate2 / brotli-decompressor | 1.1.11 / 6.3.1 | huginn-net, huginn-js | `Content-Encoding` (gzip, deflate, br) and `CompressionStream`. Both were in the tree already (png, wuff). |
 | url / data-url | 2.5.8 / 0.3.2 | huginn-net, all | WHATWG URL parsing and `data:` URLs. |
 | psl | 2.1 | huginn-net | The Public Suffix List compiled into lookup code: cookie `Domain` checks and site boundaries (`SameSite`, `Sec-Fetch-Site`). No list is parsed at run time, so it costs no heap. |
 | parking_lot | 0.12 | huginn-net | Locks without poisoning for the cookie jar and the loader's client; already in the tree through Stylo. |

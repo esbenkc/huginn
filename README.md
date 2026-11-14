@@ -113,12 +113,14 @@ macOS; the list is in [ARCHITECTURE.md](ARCHITECTURE.md#shortcuts-and-gestures-c
 |---|---|
 | ![huginn://newtab](docs/img/newtab.png) | ![A test page rendered by huginn render](docs/img/render-text.png) |
 
-Environment variables: `HUGINN_PROFILE_DIR` (where bookmarks are saved; the
-default is `~/Library/Application Support/Huginn`, on Linux `~/.config/huginn`),
-`HUGINN_NO_JS=1`, `HUGINN_NET_LOOPBACK_ONLY=1` (no network except 127.0.0.1),
-`HUGINN_LIVE_TABS` and `HUGINN_MEMORY_BUDGET_MB` (tab discarding), and
-`HUGINN_OPAQUE_UI=1` (macOS: plain dark chrome instead of the see-through
-acrylic one).
+Environment variables: `HUGINN_PROFILE_DIR` (where bookmarks and cookies are
+saved; the default is `~/Library/Application Support/Huginn`, on Linux
+`~/.config/huginn`; the HTTP cache is then in its `Cache` folder, else in
+`~/Library/Caches/Huginn` or `~/.cache/huginn`), `HUGINN_NO_JS=1`,
+`HUGINN_NET_LOOPBACK_ONLY=1` (no network except 127.0.0.1), `HUGINN_NET_LOG=1`
+(one line per HTTP exchange on stderr), `HUGINN_LIVE_TABS` and
+`HUGINN_MEMORY_BUDGET_MB` (tab discarding), and `HUGINN_OPAQUE_UI=1` (macOS:
+plain dark chrome instead of the see-through acrylic one).
 
 ## Status and limitations
 

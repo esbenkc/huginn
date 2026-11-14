@@ -22,7 +22,7 @@ use std::time::Instant;
 
 use huginn_dom::NodeId;
 use huginn_layout::{LayoutTree, Rect};
-use huginn_net::{Client, DecodedImage, ReferrerPolicy, Url};
+use huginn_net::{Client, DecodedImage, LoadKind, ReferrerPolicy, Url};
 use huginn_paint::{CpuRasterizer, Rasterizer};
 use huginn_style::Viewport;
 
@@ -214,6 +214,9 @@ pub struct Tab {
     pub scroll: f32,
     /// Scroll position to apply when the loading page arrives.
     restore: Option<f32>,
+    /// A restored scroll position the page was too short for: lazy images
+    /// laid out later may make room for it. Any other scroll drops it.
+    pending_scroll: Option<f32>,
     /// Page area size in device px and device px per window CSS px.
     width: u32,
     height: u32,
@@ -279,6 +282,7 @@ impl Tab {
             favicon: None,
             scroll: 0.0,
             restore: None,
+            pending_scroll: None,
             width,
             height,
             scale,
@@ -480,7 +484,13 @@ impl Tab {
                     }
                     self.strips.clear();
                     self.hover = None;
-                    self.set_scroll(self.scroll);
+                    let pending = self.pending_scroll.take();
+                    self.set_scroll(pending.unwrap_or(self.scroll));
+                    if let Some(y) = pending
+                        && self.scroll < y
+                    {
+                        self.pending_scroll = Some(y);
+                    }
                     self.dirty = true;
                     interact::on_relayout(self);
                 }
@@ -541,6 +551,9 @@ impl Tab {
             .unwrap_or(0.0);
         self.scroll = 0.0;
         self.set_scroll(y);
+        if self.scroll < y {
+            self.pending_scroll = Some(y);
+        }
         self.dirty = true;
         if !self.private && self.error.is_none() {
             let url = self.history[self.index].url.clone();
@@ -605,7 +618,7 @@ impl Tab {
             });
             self.dirty = true;
         } else {
-            self.start_load(None);
+            self.start_load(None, LoadKind::Normal);
         }
     }
 
@@ -617,12 +630,19 @@ impl Tab {
         self.go(1);
     }
 
-    pub fn reload(&mut self) {
+    /// Reload: the document is revalidated with the server, the rest may
+    /// come from the HTTP cache. `hard` (Shift): nothing comes from it.
+    pub fn reload(&mut self, hard: bool) {
         if self.history.is_empty() {
             return;
         }
         self.history[self.index].scroll = self.scroll;
-        self.start_load(Some(self.scroll));
+        let kind = if hard {
+            LoadKind::HardReload
+        } else {
+            LoadKind::Reload
+        };
+        self.start_load(Some(self.scroll), kind);
     }
 
     /// Stop the load in progress: keep showing the previous page.
@@ -665,11 +685,12 @@ impl Tab {
             self.set_scroll(scroll);
             self.dirty = true;
         } else {
-            self.start_load(Some(scroll));
+            self.start_load(Some(scroll), LoadKind::History);
         }
     }
 
-    pub(crate) fn start_load(&mut self, restore: Option<f32>) {
+    /// Load the current history entry; `kind`: how it uses the HTTP cache.
+    pub(crate) fn start_load(&mut self, restore: Option<f32>, kind: LoadKind) {
         self.generation += 1;
         self.loading = Some(Instant::now());
         self.restore = restore;
@@ -693,6 +714,7 @@ impl Tab {
             post,
             html,
             initiator,
+            kind,
         });
         self.dirty = true;
     }
@@ -757,7 +779,7 @@ impl Tab {
         if visible {
             if self.discarded {
                 let scroll = self.history[self.index].scroll;
-                self.start_load(Some(scroll));
+                self.start_load(Some(scroll), LoadKind::History);
             } else if self.needs_layout {
                 self.relayout();
             }
@@ -831,7 +853,7 @@ impl Tab {
         self.needs_layout = false;
         if self.stale {
             // The engine holds another page: load this one again.
-            self.start_load(Some(self.scroll));
+            self.start_load(Some(self.scroll), LoadKind::History);
         } else {
             let (generation, viewport) = (self.generation, self.viewport());
             self.send(|seq| Command::Resize {
@@ -912,6 +934,7 @@ impl Tab {
     }
 
     pub fn set_scroll(&mut self, y: f32) {
+        self.pending_scroll = None;
         let y = y.clamp(0.0, self.max_scroll());
         if y != self.scroll {
             self.scroll = y;

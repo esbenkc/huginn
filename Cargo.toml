@@ -74,7 +74,10 @@ avif-parse = "2.1.0"
 rav1d = { version = "1.1.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
 # Networking
-ureq = { version = "3.5.1", default-features = false, features = ["rustls", "gzip", "brotli"] }
+# Without its gzip and brotli features: huginn-net reads each body to the end
+# and decodes it itself, so connections go back to the pool (see
+# crates/huginn-net/src/compression.rs).
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 url = "2.5"
 data-url = "0.3"
 # Public Suffix List compiled into code (no list parsed at run time): cookie
@@ -82,8 +85,11 @@ data-url = "0.3"
 psl = "2.1"
 # Text decoding for non-UTF-8 documents and stylesheets (WHATWG Encoding Standard).
 encoding_rs = "0.8"
-# CompressionStream and DecompressionStream (already in the tree through png and ureq).
+# Content-Encoding (huginn-net), CompressionStream and DecompressionStream
+# (huginn-js). Already in the tree through png.
 flate2 = "1.1"
+# Content-Encoding: br. The same version wuff uses for WOFF2.
+brotli-decompressor = "6.3"
 
 # Web fonts: WOFF and WOFF2 to TrueType/OpenType (pure Rust, as in Blitz).
 wuff = { version = "0.2.10", default-features = false, features = ["brotli", "z"] }
