@@ -19,6 +19,7 @@ mod build;
 mod convert;
 mod emit;
 mod fonts;
+mod incr;
 mod inline;
 mod shape;
 mod table;
@@ -410,6 +411,8 @@ pub struct LayoutEngine {
     text_index: bool,
     /// Shaped text of the last pass, when the cache is on (`shape.rs`).
     shapes: Option<shape::ShapeCache>,
+    /// The box tree of the last pass, when it is kept (`incr.rs`).
+    kept: Option<Box<incr::Kept>>,
 }
 
 impl Default for LayoutEngine {
@@ -427,6 +430,21 @@ impl LayoutEngine {
             text: parley::LayoutContext::new(),
             text_index: false,
             shapes: None,
+            kept: None,
+        }
+    }
+
+    /// Keep the box tree of each pass for the next one (off by default). A
+    /// pass then builds boxes only for the parts of the document that
+    /// changed, and lays out only what a change can reach; the result of
+    /// `layout` is the same with it on or off. It costs the memory of the
+    /// tree. An engine with this on must lay out one document only: boxes
+    /// are found by DOM node id.
+    pub fn set_keep_tree(&mut self, on: bool) {
+        match (on, &self.kept) {
+            (true, None) => self.kept = Some(Box::default()),
+            (false, Some(_)) => self.kept = None,
+            _ => {}
         }
     }
 
