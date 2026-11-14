@@ -69,6 +69,15 @@ pub(crate) struct LNode {
     /// size. Taffy's measure cache keeps only sizes, so a cache hit would
     /// lose them; see `CacheTree::cache_get`.
     pub measured_baselines: Option<(tf::Size<f32>, taffy::Baselines)>,
+    /// What the box of a DOM node was built from besides the node's subtree
+    /// and styles: the decorations it inherited and its list marker text.
+    /// A kept box (`incr.rs`) is only used again when they are the same.
+    pub decor_in: crate::convert::Decor,
+    pub marker_key: Option<String>,
+    /// The pass ([`LTree::pass`]) that created the node.
+    pub born: u64,
+    /// The slot is free (the node was dropped by `LTree::sweep`).
+    pub free: bool,
 }
 
 /// An outside list marker.
@@ -80,8 +89,13 @@ pub(crate) struct Marker {
     pub symbol: Option<(crate::DecorationShape, f32)>,
 }
 
+#[derive(Default)]
 pub(crate) struct LTree {
     pub nodes: Vec<LNode>,
+    /// Free slots in `nodes`.
+    pub free: Vec<u32>,
+    /// Counts layout passes when the tree is kept between them; 0 otherwise.
+    pub pass: u64,
 }
 
 #[inline]
@@ -99,9 +113,98 @@ impl Iterator for ChildIter<'_> {
 }
 
 impl LTree {
-    pub fn push(&mut self, n: LNode) -> tf::NodeId {
-        self.nodes.push(n);
-        tf::NodeId::from(self.nodes.len() - 1)
+    pub fn push(&mut self, mut n: LNode) -> tf::NodeId {
+        n.born = self.pass;
+        match self.free.pop() {
+            Some(i) => {
+                self.nodes[i as usize] = n;
+                tf::NodeId::from(i as usize)
+            }
+            None => {
+                self.nodes.push(n);
+                tf::NodeId::from(self.nodes.len() - 1)
+            }
+        }
+    }
+
+    /// After a pass built its tree from `root`, partly out of nodes kept
+    /// from the pass before: free every node the new tree does not reach
+    /// (`freed` is called with its DOM node and slot), and clear the layout
+    /// caches of the kept ones.
+    ///
+    /// The caches go because Taffy's cache answers by more than the exact
+    /// inputs (a box asked for the width it had under other inputs gets that
+    /// result), so what it returns depends on which measurements came
+    /// before. A kept cache has another history than a fresh pass and can
+    /// give another layout, most easily around floats. Clearing makes the
+    /// layout step of a pass the same as on a new tree.
+    pub fn sweep(&mut self, root: tf::NodeId, mut freed: impl FnMut(Option<NodeId>, usize)) {
+        let mut live = vec![false; self.nodes.len()];
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let i = ix(id);
+            if std::mem::replace(&mut live[i], true) {
+                continue;
+            }
+            let n = &self.nodes[i];
+            stack.extend(n.children.iter().copied());
+            stack.extend(n.hoisted.iter().copied());
+            match &n.kind {
+                Kind::Ifc(ifc) => stack.extend(ifc.items.iter().filter_map(|it| match it {
+                    crate::inline::Item::Atomic { child, .. }
+                    | crate::inline::Item::Oof { child, .. } => Some(*child),
+                    _ => None,
+                })),
+                Kind::Table(t) => {
+                    stack.extend(t.groups.iter().chain(&t.captions).copied());
+                    stack.extend(t.rows.iter().map(|r| r.node));
+                    stack.extend(t.cells.iter().map(|c| c.node));
+                }
+                _ => {}
+            }
+        }
+        let pass = self.pass;
+        for (i, n) in self.nodes.iter_mut().enumerate() {
+            if n.free {
+                continue;
+            }
+            if !live[i] {
+                freed(n.node, i);
+                // Drop what the node holds; the slot is used again by `push`.
+                n.free = true;
+                n.node = None;
+                n.kind = Kind::Container;
+                n.children = Vec::new();
+                n.hoisted = Vec::new();
+                n.cache.clear();
+                n.detailed = DetailedLayoutInfo::None;
+                n.marker = None;
+                n.marker_key = None;
+                n.measured_baselines = None;
+                self.free.push(i as u32);
+            } else if n.born != pass {
+                n.cache.clear();
+                n.measured_baselines = None;
+                n.hoisted.clear();
+                match &mut n.kind {
+                    Kind::Table(t) => t.intrinsic = None,
+                    // Back to the state of a newly shaped layout: the first
+                    // measurement of a pass must not see the indent that
+                    // the last pass set for its final line breaks.
+                    Kind::Ifc(ifc) => {
+                        if std::mem::take(&mut ifc.indented) {
+                            ifc.layout.set_text_indent(0.0, Default::default());
+                        }
+                        ifc.widths = None;
+                        // No lines, as before the first line breaking: a box
+                        // with a fixed size is measured without breaking
+                        // lines, and must not report last pass's baseline.
+                        drop(ifc.layout.break_lines());
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     pub fn node(&self, id: tf::NodeId) -> &LNode {

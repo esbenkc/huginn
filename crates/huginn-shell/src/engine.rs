@@ -438,6 +438,9 @@ fn load(
     // `HUGINN_SHAPE_CACHE=0` turns that off, to tell whether a layout bug
     // comes from the cache.
     layout.set_shape_cache(std::env::var_os("HUGINN_SHAPE_CACHE").is_none_or(|v| v != "0"));
+    // And its box tree: a pass builds boxes only for what changed. The
+    // engine lays out this one page. `HUGINN_KEEP_TREE=0` turns it off.
+    layout.set_keep_tree(std::env::var_os("HUGINN_KEEP_TREE").is_none_or(|v| v != "0"));
     page.register_fonts(&mut layout);
     let tree = page.layout(&mut layout, viewport);
     let shown_at_url = error.is_some() || internal || url.scheme() == "about";

@@ -476,3 +476,14 @@ fn floats_with_inline_content_shrink_to_fit() {
     let x = tree.glyphs[run.glyphs.start as usize].x;
     assert!(x > 130.0, "centered in the 300px float, got {x}");
 }
+
+#[test]
+fn text_beside_a_float_in_a_box_narrower_than_its_padding() {
+    // The paragraph's content width is negative (0 px minus 8 px of padding).
+    // Breaking its lines around the float used to panic in a clamp.
+    let (doc, tree) = layout(
+        "<style>body{margin:0} .f{float:left;width:90px;height:50px}</style>
+        <div style='width:0'><div class=f></div><p id=p style='margin:0;padding:0 4px'>some text here</p></div>",
+    );
+    assert_eq!(rect(&doc, &tree, "p").width, 8.0);
+}

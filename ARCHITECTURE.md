@@ -329,6 +329,13 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   formatting context from one pass to the next (`huginn-layout/src/shape.rs`),
   so a pass shapes only text whose content, styles or fonts changed.
   Shaping was 45 to 90 % of a pass. `HUGINN_SHAPE_CACHE=0` turns it off.
+  The engine also keeps the box tree (`huginn-layout/src/incr.rs`): a pass
+  uses the box of a DOM node again when its subtree, the styles in it and
+  what it takes from outside (inherited decorations, list number) are
+  unchanged, and builds boxes only for the rest. The layout step itself
+  still runs on the whole tree: Taffy's caches are cleared each pass,
+  because what they return depends on earlier measurements.
+  `HUGINN_KEEP_TREE=0` turns it off.
 - **Requests from scripts.** `location.href/assign/replace/reload`,
   `form.submit()`, `requestSubmit()`, `a.click()` become
   `HostRequest::Navigate`; `javascript:` URLs run in the page.

@@ -86,6 +86,12 @@ pub(crate) struct Ifc {
     pub text: Option<String>,
     /// Set when the shaped layout goes back to the shape cache after the pass.
     pub shape: Option<crate::shape::Ticket>,
+    /// The layout has a text indent set (see `compute`).
+    pub indented: bool,
+    /// The DOM node whose box was being built when this context was made
+    /// (the innermost one). When the tree is kept between passes, the
+    /// context can only be part of a kept box if that node is unchanged.
+    pub owner: Option<huginn_dom::NodeId>,
 }
 
 fn resolve_lpa_zero(v: LengthPercentageAuto, basis: Option<f32>) -> f32 {
@@ -420,8 +426,11 @@ pub(crate) fn compute(
                 }
             };
             let indent = resolve_lp(style.text_indent, Some(width));
-            if indent != 0.0 {
+            // A kept layout (`incr.rs`, `shape.rs`) may hold the indent of an
+            // earlier pass: a percentage indent can become zero.
+            if indent != 0.0 || ifc.indented {
                 ifc.layout.set_text_indent(indent, Default::default());
+                ifc.indented = indent != 0.0;
             }
             if floats && exact.is_some() {
                 let ctx = block_ctx.as_deref().expect("floats imply a block context");
@@ -784,6 +793,8 @@ fn break_around_floats(
     inset_left: f32,
     inset_top: f32,
 ) {
+    // The content width is negative when the padding is wider than the box.
+    let width = width.max(0.0);
     let mut br = layout.break_lines();
     br.state_mut().set_layout_max_advance(width + 0.01);
     loop {

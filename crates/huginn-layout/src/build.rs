@@ -68,6 +68,14 @@ pub(crate) struct Builder<'a, 'e> {
     pub tree: LTree,
     /// Per node: an inline element contains block-level descendants.
     contains_block: Vec<bool>,
+    /// The tree is kept between passes (`incr.rs`): the bookkeeping, and
+    /// what changed since the last pass.
+    kept: Option<(Box<crate::incr::Kept>, crate::incr::Change)>,
+    /// The DOM node of the innermost `build_block` in progress.
+    owner: Option<NodeId>,
+    /// The next `build_block` must build: its caller changes the box
+    /// afterwards (table cells).
+    no_reuse: bool,
 }
 
 pub(crate) fn layout(engine: &mut LayoutEngine, input: &LayoutInput<'_>) -> LayoutTree {
@@ -85,13 +93,49 @@ pub(crate) fn layout(engine: &mut LayoutEngine, input: &LayoutInput<'_>) -> Layo
         return out;
     };
 
+    // With a kept tree: compare the document with the last pass, and hand
+    // the shaped text of contexts that will be built again to the shape cache.
+    let world = |engine: &LayoutEngine| crate::incr::World {
+        fonts_epoch: engine.fonts.epoch,
+        text_index: engine.text_index,
+        images: input.images.len(),
+        quirks: doc.quirks_mode() == huginn_dom::QuirksMode::Quirks,
+    };
+    let started = world(engine);
+    let mut tree = LTree::default();
+    let kept = engine.kept.take().map(|mut kept| {
+        tree = std::mem::take(&mut kept.tree);
+        tree.pass += 1;
+        let change = kept.begin(input, world(engine));
+        if let Some(shapes) = &mut engine.shapes {
+            for n in &mut tree.nodes {
+                if let Kind::Ifc(ifc) = &mut n.kind
+                    && ifc.owner.is_none_or(|o| !change.is_clean(o))
+                    && let Some(ticket) = ifc.shape.take()
+                {
+                    let layout = std::mem::take(&mut ifc.layout);
+                    shapes.give(ticket, layout, ifc.text.take());
+                }
+            }
+            shapes.end_pass();
+        }
+        (kept, change)
+    });
+    let keeps_tree = kept.is_some();
+
     let mut b = Builder {
         input,
         engine,
-        tree: LTree { nodes: Vec::new() },
+        tree,
         contains_block: compute_contains_block(input),
+        kept,
+        owner: None,
+        no_reuse: false,
     };
     let root = b.build_block(El::Dom(html), html_style, Decor::default());
+    if let Some((kept, _)) = &mut b.kept {
+        b.tree.sweep(root, |node, slot| kept.forget(node, slot));
+    }
     let vp = input.viewport;
     b.tree.compute_root(
         root,
@@ -102,16 +146,26 @@ pub(crate) fn layout(engine: &mut LayoutEngine, input: &LayoutInput<'_>) -> Layo
     );
     crate::emit::emit(&mut b.tree, root, input, &mut out);
     if let Some(shapes) = &mut b.engine.shapes {
-        // Give the shaped text of this pass to the next one.
-        for n in &mut b.tree.nodes {
-            if let Kind::Ifc(ifc) = &mut n.kind
-                && let Some(ticket) = ifc.shape.take()
-            {
-                let layout = std::mem::take(&mut ifc.layout);
-                shapes.give(ticket, layout, ifc.text.take());
+        if !keeps_tree {
+            // Give the shaped text of this pass to the next one.
+            for n in &mut b.tree.nodes {
+                if let Kind::Ifc(ifc) = &mut n.kind
+                    && let Some(ticket) = ifc.shape.take()
+                {
+                    let layout = std::mem::take(&mut ifc.layout);
+                    shapes.give(ticket, layout, ifc.text.take());
+                }
             }
         }
+        // With a kept tree the shaped text stays in the tree; what the
+        // cache still holds was not asked for.
         shapes.end_pass();
+    }
+    if let Some((mut kept, _)) = b.kept.take() {
+        kept.tree = std::mem::take(&mut b.tree);
+        let ended = world(b.engine);
+        kept.end(started, ended);
+        b.engine.kept = Some(kept);
     }
     if let Some(index) = &mut out.text_index {
         // Kept for the page's lifetime: no growth slack.
@@ -220,6 +274,10 @@ fn new_node(
         content_dy: 0.0,
         border_override: None,
         measured_baselines: None,
+        decor_in: Decor::default(),
+        marker_key: None,
+        born: 0,
+        free: false,
     }
 }
 
@@ -451,8 +509,46 @@ impl Builder<'_, '_> {
 
     // ----- box building -----------------------------------------------------
 
-    /// A block-level box (or the box of an atomic inline).
+    /// A block-level box (or the box of an atomic inline). With a kept tree
+    /// (`incr.rs`), the box of an unchanged DOM node is used again.
     fn build_block(&mut self, el: El, style: Arc<ComputedStyle>, decor: Decor) -> tf::NodeId {
+        let El::Dom(n) = el else {
+            return self.build_block_new(el, style, decor);
+        };
+        let no_reuse = std::mem::take(&mut self.no_reuse);
+        if !no_reuse
+            && let Some((kept, change)) = &self.kept
+            && change.is_clean(n)
+            && let Some(id) = kept.box_of(n)
+        {
+            let old = self.tree.node(id);
+            if !old.free && old.node == Some(n) && old.decor_in == decor {
+                // The marker text counts the list items before this one.
+                let marker = match style.display {
+                    Display::ListItem => self.marker_text(Some(n), &style),
+                    _ => None,
+                };
+                if marker == self.tree.node(id).marker_key {
+                    return id;
+                }
+            }
+        }
+        let outer = self.owner.replace(n);
+        let id = self.build_block_new(El::Dom(n), style, decor);
+        self.owner = outer;
+        self.tree.node_mut(id).decor_in = decor;
+        if let Some((kept, _)) = &mut self.kept {
+            // A box its caller changes is not the box a plain build gives:
+            // it must not be found for `n` later.
+            match no_reuse {
+                true => kept.clear_box(n),
+                false => kept.set_box(n, id),
+            }
+        }
+        id
+    }
+
+    fn build_block_new(&mut self, el: El, style: Arc<ComputedStyle>, decor: Decor) -> tf::NodeId {
         let node = Self::el_node(&el);
         if let El::Image(img) = el {
             let (w, h) = (img.width() as f32, img.height() as f32);
@@ -542,6 +638,7 @@ impl Builder<'_, '_> {
             }
             self.container(node, style.clone(), children)
         };
+        self.tree.node_mut(id).marker_key = marker.clone();
         if let Some(text) = marker
             && style.list_style_position == ListStylePosition::Outside
         {
@@ -881,6 +978,7 @@ impl Builder<'_, '_> {
             text: lcx,
             text_index,
             shapes,
+            ..
         } = &mut *self.engine;
         let keep_text = *text_index;
         // The same text with the same styles and fonts as in the last pass:
@@ -1046,6 +1144,8 @@ impl Builder<'_, '_> {
             final_balance: None,
             text,
             shape: ticket,
+            indented: false,
+            owner: self.owner,
         };
         let ts = taffy_style(&style, true);
         self.tree.push(new_node(
@@ -1065,7 +1165,8 @@ impl Builder<'_, '_> {
         }
         let doc = self.input.document;
         let node = node?;
-        let ordinal = {
+        // Counted only for numbered lists: it walks every item before this one.
+        let ordinal = || {
             let start = doc
                 .parent(node)
                 .and_then(|p| doc.attribute(p, &local_name!("start")))
@@ -1086,11 +1187,11 @@ impl Builder<'_, '_> {
             ListStyleType::Disc => "• ".to_owned(),
             ListStyleType::Circle => "◦ ".to_owned(),
             ListStyleType::Square => "▪ ".to_owned(),
-            ListStyleType::Decimal => format!("{ordinal}. "),
-            ListStyleType::LowerAlpha => format!("{}. ", alpha(ordinal)),
-            ListStyleType::UpperAlpha => format!("{}. ", alpha(ordinal).to_ascii_uppercase()),
-            ListStyleType::LowerRoman => format!("{}. ", roman(ordinal)),
-            ListStyleType::UpperRoman => format!("{}. ", roman(ordinal).to_ascii_uppercase()),
+            ListStyleType::Decimal => format!("{}. ", ordinal()),
+            ListStyleType::LowerAlpha => format!("{}. ", alpha(ordinal())),
+            ListStyleType::UpperAlpha => format!("{}. ", alpha(ordinal()).to_ascii_uppercase()),
+            ListStyleType::LowerRoman => format!("{}. ", roman(ordinal())),
+            ListStyleType::UpperRoman => format!("{}. ", roman(ordinal()).to_ascii_uppercase()),
         })
     }
 
@@ -1360,6 +1461,9 @@ impl Builder<'_, '_> {
     }
 
     fn build_cell(&mut self, node: NodeId, style: Arc<ComputedStyle>, decor: Decor) -> tf::NodeId {
+        // The cell's box is changed below and by `collapse_borders`, by its
+        // place in the table: build it every time. Its content is kept.
+        self.no_reuse = true;
         let id = self.build_block(El::Dom(node), style, decor);
         let ts = &mut self.tree.node_mut(id).ts;
         // The table algorithm sizes and places cells.

@@ -135,7 +135,8 @@ Missing or incomplete:
   is not lazy yet (each start loads fontconfig's font list, about 13 ms).
 - No developer tools, extensions, settings page or bookmarks bar.
 - No CSS animations or transitions, no `@container`, no `@media print`.
-- Style and layout run in full after each change, not incrementally.
+- Style runs in full after each change. Layout keeps its boxes and shaped
+  text for what did not change, but still lays out the whole tree.
 - JavaScript: no iframes, no IME, no `contenteditable`. `fetch` and XHR
   after load block the tab.
 - No disk cache. History lasts for one session.
