@@ -746,6 +746,123 @@ fn a_parser_blocking_script_holds_up_the_content_after_it() {
     assert_eq!(title(&s[0]), "SDL");
 }
 
+/// Serve HTTP on 127.0.0.1, one thread per connection: `handler` maps a path
+/// to a delay in ms, extra header lines and a body.
+fn serve_delayed(handler: fn(&str) -> (u64, &'static str, String)) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = r.read_line(&mut first);
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (ms, headers, body) = handler(&path);
+                std::thread::sleep(Duration::from_millis(ms));
+                let mut s = stream;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    port
+}
+
+/// How long the test servers take for images and fonts.
+const RESOURCE_MS: u64 = 1500;
+
+/// A 100 x 3000 image: the page scrolls once it is in.
+const TALL_SVG: &str = "<svg xmlns='http://www.w3.org/2000/svg' width='100' height='3000'>\
+    <rect width='100' height='3000' fill='green'/></svg>";
+
+#[test]
+fn the_first_paint_does_not_wait_for_images_on_the_network() {
+    let port = serve_delayed(|path| match path {
+        "/tall.svg" => (
+            RESOURCE_MS,
+            "Content-Type: image/svg+xml\r\n",
+            TALL_SVG.into(),
+        ),
+        _ => (
+            0,
+            "Content-Type: text/html\r\n",
+            "<title>t</title><p>Text</p><img src=/tall.svg>".into(),
+        ),
+    });
+    // `wait` waits for the whole load; the first state is from before the
+    // image came.
+    let s = run(
+        &format!("http://127.0.0.1:{port}/"),
+        &format!("sleep {}; state; wait; state", RESOURCE_MS / 2),
+        &[],
+    );
+    // Painted with its text and without the image.
+    let first = s[0]["load_ms"].as_f64().unwrap();
+    assert!(first > 0.0 && first < RESOURCE_MS as f64 / 2.0, "{}", s[0]);
+    assert_eq!(s[0]["contentful_ms"].as_f64(), Some(first), "{}", s[0]);
+    assert_eq!(s[0]["max_scroll"].as_f64(), Some(0.0), "{}", s[0]);
+    // Then the image came and the page grew.
+    assert!(s[1]["max_scroll"].as_f64().unwrap() > 2000.0, "{}", s[1]);
+    assert!(
+        s[1]["complete_ms"].as_f64().unwrap() >= RESOURCE_MS as f64,
+        "{}",
+        s[1]
+    );
+}
+
+#[test]
+fn text_in_a_loading_web_font_follows_font_display() {
+    // The font comes late and is no font at all (it fails to decode), so
+    // the text shows in the fallback when it is in.
+    let port = serve_delayed(|path| {
+        let display = match path {
+            "/font.woff2" => return (RESOURCE_MS, "Content-Type: font/woff2\r\n", "x".into()),
+            "/block" => "block",
+            "/swap" => "swap",
+            "/fallback" => "fallback",
+            _ => "auto",
+        };
+        (
+            0,
+            "Content-Type: text/html\r\n",
+            format!(
+                "<title>t</title><style>@font-face {{ font-family: Late; src: url(/font.woff2); \
+                 font-display: {display} }} p {{ font-family: Late, sans-serif }}</style><p>Text</p>"
+            ),
+        )
+    });
+    let base = format!("http://127.0.0.1:{port}");
+    let page = |name: &str| {
+        let s = run(&format!("{base}/{name}"), "wait; state", &[]);
+        let first = s[0]["load_ms"].as_f64().unwrap();
+        assert!(first < RESOURCE_MS as f64 / 2.0, "{name}: {}", s[0]);
+        (first, s[0]["contentful_ms"].as_f64().unwrap())
+    };
+    // Block (and auto, Chrome's block): the first paint has invisible text;
+    // the text shows when the font is in (here before the 3 s period ends).
+    for name in ["block", "auto"] {
+        let (_, text) = page(name);
+        assert!(text >= RESOURCE_MS as f64, "{name}: text at {text}");
+    }
+    // Swap: the fallback at once.
+    let (first, text) = page("swap");
+    assert_eq!(text, first);
+    // Fallback: invisible for 100 ms, then the fallback.
+    let (first, text) = page("fallback");
+    assert!(
+        text >= first.max(100.0) && text < RESOURCE_MS as f64 / 2.0,
+        "fallback: text at {text}, first paint at {first}"
+    );
+}
+
 fn huginn_net_file_url(path: &std::path::Path) -> String {
     format!("file://{}", path.to_str().expect("UTF-8 path"))
 }

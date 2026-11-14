@@ -504,6 +504,16 @@ impl LayoutEngine {
         added
     }
 
+    /// The web font families in their `font-display` block period (font
+    /// files still loading). Text whose first available family is one of
+    /// them is laid out with the fallback font and not painted, as in
+    /// Chrome; so are its text decorations. Returns whether the set
+    /// changed (then the next `layout` shapes all text again).
+    pub fn set_invisible_families(&mut self, families: Vec<String>) -> bool {
+        self.fonts
+            .set_blocked(families.into_iter().map(|f| f.to_lowercase()).collect())
+    }
+
     /// Lay out a document.
     pub fn layout(&mut self, input: &LayoutInput<'_>) -> LayoutTree {
         build::layout(self, input)

@@ -74,6 +74,8 @@ pub struct FontFaceRule {
     pub unicode_range: Vec<(u32, u32)>,
     /// `size-adjust` descriptor as a factor (1.0 when absent).
     pub size_adjust: f32,
+    /// `font-display` descriptor (`Auto` when absent).
+    pub display: FontDisplay,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -864,7 +866,9 @@ mod tests {
         let mut e = engine();
         e.add_stylesheet(
             "@font-face { font-family: Inter; font-weight: 400 800; font-style: italic; \
-             src: url(i.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, u+04??; size-adjust: 95%; }",
+             src: url(i.woff2) format('woff2'); unicode-range: U+0000-00FF, U+0131, u+04??; size-adjust: 95%; \
+             font-display: swap; } \
+             @font-face { font-family: B; src: url(b.woff2); }",
             "http://h/css/a.css",
             Origin::Author,
             &NoImports,
@@ -879,6 +883,8 @@ mod tests {
             [(0, 0xFF), (0x131, 0x131), (0x400, 0x4FF)]
         );
         assert_eq!(ff.size_adjust, 0.95);
+        assert_eq!(ff.display, FontDisplay::Swap);
+        assert_eq!(e.font_faces()[1].display, FontDisplay::Auto);
     }
 
     #[test]

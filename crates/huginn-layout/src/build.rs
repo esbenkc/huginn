@@ -953,20 +953,28 @@ impl Builder<'_, '_> {
         let fonts = &mut self.engine.fonts;
         let root_fam = fonts.family_list(&style.font_family);
         let root_lh = fonts.line_height(&style, &root_fam);
+        let root_invisible = fonts.invisible(&style.font_family);
         let sel = |fonts: &mut crate::fonts::Fonts, s: &ComputedStyle| {
             let fam = fonts.family_list(&s.font_family);
             let lh = fonts.line_height(s, &fam);
-            Some((fam, lh))
+            // Text in a web font that is still in its block period is laid
+            // out with the fallback and not painted.
+            let opacity = if fonts.invisible(&s.font_family) {
+                0.0
+            } else {
+                1.0
+            };
+            Some((fam, lh, opacity))
         };
         let mut struts: Vec<Option<(f32, f32)>> = vec![None; evs.len()];
-        let ev_fams: Vec<Option<(crate::fonts::FamilyList, (parley::LineHeight, f32))>> = evs
+        let ev_fams: Vec<Option<(crate::fonts::FamilyList, (parley::LineHeight, f32), f32)>> = evs
             .iter()
             .enumerate()
             .map(|(i, ev)| match ev {
                 Ev::Open(_, s) => {
                     let r = sel(fonts, s);
                     if textless[i]
-                        && let Some((fam, lh)) = &r
+                        && let Some((fam, lh, _)) = &r
                     {
                         struts[i] = fonts.span_box(s, fam, lh.0);
                     }
@@ -995,7 +1003,10 @@ impl Builder<'_, '_> {
         }];
         let mut items: Vec<IItem> = Vec::new();
         let root_opsz = optical_sizing(&style);
-        let root_ts = text_style(&style, &decor, &root_fam, root_lh.0, 0, true, &root_opsz);
+        let mut root_ts = text_style(&style, &decor, &root_fam, root_lh.0, 0, true, &root_opsz);
+        if root_invisible {
+            fade(&mut root_ts, 0.0);
+        }
         let LayoutEngine {
             fonts,
             text: lcx,
@@ -1029,9 +1040,9 @@ impl Builder<'_, '_> {
         let mut next_atomic = 0usize;
         for (i, (ev, sel)) in evs.iter().zip(&ev_fams).enumerate() {
             let (cur, cur_decor) = *stack.last().expect("root span");
-            let (fam, lh): (&[parley::FontFamilyName<'static>], _) = sel
+            let (fam, lh, shown): (&[parley::FontFamilyName<'static>], _, _) = sel
                 .as_ref()
-                .map_or((&root_fam, root_lh), |(f, lh)| (f, *lh));
+                .map_or((&root_fam, root_lh, 1.0), |(f, lh, o)| (f, *lh, *o));
             match ev {
                 Ev::Open(n, s) => {
                     let si = spans.len() as u32;
@@ -1048,8 +1059,8 @@ impl Builder<'_, '_> {
                     if let Some(tb) = &mut tb {
                         let opsz = optical_sizing(s);
                         let mut ts = text_style(s, &d, fam, lh.0, si, false, &opsz);
-                        if opacity < 1.0 {
-                            fade(&mut ts, opacity);
+                        if opacity * shown < 1.0 {
+                            fade(&mut ts, opacity * shown);
                         }
                         tb.push_style_span(ts);
                     }
@@ -1090,6 +1101,9 @@ impl Builder<'_, '_> {
                         let opsz = optical_sizing(s);
                         let mut ts = text_style(s, &cur_decor, fam, lh.0, cur, false, &opsz);
                         ts.white_space_collapse = parley::WhiteSpaceCollapse::Preserve;
+                        if shown < 1.0 {
+                            fade(&mut ts, shown);
+                        }
                         tb.push_style_span(ts);
                         tb.push_text("\n");
                         tb.pop_style_span();
@@ -1234,6 +1248,9 @@ impl Builder<'_, '_> {
         // The marker's trailing space separates it from the content.
         ts.white_space_collapse = parley::WhiteSpaceCollapse::Preserve;
         ts.text_wrap_mode = parley::TextWrapMode::NoWrap;
+        if self.engine.fonts.invisible(&style.font_family) {
+            fade(&mut ts, 0.0);
+        }
         let LayoutEngine {
             fonts, text: lcx, ..
         } = &mut *self.engine;

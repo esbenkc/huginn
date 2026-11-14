@@ -85,6 +85,9 @@ pub(crate) enum CacheMode {
     NoCache,
     /// Any matching entry answers, stale or not.
     ForceCache,
+    /// Only a fresh entry answers; without one nothing is sent and the
+    /// request fails.
+    OnlyFresh,
 }
 
 /// A stored response.

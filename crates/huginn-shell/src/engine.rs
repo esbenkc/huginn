@@ -130,6 +130,11 @@ pub enum EngineEvent {
     /// first paint, DOMContentLoaded, load and the lazy images are done.
     /// `complete_ms` counts from the start of the load, like `load_ms`.
     Complete { generation: u64, complete_ms: f64 },
+    /// The first tree of the load of `generation` that paints content
+    /// (Chrome's first contentful paint: visible text, an image or a
+    /// background image in the viewport). The first paint can have none:
+    /// its text may wait for web fonts. Sent once per load, at most.
+    Contentful { generation: u64, contentful_ms: f64 },
     /// Every command up to `seq` is done and the queue is empty.
     Idle { seq: u64 },
 }
@@ -236,6 +241,9 @@ pub(crate) struct Current {
     pub generation: u64,
     /// Scripts, timers and input after load (`livepage`).
     pub live: LivePage,
+    /// Whether a tree with content was sent for this load
+    /// ([`EngineEvent::Contentful`]).
+    contentful: bool,
 }
 
 fn run(
@@ -326,7 +334,14 @@ fn run(
                             }
                         }));
                     }
+                    let first_paint_ms = loaded.load_ms;
                     notify(EngineEvent::Loaded(Box::new(loaded)));
+                    if cur.contentful {
+                        notify(EngineEvent::Contentful {
+                            generation: cur.generation,
+                            contentful_ms: first_paint_ms,
+                        });
+                    }
                     cur.live.set_visible(&mut cur.page, visible);
                     cur.live.after_load(
                         &mut cur.page,
@@ -335,6 +350,11 @@ fn run(
                         cur.generation,
                         notify,
                     );
+                    // Images and web fonts still on the network at the
+                    // first paint, as they come. The async, defer and
+                    // module scripts run once their sources are in, as in
+                    // Chrome; what arrived by then shows before they run.
+                    settle_pending(&mut cur, notify, true);
                     // The page is on screen: now the async, defer and module
                     // scripts, and the load events that waited for them.
                     cur.live.finish_load(
@@ -344,22 +364,19 @@ fn run(
                         cur.generation,
                         notify,
                     );
+                    settle_pending(&mut cur, notify, false);
                     // `loading=lazy` images after the page is on screen, as
                     // in Chrome (on bbc.com they held up the first paint by
                     // seconds); then the page is laid out again.
                     if cur.page.load_all_lazy(cur.live.loader()) {
                         let tree = cur.page.layout(&mut cur.layout, cur.viewport);
-                        notify(EngineEvent::Relaid {
-                            generation: cur.generation,
-                            tree,
-                            links: None,
-                            title: None,
-                        });
+                        relaid(&mut cur, tree, notify);
                     }
                     notify(EngineEvent::Complete {
                         generation: cur.generation,
                         complete_ms: cur.live.load_start().elapsed().as_secs_f64() * 1e3,
                     });
+                    huginn_net::log_phase("complete");
                     // The load is done: from now on the page's requests use
                     // the cache as usual, also after a hard reload.
                     cur.live.loader().set_load_kind(LoadKind::Normal);
@@ -442,6 +459,105 @@ fn run(
     }
 }
 
+/// How often the engine looks whether the later scripts' sources are in
+/// while it waits for the first paint's images and fonts.
+const PENDING_POLL: Duration = Duration::from_millis(4);
+
+/// Images that arrive after the first paint show at most this often: a
+/// layout per image would cost more than it shows.
+const IMAGE_BATCH: Duration = Duration::from_millis(50);
+
+/// Show the images and web fonts that were still on the network at the
+/// first paint as they arrive: text in a web font as soon as the font is in
+/// or its block period ends, images in batches. Returns when all are in,
+/// or (`until_scripts`) when the later scripts' sources are in.
+fn settle_pending(cur: &mut Current, notify: &dyn Fn(EngineEvent), until_scripts: bool) {
+    // When images that are not shown yet started to arrive.
+    let mut images_since: Option<Instant> = None;
+    while cur.page.has_pending()
+        && !(until_scripts && cur.page.later.as_ref().is_none_or(|l| l.ready()))
+    {
+        let now = Instant::now();
+        let deadline = [
+            cur.page.next_font_change(),
+            images_since.map(|t| t + IMAGE_BATCH),
+            until_scripts.then(|| now + PENDING_POLL),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let took = cur.page.take_pending(deadline);
+        if took.images {
+            images_since.get_or_insert(now);
+        }
+        let text = cur.page.update_invisible_text(&mut cur.layout) | took.fonts;
+        let images_due =
+            images_since.is_some_and(|t| t.elapsed() >= IMAGE_BATCH || !cur.page.has_pending());
+        if text || images_due {
+            show_arrived(cur, notify);
+            images_since = None;
+        }
+    }
+    if images_since.is_some() {
+        show_arrived(cur, notify);
+    }
+}
+
+/// Lay out again with the fonts and images that arrived, and send the tree.
+fn show_arrived(cur: &mut Current, notify: &dyn Fn(EngineEvent)) {
+    cur.page.register_fonts(&mut cur.layout);
+    let tree = cur.page.layout(&mut cur.layout, cur.viewport);
+    relaid(cur, tree, notify);
+}
+
+/// Send a new tree of the load in progress; the first one with content is
+/// its first contentful paint.
+fn relaid(cur: &mut Current, tree: LayoutTree, notify: &dyn Fn(EngineEvent)) {
+    if !cur.contentful && contentful(&tree) {
+        cur.contentful = true;
+        huginn_net::log_phase("first contentful paint");
+        notify(EngineEvent::Contentful {
+            generation: cur.generation,
+            contentful_ms: cur.live.load_start().elapsed().as_secs_f64() * 1e3,
+        });
+    }
+    notify(EngineEvent::Relaid {
+        generation: cur.generation,
+        tree,
+        links: None,
+        title: None,
+    });
+}
+
+/// Whether painting `tree` shows content in the viewport, as Chrome counts
+/// it for the first contentful paint: text that is not invisible (web
+/// fonts in their block period), an image or a background image.
+/// Background colours and borders do not count.
+fn contentful(tree: &LayoutTree) -> bool {
+    let view = huginn_layout::Rect {
+        x: 0.0,
+        y: 0.0,
+        width: tree.viewport.width,
+        height: tree.viewport.height,
+    };
+    let text = tree.runs.iter().any(|r| {
+        r.color.a > 0
+            && tree
+                .glyphs
+                .get(r.glyphs.start as usize..r.glyphs.end as usize)
+                .and_then(|g| g.first())
+                .is_some_and(|g| {
+                    g.y > 0.0 && g.y - r.font_size < view.height && (0.0..view.width).contains(&g.x)
+                })
+    });
+    text || tree.boxes.iter().any(|b| {
+        (matches!(b.kind, huginn_layout::BoxKind::Image(_)) || b.background_image.is_some())
+            && b.rect.width > 0.0
+            && b.rect.height > 0.0
+            && b.rect.intersects(&view)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load(
     generation: u64,
@@ -514,7 +630,14 @@ fn load(
     // engine lays out this one page. `HUGINN_KEEP_TREE=0` turns it off.
     layout.set_keep_tree(std::env::var_os("HUGINN_KEEP_TREE").is_none_or(|v| v != "0"));
     page.register_fonts(&mut layout);
+    // Text in web fonts still in their block period is invisible.
+    page.update_invisible_text(&mut layout);
     let tree = page.layout(&mut layout, viewport);
+    huginn_net::log_phase("first paint (laid out)");
+    let contentful = contentful(&tree);
+    if contentful {
+        huginn_net::log_phase("first contentful paint");
+    }
     let shown_at_url = error.is_some() || internal || url.scheme() == "about";
     let final_url = if shown_at_url {
         url.clone()
@@ -549,6 +672,7 @@ fn load(
             layout,
             viewport,
             generation,
+            contentful,
         },
         loaded,
     )

@@ -80,6 +80,9 @@ pub struct Page {
     pub js: Option<Box<dyn huginn_js::ScriptEngine>>,
     /// The window: the scripts that run after the first paint.
     pub later: Option<LaterScripts>,
+    /// The window: images and web fonts still on the network at the first
+    /// paint ([`Page::take_pending`]).
+    pending: Option<resources::Pending>,
     pub fetch_time: Duration,
     pub parse_time: Duration,
     pub script_time: Duration,
@@ -93,6 +96,47 @@ impl Page {
         for f in std::mem::take(&mut self.fonts) {
             layout_engine.register_font(f.data, &f.family, f.weight, f.style);
         }
+    }
+
+    /// Wait for the next of the images and web fonts that were still on
+    /// the network at the first paint (or `deadline`; `None`: as long as it
+    /// takes) and store what came. New fonts wait for `register_fonts`.
+    pub fn take_pending(&mut self, deadline: Option<Instant>) -> resources::Took {
+        let Some(p) = &mut self.pending else {
+            return resources::Took::default();
+        };
+        let took = p.take(&mut self.images, &mut self.fonts, deadline);
+        if p.is_done() {
+            self.pending = None;
+            huginn_net::log_phase("images and fonts in");
+        }
+        took
+    }
+
+    /// Whether images or web fonts of the first paint are still on the network.
+    pub fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Tell `layout_engine` which web fonts are in their block period now
+    /// (their text is invisible). True if that changed: lay out again.
+    pub fn update_invisible_text(&mut self, layout_engine: &mut LayoutEngine) -> bool {
+        let blocked = self
+            .pending
+            .as_mut()
+            .map_or_else(Vec::new, |p| p.blocked_families(Instant::now()));
+        layout_engine.set_invisible_families(blocked)
+    }
+
+    /// When the next web font of the first paint ends a font-display period.
+    pub fn next_font_change(&self) -> Option<Instant> {
+        self.pending.as_ref()?.next_font_change(Instant::now())
+    }
+
+    /// The keys `load_added` would mark as tried for the images still on
+    /// the network (so it does not fetch them again).
+    pub fn pending_keys(&self) -> impl Iterator<Item = &String> {
+        self.pending.iter().flat_map(resources::Pending::tried_keys)
     }
 
     /// Load the `loading=lazy` images whose boxes intersect `region` and
@@ -230,6 +274,13 @@ impl LaterScripts {
             requests,
             fetch,
         }
+    }
+
+    /// Whether the sources are in ([`LaterScripts::sources`] will not wait).
+    pub fn ready(&self) -> bool {
+        self.fetch
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
     /// Wait for the sources. Per script: the fetched source, `None` for
@@ -382,6 +433,7 @@ pub fn load_document(
         device_pixel_ratio: viewport.device_pixel_ratio,
     };
     // 1. Fetch the document (not cached: the body is dropped after parsing).
+    huginn_net::log_phase("load");
     let t = Instant::now();
     let (main, referrer) = loader
         .navigate(
@@ -391,6 +443,7 @@ pub fn load_document(
         )
         .map_err(|e| format!("cannot load {url}: {e}"))?;
     let mut fetch = t.elapsed();
+    huginn_net::log_phase("document in");
 
     // 2. Parse HTML (charset from BOM, Content-Type or <meta charset>).
     let t = Instant::now();
@@ -411,6 +464,7 @@ pub fn load_document(
     }));
     let base = document_base(&doc, &doc_url);
     let mut parse = t.elapsed();
+    huginn_net::log_phase("html parsed");
 
     // The window's first paint goes first: requests that scripts send from
     // threads of their own (`fetch()`, async XHR) wait until it has its
@@ -472,6 +526,7 @@ pub fn load_document(
     let fetched = loader.map_parallel(&requests, |(u, kind, cors)| {
         loader.fetch_with(u, *kind, *cors)
     });
+    huginn_net::log_phase("stylesheets and blocking scripts in");
     // The later scripts' sources load while the page is styled, laid out and
     // painted: after the stylesheets and blocking scripts, which Chrome
     // gives a higher priority.
@@ -502,6 +557,7 @@ pub fn load_document(
         }
     }
     parse += t.elapsed();
+    huginn_net::log_phase("css parsed");
 
     // 4b. Scripts, then pick up the stylesheets and images they added.
     let t = Instant::now();
@@ -559,6 +615,9 @@ pub fn load_document(
             }
         }
     }
+    if !scripts.is_empty() {
+        huginn_net::log_phase("blocking scripts run");
+    }
     // Stylesheet and script texts are parsed or run; free them.
     drop(fetched);
     loader.clear_cache();
@@ -579,25 +638,42 @@ pub fn load_document(
     let t = Instant::now();
     let styles = engine.compute(&doc);
     let style_time = t.elapsed();
+    huginn_net::log_phase("styled");
 
     // 6. Second fetch wave, one parallel batch: <img> (eager, chosen from
     // srcset/<picture>), CSS background images, inline <svg> and the web
     // fonts the text uses. Bodies are dropped as soon as they are decoded.
+    // The window paints without the ones still on the network (fonts in
+    // their block period aside); they come with `pending`.
     let t = Instant::now();
     let img_plan = resources::plan_images(&doc, &base, &screen);
+    let (loaded, pending) = if live {
+        resources::load_for_first_paint(
+            loader,
+            &doc,
+            &styles,
+            engine.font_faces(),
+            &img_plan,
+            &screen,
+        )
+    } else {
+        let all = resources::load(
+            loader,
+            &doc,
+            &styles,
+            engine.font_faces(),
+            &img_plan,
+            &screen,
+        );
+        (all, None)
+    };
     let resources::Loaded {
         images,
         fonts,
         font_urls,
-    } = resources::load(
-        loader,
-        &doc,
-        &styles,
-        engine.font_faces(),
-        &img_plan,
-        &screen,
-    );
+    } = loaded;
     fetch += t.elapsed();
+    huginn_net::log_phase("images and fonts for the first paint in");
 
     Ok(Page {
         url: doc_url,
@@ -616,6 +692,7 @@ pub fn load_document(
         js_report,
         js: js_engine,
         later,
+        pending,
         fetch_time: fetch,
         parse_time: parse,
         script_time,
