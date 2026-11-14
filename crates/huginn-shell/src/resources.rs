@@ -577,8 +577,8 @@ pub fn load_lazy(
     relayout
 }
 
-/// Load every `loading=lazy` image now (the window, which scrolls).
-/// Returns true if any was added.
+/// Load every `loading=lazy` image that is not loaded yet (the window, which
+/// scrolls). Returns true if any was added.
 pub fn load_all_lazy(
     loader: &Loader,
     doc: &Document,
@@ -587,10 +587,21 @@ pub fn load_all_lazy(
     screen: &Screen,
     images: &mut ImageStore,
 ) -> bool {
-    let choices: Vec<&ImgChoice> = plan.lazy.iter().collect();
+    // Scripts that ran after the first paint may have loaded some already
+    // (`load_added`).
+    let choices: Vec<&ImgChoice> = plan.lazy.iter().filter(|c| !has_image(images, c)).collect();
     load_choices(loader, doc, styles, &choices, screen, images)
         .iter()
         .any(Option::is_some)
+}
+
+/// Whether `images` has the image of choice `c`.
+fn has_image(images: &ImageStore, c: &ImgChoice) -> bool {
+    if c.by_url {
+        images.get(c.url.as_str()).is_some()
+    } else {
+        images.get_for_node(c.node.to_raw()).is_some()
+    }
 }
 
 /// After scripts changed the DOM or a state changed styles (the live window):
@@ -614,13 +625,7 @@ pub fn load_added(
         .iter()
         .chain(&plan.lazy)
         .filter(|c| styles.get(c.node).is_some())
-        .filter(|c| {
-            if c.by_url {
-                images.get(c.url.as_str()).is_none()
-            } else {
-                images.get_for_node(c.node.to_raw()).is_none()
-            }
-        })
+        .filter(|c| !has_image(images, c))
         .filter(|c| {
             tried.insert(if c.by_url {
                 c.url.to_string()
