@@ -134,8 +134,23 @@ The window runs only the parser-blocking scripts here and the `async`,
   microtask checkpoint after each. `abort()` (an `AbortSignal`,
   `xhr.abort()`, an XHR `timeout`) settles at once; a request that still
   waits in the queue never goes out, and the response of one in flight is
-  dropped when it comes (a blocking ureq call cannot be stopped). Sync XHR
-  still waits on the engine thread.
+  dropped when it comes (the thread's blocking call cannot be stopped).
+  Sync XHR still waits on the engine thread.
+- The window's first paint goes first. While `pipeline::load_document`
+  loads a page, it holds the scripts' requests
+  (`Loader::hold_script_requests`): `fetch()` and async XHR that the
+  parser-blocking scripts start wait in the queue until the stylesheets,
+  images and fonts of the first paint are in. Then they all go, up to 16 at
+  once, while the page is laid out. Chrome gives stylesheets and fonts the
+  highest priority and `fetch()` and XHR the next one, and servers that
+  use HTTP/2 or HTTP/3 priorities send the higher ones first. Huginn's
+  requests carry no priority, so it holds the lower ones back instead. It
+  cannot hold them only while the first paint's requests are in flight:
+  those start after the parser-blocking scripts have run (stylesheets the
+  scripts add, images, fonts), so when a script calls `fetch()` there are
+  none yet. Sync XHR is not held; it runs on the engine thread, which
+  holds the others. `render` holds nothing: its settle loop waits for the
+  responses before style.
 - Waiting for responses. `render` (`scripts.rs`) jumps virtual time from
   timer to timer while no request is in flight. While requests are in
   flight, virtual time runs at real speed: the thread sleeps until the next

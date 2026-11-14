@@ -588,6 +588,10 @@ impl Loader {
     pub fn set_load_kind(&self, kind: LoadKind);       // for the next navigation and its subresources; Normal again when done
     pub fn set_client(&self, client: Option<Client>);   // the document, once its final URL is known
     pub fn client(&self) -> Option<Client>;
+    /// fetch()/async XHR (sent from other threads) wait while a guard lives: the window holds
+    /// them while it loads the first paint's resources. Sync XHR is not held.
+    pub fn hold_script_requests(&self) -> ScriptRequestsHeld<'_>;
+    pub fn wait_for_script_turn(&self);      // blocks while held; the threads of fetch()/async XHR call it
     pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // no-cors subresource, kept in the loader by URL
     pub fn fetch_with(&self, url: &Url, kind: ResourceKind, cors: CorsSettings) -> Result<Arc<Resource>, NetError>;  // modules, <script crossorigin>
     /// Not kept in the loader (the HTTP cache still answers): for bodies decoded once and
@@ -605,6 +609,7 @@ impl Loader {
     pub fn map_parallel<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>;  // <= 32 threads
     pub fn clear_cache(&self);               // drop the bodies kept in the loader (after CSS parsing); the HTTP cache stays
 }
+pub struct ScriptRequestsHeld<'a> { .. }    // Loader::hold_script_requests; the requests go when it drops
 
 /// RFC 6265bis cookies: Domain (no public suffixes), Path, Expires/Max-Age
 /// (<= 400 days), Secure (https and loopback), HttpOnly, SameSite (Lax when
@@ -810,7 +815,7 @@ DOM rules (pre-insertion checks, queries, URL parts) are in `src/dom_ops.rs`.
 | `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `cloneNode` | `huginn_dom::parse_fragment`, `serialize`, `Document::clone_node` |
 | `querySelector(All)`, `matches`, `closest` | `huginn_style::query_selector(_all)`, `matches_selector`, `closest` |
 | `getBoundingClientRect`, `offset*`, `client*`, `getComputedStyle` | `cx.layout` (`LayoutHost`) |
-| `fetch`, async `XMLHttpRequest` | `cx.loader.fetch_for_script` on a thread of the page (`v8engine/fetches.rs`, at most 16 in flight per page, the rest queued): Fetch modes and CORS; other origins must allow `cors` requests |
+| `fetch`, async `XMLHttpRequest` | `cx.loader.fetch_for_script` on a thread of the page (`v8engine/fetches.rs`, at most 16 in flight per page, the rest queued; none go out while a `Loader::hold_script_requests` guard lives): Fetch modes and CORS; other origins must allow `cors` requests |
 | sync `XMLHttpRequest` | `cx.loader.fetch_for_script` on the engine thread |
 | inserted `<script src>`, module imports | `cx.loader.fetch_with`: classic scripts `no-cors` from any origin; modules and `crossorigin` scripts CORS |
 | `document.cookie`, `document.referrer` | `cx.loader.cookies()` (no HttpOnly), `cx.referrer` |

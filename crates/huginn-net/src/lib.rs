@@ -396,11 +396,29 @@ pub struct Loader {
     client_public: parking_lot::Mutex<Option<bool>>,
     /// How this load uses the HTTP cache.
     load: parking_lot::Mutex<LoadKind>,
+    /// Holds on the requests scripts send from threads of their own
+    /// ([`Loader::hold_script_requests`]), and those threads' wait.
+    script_holds: parking_lot::Mutex<usize>,
+    script_turn: parking_lot::Condvar,
 }
 
 impl Default for Loader {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Scripts' requests wait while this lives ([`Loader::hold_script_requests`]).
+#[must_use = "the requests go as soon as the guard drops"]
+pub struct ScriptRequestsHeld<'a>(&'a Loader);
+
+impl Drop for ScriptRequestsHeld<'_> {
+    fn drop(&mut self) {
+        let mut holds = self.0.script_holds.lock();
+        *holds -= 1;
+        if *holds == 0 {
+            self.0.script_turn.notify_all();
+        }
     }
 }
 
@@ -449,6 +467,8 @@ impl Loader {
             client: RwLock::new(None),
             client_public: parking_lot::Mutex::new(None),
             load: parking_lot::Mutex::new(LoadKind::Normal),
+            script_holds: parking_lot::Mutex::new(0),
+            script_turn: parking_lot::Condvar::new(),
         }
     }
 
@@ -505,6 +525,24 @@ impl Loader {
     /// The document this loader fetches for.
     pub fn client(&self) -> Option<Client> {
         self.client.read().clone()
+    }
+
+    /// Hold back the requests that the client's scripts send from threads
+    /// of their own (`fetch()`, async `XMLHttpRequest`) until the guard
+    /// drops: before the first paint, the requests it needs go first.
+    /// Requests sent on the calling thread (sync XHR) are not held.
+    pub fn hold_script_requests(&self) -> ScriptRequestsHeld<'_> {
+        *self.script_holds.lock() += 1;
+        ScriptRequestsHeld(self)
+    }
+
+    /// Wait until no [`Loader::hold_script_requests`] is in place. The
+    /// threads that send scripts' requests call it before each request.
+    pub fn wait_for_script_turn(&self) {
+        let mut holds = self.script_holds.lock();
+        while *holds > 0 {
+            self.script_turn.wait(&mut holds);
+        }
     }
 
     /// Fetch one URL as a `no-cors` subresource of the client document.

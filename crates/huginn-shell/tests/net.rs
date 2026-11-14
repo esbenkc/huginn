@@ -549,10 +549,15 @@ fn serve_parallel(handler: fn(&str) -> (u64, String)) -> u16 {
                 let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
                 let (ms, body) = handler(&path);
                 std::thread::sleep(Duration::from_millis(ms));
+                let ty = if path.ends_with(".css") {
+                    "text/css"
+                } else {
+                    "text/html"
+                };
                 let mut s = stream;
                 let _ = write!(
                     s,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ty}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
             });
@@ -649,6 +654,56 @@ fn render_waits_for_script_requests_within_the_settle_budget() {
     assert_eq!(fetched["nodes"], sync["nodes"], "{fetched}");
     // The hanging request is given up after the 1.5 s settle budget.
     assert!(fetched["total_ms"].as_f64().unwrap() < 5000.0, "{fetched}");
+}
+
+const FETCH_MS: u64 = 1500;
+
+#[test]
+fn requests_that_scripts_start_before_the_first_paint_wait_for_it() {
+    // The inline script starts 6 slow requests, as many as there are
+    // HTTP/1.1 connections to a host, then adds a stylesheet. A sync XHR
+    // before them is not held.
+    let port = serve_parallel(|path| match path {
+        p if p.starts_with("/slow") => (FETCH_MS, "x".into()),
+        "/late.css" => (300, "p { color: red }".into()),
+        "/sync" => (0, "sync".into()),
+        _ => (
+            0,
+            "<title>start</title><p>text</p><script>
+             const x = new XMLHttpRequest();
+             x.open('GET', '/sync', false);
+             x.send();
+             document.title = x.responseText;
+             let done = 0;
+             for (let i = 0; i < 6; i++) {
+               fetch('/slow?' + i).then(r => r.text()).then(() => {
+                 if (++done === 6) document.title = 'fetched ' + Math.round(performance.now());
+               });
+             }
+             const l = document.createElement('link');
+             l.rel = 'stylesheet';
+             l.href = '/late.css';
+             document.head.appendChild(l);
+             </script>"
+                .into(),
+        ),
+    });
+    let s = run(
+        &format!("http://127.0.0.1:{port}/"),
+        "wait; state; sleep 4000; state",
+        &[],
+    );
+    // The first paint waited for the stylesheet, not for the requests.
+    let first = s[0]["load_ms"].as_f64().unwrap();
+    assert!((300.0..FETCH_MS as f64).contains(&first), "{}", s[0]);
+    assert_eq!(title(&s[0]), "sync", "{}", s[0]);
+    // Then the requests went out, all at once: one after another, two of
+    // them would already take twice as long.
+    let done: f64 = title(&s[1])
+        .strip_prefix("fetched ")
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("{}", s[1]));
+    assert!(done < first + 1.8 * FETCH_MS as f64, "{}", s[1]);
 }
 
 #[test]
