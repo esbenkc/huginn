@@ -69,7 +69,8 @@ to PNG written), `nodes`, `styled`, `boxes`, `images`, `width`, `height`.
 
 With the `v8` feature (the default), the shell runs scripts between CSS parsing and style
 (`crates/huginn-shell/src/scripts.rs`): scripts in order, DOMContentLoaded and
-load, then timers for up to 500 ms of virtual time. Script sources are
+load, then timers for up to 500 ms of virtual time, and the responses to the
+requests scripts started (`fetch()`, XHR; see "Threading"). Script sources are
 fetched in the first wave with the stylesheets and images. Afterwards the
 shell picks up stylesheets and images that scripts added, then styles and
 lays out once. Geometry queries during scripts (`getBoundingClientRect`,
@@ -80,7 +81,9 @@ the parser found), `script_events_ms` (DOMContentLoaded and load),
 `script_timers_ms` (timers while the page settles), `script_layout_ms` and
 `script_layouts` (style and layout that scripts asked for), and
 `script_wait_ms` (time the thread waited instead of running, mostly for the
-network; Linux only, `null` elsewhere). `--no-js` (or `HUGINN_NO_JS=1`) turns scripts off.
+network; Linux only, `null` elsewhere). Time the settle loop sleeps until
+responses to scripts' requests arrive counts in `fetch_ms`, not in
+`script_ms` or `script_timers_ms`. `--no-js` (or `HUGINN_NO_JS=1`) turns scripts off.
 The window runs only the parser-blocking scripts here and the `async`,
 `defer` and module scripts after its first paint (see "The window").
 
@@ -112,8 +115,38 @@ The window runs only the parser-blocking scripts here and the `async`,
   same wall time). It gets the document through `HostContext` for each
   call. A small watchdog thread terminates a call that runs past 2 s. Each
   timer task gets the whole budget (a round starts no new task after it),
-  and time the thread waits for the network (sync `fetch`/XHR, inserted
-  scripts, modules) does not count.
+  and time the thread waits for the network (sync XHR, inserted scripts,
+  modules) does not count.
+- `fetch()` and async XHR run on threads of their own
+  (`huginn-js/src/v8engine/fetches.rs`), several at once, as in Chrome; the
+  engine thread keeps running scripts meanwhile. Each request runs the
+  page's own `Loader::fetch_for_script` (`HostContext::loader` is an
+  `Arc`), so cookies, CORS, referrers, the loader's memory and the HTTP
+  cache work as on the engine thread, and `HUGINN_NET_LOG` lines come from
+  the request's thread. A page has at most 16 requests in flight; the rest
+  wait in a queue. Chrome has no limit per page (6 connections per host on
+  HTTP/1.1, 256 in all), but here a request holds a thread while it waits
+  (up to the 30 s request timeout), and a page that starts hundreds of
+  requests must not make hundreds of threads. A thread takes queued
+  requests until none are left, then ends: an idle page has none.
+  Responses queue up in arrival order. `run_timers` hands each one to the
+  prelude as a task of its own, after the tasks already due, with a
+  microtask checkpoint after each. `abort()` (an `AbortSignal`,
+  `xhr.abort()`, an XHR `timeout`) settles at once; a request that still
+  waits in the queue never goes out, and the response of one in flight is
+  dropped when it comes (a blocking ureq call cannot be stopped). Sync XHR
+  still waits on the engine thread.
+- Waiting for responses. `render` (`scripts.rs`) jumps virtual time from
+  timer to timer while no request is in flight. While requests are in
+  flight, virtual time runs at real speed: the thread sleeps until the next
+  timer is due or a response arrives, whichever comes first. After the
+  500 ms window, virtual time stops and the thread still waits for
+  responses (including requests that responses start) until the settle
+  loop's 1.5 s of real time are spent; later responses are dropped with
+  the isolate. The window's engine thread sleeps on its command channel;
+  the request's thread wakes it with `Command::Wake` through a weak
+  reference to the channel, so a closed tab's thread can still end. The
+  wait is outside any engine call, so the watchdog does not run.
 - `huginn open` has two threads of its own; see the next section.
 
 ## The window (`huginn open`)
@@ -325,8 +358,10 @@ with `live`; `huginn render` still drops the isolate before style).
 
 - **Timers.** The engine thread sleeps until a command or the next timer
   (`recv_timeout`). Timers run in real time from load (the window skips the
-  500 ms virtual settle of `render`). Background tabs run them at most once
-  a second and give unused V8 heap back (`trim_memory`).
+  500 ms virtual settle of `render`). A response to a script's request wakes
+  the thread (`Command::Wake`) and is delivered like a due timer. Background
+  tabs run timers and deliver responses at most once a second and give
+  unused V8 heap back (`trim_memory`).
 - **Input.** Every page pointer and key event goes to the engine
   (`PageInput`); moves are coalesced per batch. The engine fires pointer,
   mouse, keyboard, focus, input, change and submit events through the
@@ -389,8 +424,8 @@ with `live`; `huginn render` still drops the isolate before style).
   `change` in React 18's event system, `hashchange` routing). Form named
   access (`form.q`), `form.reset()` restoring defaults, IME, multi-line
   caret by clicks in wrapped textareas, `<select multiple>`, drag and drop,
-  `contenteditable`. XHR/fetch after load block the tab's engine thread,
-  one request at a time; so do fonts and `<svg>` loaded after load.
+  `contenteditable`. Fonts and `<svg>` loaded after load block the tab's
+  engine thread.
 
 ## Timing (`perf.rs`)
 

@@ -1,12 +1,14 @@
-//! Cookies, CORS and referrers through the real binary (`huginn open
-//! --commands`) against local test servers. Two servers on 127.0.0.1 and a
-//! `localhost` URL give same-site, cross-origin and cross-site requests.
-//! Window layout at 800x600: the page starts 80 px down.
+//! Cookies, CORS, referrers and scripts' requests through the real binary
+//! (`huginn open --commands`, `huginn render`) against local test servers.
+//! Two servers on 127.0.0.1 and a `localhost` URL give same-site,
+//! cross-origin and cross-site requests. Window layout at 800x600: the page
+//! starts 80 px down.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -227,12 +229,25 @@ fn cross_origin_requests_follow_cors() {
         "allowed=GET ok del=TypeError denied=TypeError mod=TypeError opaque=opaque0 put=PUT ok xhr=Error lib=lib"
     );
     let log = api_log.lock().unwrap();
-    let pre = log
-        .iter()
-        .find(|r| r.method == "OPTIONS" && r.path == "/put")
-        .unwrap();
-    assert_eq!(pre.header("access-control-request-method"), "PUT");
-    assert_eq!(pre.header("access-control-request-headers"), "x-token");
+    // The requests run in parallel: the PUT and DELETE preflights come in
+    // either order.
+    let preflight = |method: &str| {
+        log.iter()
+            .find(|r| {
+                r.method == "OPTIONS"
+                    && r.path == "/put"
+                    && r.header("access-control-request-method") == method
+            })
+            .unwrap_or_else(|| panic!("no {method} preflight in {log:?}"))
+    };
+    assert_eq!(
+        preflight("PUT").header("access-control-request-headers"),
+        "x-token"
+    );
+    assert_eq!(
+        preflight("DELETE").header("access-control-request-headers"),
+        ""
+    );
     assert!(
         !log.iter().any(|r| r.method == "DELETE"),
         "a refused preflight stops the request"
@@ -487,6 +502,65 @@ fn lazy_images_load_after_the_first_paint_and_keep_the_restored_scroll() {
     );
 }
 
+#[test]
+fn a_fetch_that_answers_after_load_updates_the_live_page() {
+    // No timers: only the response can wake the tab's engine thread.
+    let (port, _) = serve(|r| match r.path.as_str() {
+        "/slow" => {
+            std::thread::sleep(Duration::from_millis(600));
+            ("200 OK\nContent-Type: text/plain".into(), "late".into())
+        }
+        "/" => html(
+            "",
+            "<title>start</title><p id=out>waiting</p><script>
+            fetch('/slow').then(r => r.text()).then(t => {
+              document.getElementById('out').textContent = t;
+              document.title = 'got ' + t;
+            });
+            </script>",
+        ),
+        _ => ("404 Not Found".into(), String::new()),
+    });
+    let s = run(
+        &format!("http://127.0.0.1:{port}/"),
+        "wait; state; sleep 1500; state",
+        &[],
+    );
+    // The load does not wait for the request.
+    assert_eq!(title(&s[0]), "start");
+    assert_eq!(title(&s[1]), "got late");
+}
+
+/// Serve HTTP on 127.0.0.1, one thread per connection: `handler` maps a path
+/// to a delay in ms and an HTML body.
+fn serve_parallel(handler: fn(&str) -> (u64, String)) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = r.read_line(&mut first);
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (ms, body) = handler(&path);
+                std::thread::sleep(Duration::from_millis(ms));
+                let mut s = stream;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    port
+}
+
 /// A page with an inline script that logs DOMContentLoaded (`D`) and load
 /// (`L`) in the title, and `script`, which loads `/slow.js` (`S`). The
 /// server answers `/slow.js` after `SLOW_MS`.
@@ -525,6 +599,56 @@ fn serve_slow_script_pages() -> u16 {
         _ => ("404 Not Found".into(), String::new()),
     });
     port
+}
+
+/// `huginn render <url>`: the JSON line.
+fn render(url: &str) -> Value {
+    let out_png =
+        std::env::temp_dir().join(format!("huginn-net-render-{}.png", std::process::id()));
+    let out = Command::new(env!("CARGO_BIN_EXE_huginn"))
+        .args(["render", url, "--out", out_png.to_str().unwrap()])
+        .env("HUGINN_NET_LOOPBACK_ONLY", "1")
+        .output()
+        .expect("run huginn");
+    let _ = std::fs::remove_file(&out_png);
+    assert!(
+        out.status.success(),
+        "huginn render failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("one JSON line")
+}
+
+#[test]
+fn render_waits_for_script_requests_within_the_settle_budget() {
+    // `/` adds 40 paragraphs in two chained requests and 1000 more after a
+    // request that takes 10 s; `/sync` adds the 40 at once.
+    let port = serve_parallel(|path| {
+        let script = match path {
+            "/data" => return (300, "x".into()),
+            "/hang" => return (10_000, "y".into()),
+            "/sync" => "add(40);",
+            _ => {
+                "fetch('/data').then(r => r.text()).then(() => { add(20); return fetch('/data'); })
+                   .then(r => r.text()).then(() => add(20));
+                 fetch('/hang').then(() => add(1000));"
+            }
+        };
+        (
+            0,
+            format!(
+                "<body><script>
+                 const add = n => {{ for (let i = 0; i < n; i++) document.body.appendChild(document.createElement('p')); }};
+                 {script}
+                 </script></body>"
+            ),
+        )
+    });
+    let sync = render(&format!("http://127.0.0.1:{port}/sync"));
+    let fetched = render(&format!("http://127.0.0.1:{port}/"));
+    assert_eq!(fetched["nodes"], sync["nodes"], "{fetched}");
+    // The hanging request is given up after the 1.5 s settle budget.
+    assert!(fetched["total_ms"].as_f64().unwrap() < 5000.0, "{fetched}");
 }
 
 #[test]

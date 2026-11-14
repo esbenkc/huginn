@@ -6,8 +6,8 @@
 //! table, then paints and hit-tests on its own.
 
 use std::any::Any;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, NodeId, local_name, ns};
@@ -66,6 +66,9 @@ pub enum Command {
         generation: u64,
         event: crate::live::PageInput,
     },
+    /// A response to a script's request arrived (sent by the request's
+    /// thread, not by the UI): wake up and deliver it.
+    Wake,
 }
 
 impl Command {
@@ -82,6 +85,7 @@ impl Command {
             | Command::SetVisible { seq, .. }
             | Command::Run { seq, .. }
             | Command::Input { seq, .. } => *seq,
+            Command::Wake => 0,
         }
     }
 }
@@ -199,18 +203,25 @@ impl Links {
 /// Delivers engine events to the UI thread (tagged with the tab by the caller).
 pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 
-/// Start one tab's engine thread. It ends when the returned sender is
-/// dropped (the tab closed or was discarded), freeing the page.
+/// The UI's end of a tab's engine thread. The thread ends when the last
+/// one is dropped (the tab closed or was discarded), freeing the page.
+/// Responses to scripts' requests wake the thread through a weak
+/// reference, so they never keep it alive.
+pub type EngineTx = Arc<Sender<Command>>;
+
+/// Start one tab's engine thread.
 /// `js`: run page scripts (when built with the `v8` feature). `net`: the
 /// network of the tab's profile (the private one in private windows).
-pub fn spawn(js: bool, net: Arc<Network>, notify: Notify) -> Sender<Command> {
+pub fn spawn(js: bool, net: Arc<Network>, notify: Notify) -> EngineTx {
     let (tx, rx) = channel();
+    let tx = Arc::new(tx);
+    let weak = Arc::downgrade(&tx);
     // Style and layout recurse on deep DOMs: same big stack as `render`. Only
     // touched stack pages are committed, so idle tabs cost no stack memory.
     std::thread::Builder::new()
         .name("engine".into())
         .stack_size(256 << 20)
-        .spawn(move || run(&rx, js, &net, &*notify))
+        .spawn(move || run(&rx, &weak, js, &net, &*notify))
         .expect("spawn engine thread");
     tx
 }
@@ -227,12 +238,19 @@ pub(crate) struct Current {
     pub live: LivePage,
 }
 
-fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(EngineEvent)) {
+fn run(
+    rx: &Receiver<Command>,
+    tx: &Weak<Sender<Command>>,
+    js: bool,
+    net: &Arc<Network>,
+    notify: &dyn Fn(EngineEvent),
+) {
     let mut current: Option<Current> = None;
     // Whether the tab is the active one in its window.
     let mut visible = true;
     loop {
-        // Sleep until a command arrives or the page's next timer is due.
+        // Sleep until a command arrives, a response to a script's request
+        // arrives (`Command::Wake`), or the page's next timer is due.
         let wake = current.as_ref().and_then(|c| c.live.next_wakeup(&c.page));
         let first = match wake {
             None => match rx.recv() {
@@ -256,10 +274,14 @@ fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(Eng
                 Err(RecvTimeoutError::Disconnected) => break,
             },
         };
+        // A response is delivered like a due timer (`next_wakeup`).
+        if matches!(first, Command::Wake) {
+            continue;
+        }
         // Coalesce a burst (live resize sends many): only the last load and
         // the last viewport matter, and only the last pointer move.
         let mut batch = vec![first];
-        batch.extend(rx.try_iter());
+        batch.extend(rx.try_iter().filter(|c| !matches!(c, Command::Wake)));
         let last_seq = batch.last().map_or(0, Command::seq);
         let start = batch
             .iter()
@@ -296,6 +318,14 @@ fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(Eng
                         kind,
                         net,
                     );
+                    if let Some(page_js) = cur.page.js.as_deref_mut() {
+                        let tx = tx.clone();
+                        page_js.set_waker(Arc::new(move || {
+                            if let Some(tx) = tx.upgrade() {
+                                let _ = tx.send(Command::Wake);
+                            }
+                        }));
+                    }
                     notify(EngineEvent::Loaded(Box::new(loaded)));
                     cur.live.set_visible(&mut cur.page, visible);
                     cur.live.after_load(
@@ -404,6 +434,8 @@ fn run(rx: &Receiver<Command>, js: bool, net: &Arc<Network>, notify: &dyn Fn(Eng
                         crate::live::input(cur, event, visible, notify);
                     }
                 }
+                // Filtered out above.
+                Command::Wake => {}
             }
         }
         notify(EngineEvent::Idle { seq: last_seq });
@@ -425,7 +457,7 @@ fn load(
     let t = Instant::now();
     // One loader per page, on the profile's network (idle connections and
     // the HTTP cache outlive the page); scripts keep fetching through it
-    // (XMLHttpRequest, fetch) while the page lives.
+    // (XMLHttpRequest, fetch, on threads of their own) while the page lives.
     let loader = Arc::new(Loader::with_network(net.clone()));
     loader.set_load_kind(kind);
     let internal;

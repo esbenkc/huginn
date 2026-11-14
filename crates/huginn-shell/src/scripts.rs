@@ -5,11 +5,13 @@
 //! Order (CONTRACTS.md, huginn-js): blocking scripts in document order, then
 //! async ones, then deferred ones; a microtask checkpoint after each; then
 //! DOMContentLoaded and load; then timers due within `SETTLE_MS` of virtual
-//! time (no real waiting) or until the real-time budget is spent. The
-//! window runs only the blocking scripts before its first paint and the
-//! rest after it ([`run_later`]); its timers run in real time.
+//! time, and responses to the requests scripts started (`fetch()`, XHR),
+//! until the real-time budget is spent. The window runs only the blocking
+//! scripts before its first paint and the rest after it ([`run_later`]);
+//! its timers run in real time.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use huginn_dom::{Document, NodeId};
@@ -25,7 +27,7 @@ use huginn_style::{
 
 /// Virtual time timers may advance after `load`.
 const SETTLE_MS: f64 = 500.0;
-/// Real time the settle loop may take.
+/// Real time the settle loop may take, waiting for scripts' requests included.
 const SETTLE_BUDGET: Duration = Duration::from_millis(1500);
 /// Real time the parser-found scripts may take together; later ones are
 /// skipped (each single call is also cut off by the engine's watchdog).
@@ -51,6 +53,9 @@ pub struct ScriptReport {
     /// Time the thread was on a CPU during the phase, if the system tells
     /// us. The rest of the phase it waited, mostly for the network.
     pub cpu_time: Option<Duration>,
+    /// Time the settle loop slept until responses to scripts' requests
+    /// arrived. Network time, not part of the times above.
+    pub net_wait: Duration,
 }
 
 /// How far [`run`] takes the load after the scripts it is given.
@@ -73,7 +78,7 @@ pub enum Until {
 pub fn run(
     engine: &mut dyn ScriptEngine,
     doc: &mut Document,
-    loader: &Loader,
+    loader: &Arc<Loader>,
     document_url: &Url,
     referrer: &str,
     base: &Url,
@@ -119,18 +124,41 @@ pub fn run(
 
     // Settle: jump virtual time to each due timer, without real waiting. The
     // window skips this: its timers run in real time after load.
+    //
+    // While scripts' requests are in flight, virtual time runs at real
+    // speed instead: the loop sleeps until the next timer is due or a
+    // response arrives, whichever comes first, and the response is
+    // delivered then. After the virtual window's end, time stops; the loop
+    // still waits for responses to requests started in the window (and to
+    // the requests their handlers start) until `SETTLE_BUDGET` of real time
+    // is spent. A request that takes longer is dropped with the isolate.
     let mut now = elapsed_ms();
-    let settle_end = if until == Until::Settled {
-        now + SETTLE_MS
-    } else {
-        f64::NEG_INFINITY
-    };
+    let settle_end = now + SETTLE_MS;
     let real_end = Instant::now() + SETTLE_BUDGET;
-    while let Some(due) = engine.next_timer_due() {
-        if due > settle_end || Instant::now() > real_end {
+    while until == Until::Settled {
+        let real_left = real_end.saturating_duration_since(Instant::now());
+        if real_left.is_zero() {
             break;
         }
-        now = now.max(due);
+        let due = engine.next_timer_due().filter(|d| *d <= settle_end);
+        if engine.requests_in_flight() == 0 || due.is_some_and(|d| d <= now) {
+            let Some(due) = due else { break };
+            now = now.max(due);
+        } else {
+            let until = due.unwrap_or(settle_end);
+            let wait = if until > now {
+                Duration::from_secs_f64((until - now) / 1000.0).min(real_left)
+            } else {
+                real_left
+            };
+            let t = Instant::now();
+            engine.wait_for_response(wait);
+            let waited = t.elapsed();
+            report.net_wait += waited;
+            if until > now {
+                now = (now + waited.as_secs_f64() * 1000.0).min(until);
+            }
+        }
         cx.now_ms = now;
         if let Err(e) = engine.run_timers(&mut cx) {
             report.errors += 1;
@@ -138,7 +166,7 @@ pub fn run(
         }
     }
     drop(cx);
-    report.timers_time = timers_start.elapsed();
+    report.timers_time = timers_start.elapsed().saturating_sub(report.net_wait);
     report.layouts = layout.passes;
     report.layout_time = layout.spent;
     report.cpu_time = cpu_start

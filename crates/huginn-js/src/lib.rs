@@ -23,6 +23,8 @@ mod importmap;
 mod v8engine;
 
 use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
 use huginn_dom::{Document, ElementData, NodeData, NodeId, local_name};
 use huginn_net::{CorsSettings, Loader, Url};
@@ -151,7 +153,9 @@ pub fn inline_source(doc: &Document, script: NodeId) -> String {
 /// for each call, so the engine never owns the document.
 pub struct HostContext<'a> {
     pub document: &'a mut Document,
-    pub loader: &'a Loader,
+    /// The page's loader. Shared, so requests of scripts (`fetch()`,
+    /// `XMLHttpRequest`) can run on other threads.
+    pub loader: &'a Arc<Loader>,
     /// `document.URL` and `location`.
     pub document_url: &'a Url,
     /// `document.referrer`: the `Referer` the document was requested with.
@@ -313,7 +317,8 @@ impl std::error::Error for ScriptError {}
 /// 1. `execute` for each script (blocking ones during parse, then deferred),
 /// 2. `dispatch_event(Document, "DOMContentLoaded")`, `dispatch_event(Window, "load")`,
 /// 3. `run_microtasks` after every task,
-/// 4. `run_timers` while `next_timer_due` is within the load budget.
+/// 4. `run_timers` while `next_timer_due` is within the load budget, and
+///    `wait_for_response` while `requests_in_flight` is not zero.
 ///
 /// After any call that changed `document.generation()`, the shell re-runs
 /// style and layout before painting.
@@ -341,11 +346,30 @@ pub trait ScriptEngine {
     fn run_microtasks(&mut self, cx: &mut HostContext<'_>) -> Result<(), ScriptError>;
 
     /// Run every timer (`setTimeout`, `setInterval`, `requestAnimationFrame`)
-    /// due at or before `cx.now_ms`. Returns how many callbacks ran.
+    /// due at or before `cx.now_ms`, and deliver the responses to scripts'
+    /// requests that arrived (each in its own task, in arrival order).
+    /// Returns how many callbacks ran.
     fn run_timers(&mut self, cx: &mut HostContext<'_>) -> Result<usize, ScriptError>;
 
-    /// Time (ms since navigation start) of the earliest pending timer.
+    /// Time (ms since navigation start) of the earliest pending timer. An
+    /// arrived response is due now.
     fn next_timer_due(&self) -> Option<f64>;
+
+    /// Requests of scripts (`fetch()`, async `XMLHttpRequest`) that run on
+    /// other threads and whose response the page has not got yet.
+    fn requests_in_flight(&self) -> usize {
+        0
+    }
+
+    /// Sleep until a response to one of those requests arrives, at most
+    /// `timeout`. Returns true if one is ready for `run_timers`.
+    fn wait_for_response(&self, _timeout: Duration) -> bool {
+        false
+    }
+
+    /// `wake` is called, on another thread, when a response arrives while
+    /// the engine is idle (the window's engine thread sleeps until then).
+    fn set_waker(&mut self, _wake: Waker) {}
 
     /// Requests scripts made since the last call (navigations from
     /// `location`, `form.submit()`, `a.click()`).
@@ -362,6 +386,10 @@ pub trait ScriptEngine {
     /// tab goes to the background).
     fn trim_memory(&mut self) {}
 }
+
+/// Wakes the thread that drives a [`ScriptEngine`] (see
+/// [`ScriptEngine::set_waker`]).
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 /// Engine used while V8 is not linked: runs no script, like a browser with
 /// JavaScript disabled. Events and timers are no-ops because no listener or

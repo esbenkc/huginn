@@ -94,5 +94,5 @@ function hostDispatch(kind, id, type, bubbles, cancelable, iface, init, trusted)
   return r;
 }
 
-return { dispatch: hostDispatch, runOne, nextDue };
+return { dispatch: hostDispatch, runOne, nextDue, netDone };
 })

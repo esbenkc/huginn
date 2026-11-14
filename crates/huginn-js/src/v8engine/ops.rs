@@ -6,10 +6,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use huginn_dom::{Document, LocalName, Namespace, NodeData, NodeId, QualName, local_name, ns};
-use huginn_net::{
-    CorsSettings, Credentials, Mode, RedirectMode, ResourceKind, ResponseType, ScriptRequest, Url,
-};
+use huginn_net::{CorsSettings, Credentials, Mode, RedirectMode, ResourceKind, ScriptRequest, Url};
 
+use super::fetches::{self, Response};
 use super::{SharedState, run_classic};
 use crate::activation::{self, EventSink};
 use crate::dom_ops::{self, InsertError};
@@ -781,16 +780,17 @@ op!(op_log(scope, args, rv) {
     }
 });
 
-// `fetch()` and XHR: N.fetch(url, method, headers, body, mode, credentials,
-// redirect). `headers`: "name\nvalue\n..." pairs; `body`: null, a string or
-// a Uint8Array. Returns [status, url, headers ("name: value\r\n"...), body
-// text, type, redirected ("1" or "")], or null for a network error (CORS
-// failures included). Opaque responses come back empty.
-op!(op_fetch(scope, args, rv) {
-    let Some(cx) = host(scope) else { return };
-    let href = arg_str(scope, &args, 0);
-    let method = arg_str(scope, &args, 1);
-    let raw_headers = arg_str(scope, &args, 2);
+/// The request of `N.fetch` and `N.fetchStart`: (url, method, headers, body,
+/// mode, credentials, redirect). `headers`: "name\nvalue\n..." pairs; `body`:
+/// null, a string or a Uint8Array. `None`: a network error at once.
+fn script_request(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &Args<'_>,
+    cx: &HostContext<'_>,
+) -> Option<ScriptRequest> {
+    let href = arg_str(scope, args, 0);
+    let method = arg_str(scope, args, 1);
+    let raw_headers = arg_str(scope, args, 2);
     let body = {
         let b = args.get(3);
         if b.is_null_or_undefined() {
@@ -803,23 +803,23 @@ op!(op_fetch(scope, args, rv) {
             Some(b.to_rust_string_lossy(scope).into_bytes())
         }
     };
-    let mode = match arg_str(scope, &args, 4).as_str() {
+    let mode = match arg_str(scope, args, 4).as_str() {
         "no-cors" => Mode::NoCors,
         "same-origin" => Mode::SameOrigin,
-        "navigate" => return rv.set_null(),
+        "navigate" => return None,
         _ => Mode::Cors,
     };
-    let credentials = match arg_str(scope, &args, 5).as_str() {
+    let credentials = match arg_str(scope, args, 5).as_str() {
         "omit" => Credentials::Omit,
         "include" => Credentials::Include,
         _ => Credentials::SameOrigin,
     };
-    let redirect = match arg_str(scope, &args, 6).as_str() {
+    let redirect = match arg_str(scope, args, 6).as_str() {
         "error" => RedirectMode::Error,
         "manual" => RedirectMode::Manual,
         _ => RedirectMode::Follow,
     };
-    let Some(url) = huginn_net::resolve_url(cx.base_url, &href) else { return rv.set_null() };
+    let url = huginn_net::resolve_url(cx.base_url, &href)?;
     let mut headers = Vec::new();
     let mut lines = raw_headers.split('\n');
     while let (Some(n), Some(v)) = (lines.next(), lines.next()) {
@@ -827,32 +827,75 @@ op!(op_fetch(scope, args, rv) {
             headers.push((n.to_owned(), v.to_owned()));
         }
     }
-    let req = ScriptRequest { url, method, headers, body, mode, credentials, redirect };
-    let r = match super::network_wait(&state(scope), || cx.loader.fetch_for_script(req)) {
-        Ok(r) => r,
-        Err(e) => {
-            if state(scope).borrow().options.console {
-                eprintln!("huginn: fetch: {e}");
-            }
-            return rv.set_null();
-        }
+    Some(ScriptRequest {
+        url,
+        method,
+        headers,
+        body,
+        mode,
+        credentials,
+        redirect,
+    })
+}
+
+/// A response for the prelude: [status, url, headers ("name: value\r\n"...),
+/// body text, type, redirected ("1" or "")], or null for a network error.
+pub(super) fn response_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    r: Option<&Response>,
+) -> v8::Local<'s, v8::Value> {
+    let Some(r) = r else {
+        return v8::null(scope).into();
     };
-    let status = r.status.to_string();
-    let mut head = String::new();
-    for (n, v) in &r.headers {
-        head.push_str(n);
-        head.push_str(": ");
-        head.push_str(v);
-        head.push_str("\r\n");
-    }
-    let (ty, url) = match r.response_type {
-        ResponseType::Basic => ("basic", r.url.as_str()),
-        ResponseType::Cors => ("cors", r.url.as_str()),
-        ResponseType::Opaque => ("opaque", ""),
-        ResponseType::OpaqueRedirect => ("opaqueredirect", ""),
-    };
-    let text = r.text();
-    set_strs(scope, &mut rv, &[&status, url, &head, &text, ty, if r.redirected { "1" } else { "" }]);
+    let redirected = if r.redirected { "1" } else { "" };
+    let items = [
+        r.status.as_str(),
+        &r.url,
+        &r.head,
+        &r.text,
+        r.kind,
+        redirected,
+    ];
+    let elems: Vec<v8::Local<v8::Value>> = items
+        .iter()
+        .map(|s| {
+            v8::String::new(scope, s).map_or_else(|| v8::String::empty(scope).into(), Into::into)
+        })
+        .collect();
+    v8::Array::new_with_elements(scope, &elems).into()
+}
+
+// Synchronous `XMLHttpRequest`: N.fetch(url, method, headers, body, mode,
+// credentials, redirect) sends the request on this thread and returns the
+// response (see `response_value`). Opaque responses come back empty.
+op!(op_fetch(scope, args, rv) {
+    let Some(cx) = host(scope) else { return };
+    let Some(req) = script_request(scope, &args, cx) else { return rv.set_null() };
+    let console = state(scope).borrow().options.console;
+    let loader = cx.loader;
+    let r = super::network_wait(&state(scope), || fetches::send(loader, req, console));
+    let v = response_value(scope, r.as_ref());
+    rv.set(v);
+});
+
+// `fetch()` and async `XMLHttpRequest`: N.fetchStart(the arguments of
+// N.fetch) starts the request on another thread and returns its id, or 0
+// for a network error at once. The response comes back through the
+// prelude's `netDone` hook in a later task.
+op!(op_fetch_start(scope, args, rv) {
+    let Some(cx) = host(scope) else { return };
+    let Some(req) = script_request(scope, &args, cx) else { return rv.set_uint32(0) };
+    let st = state(scope);
+    let mut st = st.borrow_mut();
+    let console = st.options.console;
+    let id = st.fetches.start(cx.loader.clone(), req, console);
+    rv.set_uint32(id);
+});
+
+// N.fetchCancel(id): the script aborted the request; drop its response.
+op!(op_fetch_cancel(scope, args, rv) {
+    let id = arg_u32(scope, &args, 0);
+    state(scope).borrow_mut().fetches.cancel(id);
 });
 
 // `document.cookie` (no HttpOnly cookies).
@@ -1101,7 +1144,8 @@ pub(super) fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s,
         "byClass" => op_by_class, "docEl" => op_doc_el, "head" => op_head, "body" => op_body,
         "contains" => op_contains, "cmp" => op_cmp, "connected" => op_connected, "quirks" => op_quirks,
         "geom" => op_geom, "scrollPos" => op_scroll_pos, "setScrollPos" => op_set_scroll_pos, "cstyle" => op_cstyle, "now" => op_now, "taskNow" => op_task_now, "log" => op_log,
-        "fetch" => op_fetch, "cookie" => op_cookie, "setCookie" => op_set_cookie, "referrer" => op_referrer,
+        "fetch" => op_fetch, "fetchStart" => op_fetch_start, "fetchCancel" => op_fetch_cancel,
+        "cookie" => op_cookie, "setCookie" => op_set_cookie, "referrer" => op_referrer,
         "url" => op_url, "urlSet" => op_url_set, "docUrl" => op_doc_url, "baseUrl" => op_base_url,
         "curScript" => op_cur_script, "write" => op_write, "customIn" => op_custom_in,
         "defineCE" => op_define_ce, "tmpl" => op_tmpl, "viewport" => op_viewport,

@@ -1204,6 +1204,7 @@ dependencies = [
  "huginn-dom",
  "huginn-net",
  "huginn-style",
+ "parking_lot",
  "url",
  "v8",
 ]

@@ -8,12 +8,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 
 use huginn_net::{CookieJar, DecodedImage, HttpCache, Network, Url};
 
 use crate::browser::{Browser, WindowOp};
-use crate::engine::{self, Command, EngineEvent};
+use crate::engine::{self, EngineEvent, EngineTx};
 use crate::internal_pages::{self, Bookmark};
 use crate::tab::{HistoryEntry, Opener, TabId};
 
@@ -91,7 +90,7 @@ impl Shared {
 
     /// Start the engine thread of a tab; `private`: it uses the private
     /// windows' network.
-    pub(crate) fn spawn_engine(&mut self, tab: TabId, private: bool) -> Sender<Command> {
+    pub(crate) fn spawn_engine(&mut self, tab: TabId, private: bool) -> EngineTx {
         let notify = self.notify.clone();
         let net = if private {
             self.private_net

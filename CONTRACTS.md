@@ -735,7 +735,7 @@ pub fn inline_source(doc: &Document, script: NodeId) -> String;
 /// Built by the shell for each call. The engine never owns the document.
 pub struct HostContext<'a> {
     pub document: &'a mut Document,
-    pub loader: &'a Loader,
+    pub loader: &'a Arc<Loader>,             // shared: fetch() and async XHR run on other threads
     pub document_url: &'a Url,               // document.URL, location
     pub referrer: &'a str,                   // document.referrer
     pub base_url: &'a Url,                   // <base href> or the document URL
@@ -768,9 +768,11 @@ pub trait ScriptEngine {
     fn dispatch_event(&mut self, cx: &mut HostContext<'_>, target: EventTarget, event: &Event) -> Result<bool, ScriptError>;
     fn run_microtasks(&mut self, cx: &mut HostContext<'_>) -> Result<(), ScriptError>;
     /// Run timers (setTimeout, setInterval, requestAnimationFrame, message
-    /// tasks) and script-inserted external scripts due at or before cx.now_ms.
+    /// tasks) and script-inserted external scripts due at or before cx.now_ms,
+    /// and deliver arrived responses to fetch()/async XHR (one task each, in
+    /// arrival order, microtasks after each).
     fn run_timers(&mut self, cx: &mut HostContext<'_>) -> Result<usize, ScriptError>;
-    fn next_timer_due(&self) -> Option<f64>;
+    fn next_timer_due(&self) -> Option<f64>;  // an arrived response is due now
 }
 pub struct ScriptingDisabled;                // runs nothing
 pub struct EngineOptions { pub call_budget_ms: u64, pub console: bool }   // Default: 2000 ms, HUGINN_JS_CONSOLE
@@ -781,7 +783,12 @@ pub fn create_engine(options: EngineOptions) -> Option<Box<dyn ScriptEngine>>;
 // Event::ui(kind, interface, init) builds a bubbling, cancelable, composed one.
 pub enum HostRequest { Navigate { url: Url, post: Option<forms::PostBody>, new_tab: bool, replace: bool } }
 // ScriptEngine, provided methods: take_requests() -> Vec<HostRequest> (location, form.submit(),
-// a.click()), heap_bytes() -> usize (0 = no isolate), trim_memory() (full GC).
+// a.click()), heap_bytes() -> usize (0 = no isolate), trim_memory() (full GC),
+// requests_in_flight() -> usize (fetch()/async XHR started, response not delivered, aborted
+// ones excluded), wait_for_response(&self, timeout: Duration) -> bool (sleep until a response
+// arrives; true: run_timers delivers it), set_waker(Waker) (called on the request's thread when
+// a response arrives).
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 // huginn_js::forms: activation behavior (Activation), form owner, entry list, submission
 // (GET query / POST urlencoded, multipart, text/plain), checkedness, select options.
 // huginn_js::activation: click / submit / implicit_submit / set_focus over an EventSink;
@@ -803,7 +810,8 @@ DOM rules (pre-insertion checks, queries, URL parts) are in `src/dom_ops.rs`.
 | `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `cloneNode` | `huginn_dom::parse_fragment`, `serialize`, `Document::clone_node` |
 | `querySelector(All)`, `matches`, `closest` | `huginn_style::query_selector(_all)`, `matches_selector`, `closest` |
 | `getBoundingClientRect`, `offset*`, `client*`, `getComputedStyle` | `cx.layout` (`LayoutHost`) |
-| `fetch`, `XMLHttpRequest` | `cx.loader.fetch_for_script`: Fetch modes and CORS; other origins must allow `cors` requests |
+| `fetch`, async `XMLHttpRequest` | `cx.loader.fetch_for_script` on a thread of the page (`v8engine/fetches.rs`, at most 16 in flight per page, the rest queued): Fetch modes and CORS; other origins must allow `cors` requests |
+| sync `XMLHttpRequest` | `cx.loader.fetch_for_script` on the engine thread |
 | inserted `<script src>`, module imports | `cx.loader.fetch_with`: classic scripts `no-cors` from any origin; modules and `crossorigin` scripts CORS |
 | `document.cookie`, `document.referrer` | `cx.loader.cookies()` (no HttpOnly), `cx.referrer` |
 | wrapper identity | one JS wrapper per `NodeId::to_raw`, cached |
@@ -814,7 +822,10 @@ Event loop, owned by the shell (`huginn-shell/src/scripts.rs`):
 2. `dispatch_event(Document, "DOMContentLoaded")`, then
    `dispatch_event(Window, "load")`, each followed by `run_microtasks`.
 3. Settle: jump virtual time to each due timer and `run_timers`, up to
-   500 ms of virtual time or 1.5 s of real time.
+   500 ms of virtual time or 1.5 s of real time. While `requests_in_flight`
+   is not zero, virtual time runs at real speed instead: `wait_for_response`
+   until the next timer is due, then `run_timers`. After the 500 ms, time
+   stops and the loop waits for responses until the 1.5 s are spent.
 4. If `document.generation()` changed, pick up new stylesheets and images,
    then style, layout and paint once.
 The window (`huginn open`) runs only the `Blocking` scripts in step 1 and
@@ -824,7 +835,7 @@ before the paint unless a `Defer` script is to come, `load` unless any
 script is to come. It skips step 3 (its timers run in real time).
 No V8 isolate is created for pages without scripts: an isolate costs RSS.
 Timer due times (setTimeout, setInterval, rAF one frame later, message and
-fetch tasks) count from the time the engine call started (`cx.now_ms`), not
+response tasks) count from the time the engine call started (`cx.now_ms`), not
 from `performance.now()`, so their order does not depend on CPU speed.
 
 ## huginn-shell
@@ -902,13 +913,15 @@ impl Tab {
     pub fn link_at(&self, x: f32, y: f32) -> Option<&Url>;
 }
 
-// engine.rs (one thread per tab; dropped when the tab closes or is discarded)
+// engine.rs (one thread per tab; it ends when the tab drops its EngineTx: closed or discarded)
 pub type Job = Box<dyn FnOnce(&mut Page, &mut LayoutEngine, Viewport) -> Option<EngineEvent> + Send>;
 pub struct PostData { pub content_type: String, pub body: Vec<u8> }
+pub type EngineTx = Arc<Sender<Command>>;   // engine::spawn returns it; responses to scripts' requests hold only a Weak
 pub enum Command { Load { seq, generation, url, viewport, post: Option<PostData>, html: Option<String> },
                    Resize { seq, generation, viewport }, Fragment { seq, generation, id },
                    SetVisible { seq, visible }, Run { seq, generation, f: Job },
-                   Input { seq, generation, event: live::PageInput } }
+                   Input { seq, generation, event: live::PageInput },
+                   Wake }   // a response to fetch()/XHR arrived (sent by its thread, not by the UI)
 pub enum EngineEvent { Loaded(Box<Loaded>), Relaid { generation, tree, links: Option<Links>, title: Option<String> },
                        Fragment { generation, targets }, Navigate { generation, url, post: Option<PostData>, mods: Modifiers },
                        Interact(Box<dyn Any + Send>), Live(live::LiveEvent),
@@ -938,7 +951,7 @@ discarded tab gets fresh `PageState`/`TabState`.
 
 Engine-side hook points (the live JavaScript code in `engine.rs`): `Current`
 (the page on the engine thread), `load()` (build the isolate), the wait in
-`run()` (timers), `live::input(cur, event, visible, notify)`. `live.rs` also exports
+`run()` (timers and responses to scripts' requests), `live::input(cur, event, visible, notify)`. `live.rs` also exports
 `text_control_focused(&Tab)` (interact skips Cmd+A/C then), `focused(&Tab) -> Option<NodeId>` (keys scroll its container), `select_picked(&mut Tab, node,
 index)` and `mouse_leave(&mut Tab)`; the engine half is `livepage.rs` (`LivePage` in `Current`).
 

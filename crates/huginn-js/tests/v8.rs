@@ -1,16 +1,19 @@
 //! Engine behavior through the public `ScriptEngine` API (needs `--features v8`).
 #![cfg(feature = "v8")]
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use huginn_dom::Document;
 use huginn_js::{
     EngineOptions, Event, EventTarget, HostContext, ScriptEngine, ScriptError, ScriptKind,
     create_engine,
 };
-use huginn_net::{Loader, Url};
+use huginn_net::{Client, Loader, Url};
 
 struct Page {
     doc: Document,
-    loader: Loader,
+    loader: Arc<Loader>,
     url: Url,
     engine: Box<dyn ScriptEngine>,
     now: f64,
@@ -24,7 +27,7 @@ impl Page {
     fn with_options(html: &str, options: EngineOptions) -> Page {
         Page {
             doc: huginn_dom::parse_html(html),
-            loader: Loader::new(),
+            loader: Arc::new(Loader::new()),
             url: Url::parse("http://127.0.0.1:9/dir/page.html").unwrap(),
             engine: create_engine(options).expect("built with the v8 feature"),
             now: 0.0,
@@ -66,12 +69,25 @@ impl Page {
             e.dispatch_event(cx, EventTarget::Window, &Event::new("load", false, false))
         })
         .unwrap();
+        self.settle(ms);
+    }
+
+    /// Run timers for `ms` of virtual time, and deliver responses to the
+    /// page's requests as they arrive (for at most 10 s of real time).
+    fn settle(&mut self, ms: f64) {
         let end = self.now + ms;
-        while let Some(due) = self.engine.next_timer_due() {
-            if due > end {
-                break;
+        let real_end = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.engine.next_timer_due() {
+                Some(due) if due <= end => self.now = self.now.max(due),
+                _ if self.engine.requests_in_flight() > 0 => {
+                    let left = real_end.saturating_duration_since(Instant::now());
+                    if !self.engine.wait_for_response(left) {
+                        break;
+                    }
+                }
+                _ => break,
             }
-            self.now = self.now.max(due);
             self.call(|e, cx| e.run_timers(cx)).unwrap();
         }
     }
@@ -407,6 +423,267 @@ fn network_waits_and_earlier_tasks_do_not_use_up_the_script_budget() {
             "{k}"
         );
     }
+}
+
+/// Serve HTTP on 127.0.0.1, one thread per connection: `/<ms>/<text>`
+/// answers `text` after `ms` milliseconds. Other origins may read it, except
+/// `private`.
+fn delay_server() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let mut r = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = r.read_line(&mut first);
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (ms, text) = path[1..].split_once('/').unwrap_or(("0", ""));
+                std::thread::sleep(Duration::from_millis(ms.parse().unwrap_or(0)));
+                let cors = if text == "private" {
+                    ""
+                } else {
+                    "Access-Control-Allow-Origin: *\r\n"
+                };
+                let mut s = stream;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\n{cors}Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                    text.len()
+                );
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn fetches_started_together_are_in_flight_together() {
+    let port = delay_server();
+    let mut p = Page::new("<body></body>");
+    let t = Instant::now();
+    p.run(&format!(
+        r#"
+        const base = 'http://127.0.0.1:{port}/400/';
+        Promise.all([0, 1, 2, 3].map(i => fetch(base + i).then(r => r.text())))
+            .then(t => {{ document.body.id = 'got' + t.join(''); }});
+        "#
+    ))
+    .unwrap();
+    // The script does not wait for the network.
+    assert!(
+        t.elapsed() < Duration::from_millis(300),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(p.engine.requests_in_flight(), 4);
+    p.settle(0.0);
+    let took = t.elapsed();
+    assert!(
+        p.doc.element_by_id("got0123").is_some(),
+        "{}",
+        p.body_html()
+    );
+    assert_eq!(p.engine.requests_in_flight(), 0);
+    // One after the other, the four responses take 1.6 s.
+    assert!(took < Duration::from_millis(1100), "{took:?}");
+}
+
+#[test]
+fn async_xhrs_sent_together_are_in_flight_together() {
+    let port = delay_server();
+    let mut p = Page::new("<body></body>");
+    let t = Instant::now();
+    p.run(&format!(
+        r#"
+        let text = '';
+        for (let i = 0; i < 4; i++) {{
+            const x = new XMLHttpRequest();
+            x.open('GET', 'http://127.0.0.1:{port}/400/' + i);
+            x.onload = () => {{
+                text += x.responseText;
+                if (text.length === 4) document.body.id = 'got' + [...text].sort().join('');
+            }};
+            x.send();
+        }}
+        "#
+    ))
+    .unwrap();
+    assert!(
+        t.elapsed() < Duration::from_millis(300),
+        "{:?}",
+        t.elapsed()
+    );
+    p.settle(0.0);
+    let took = t.elapsed();
+    assert!(
+        p.doc.element_by_id("got0123").is_some(),
+        "{}",
+        p.body_html()
+    );
+    assert!(took < Duration::from_millis(1100), "{took:?}");
+}
+
+#[test]
+fn responses_are_tasks_in_arrival_order_with_microtasks_after_each() {
+    let port = delay_server();
+    let mut p = Page::new("<body></body>");
+    p.run(&format!(
+        r#"
+        const log = [];
+        const base = 'http://127.0.0.1:{port}/';
+        const x = new XMLHttpRequest();
+        x.open('GET', base + '400/slow');
+        x.onreadystatechange = () => log.push('rs' + x.readyState);
+        for (const t of ['loadstart', 'progress', 'load', 'loadend']) {{
+            x.addEventListener(t, () => log.push(t === 'load' ? t + ':' + x.status + ':' + x.responseText : t));
+        }}
+        x.addEventListener('loadend', () => {{ document.body.dataset.log = log.join(); }});
+        x.send();
+        fetch(base + '0/fast').then(r => r.text()).then(t => log.push('fetch:' + t));
+        const y = new XMLHttpRequest();
+        y.open('GET', base + '200/mid');
+        y.onload = () => {{
+            log.push('xhr:' + y.responseText);
+            Promise.resolve().then(() => log.push('xhr:micro'));
+        }};
+        y.send();
+        setTimeout(() => log.push('timeout0'), 0);
+        log.push('sync');
+        "#
+    ))
+    .unwrap();
+    // All three responses arrive before the engine runs again; they are
+    // still delivered one task each, in the order they arrived (not the
+    // order they were sent), after the timer that was already due.
+    std::thread::sleep(Duration::from_millis(900));
+    p.settle(0.0);
+    assert_eq!(
+        p.body_attr("data-log").as_deref(),
+        Some(
+            "loadstart,sync,timeout0,fetch:fast,xhr:mid,xhr:micro,rs2,rs3,progress,rs4,load:200:slow,loadend"
+        )
+    );
+}
+
+#[test]
+fn network_errors_reject_fetch_and_fire_xhr_error() {
+    let port = delay_server();
+    // A port nobody listens on: the connection is refused.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut p = Page::new("<body></body>");
+    p.loader.set_client(Some(Client::new(p.url.clone())));
+    p.run(&format!(
+        r#"
+        const out = {{}};
+        const done = () => {{
+            if (Object.keys(out).length === 4) document.body.dataset.out = JSON.stringify(out, Object.keys(out).sort());
+        }};
+        const settle = (k, p) => p.then(
+            () => {{ out[k] = 'resolved'; done(); }},
+            e => {{ out[k] = e.constructor.name + ': ' + e.message; done(); }});
+        settle('refused', fetch('http://127.0.0.1:{dead}/'));
+        // Another origin that does not allow this one (no CORS headers).
+        settle('cors', fetch('http://127.0.0.1:{port}/0/private'));
+        const xhr = (k, url) => {{
+            const x = new XMLHttpRequest();
+            const log = [];
+            x.open('GET', url);
+            x.onreadystatechange = () => log.push('rs' + x.readyState);
+            for (const t of ['error', 'load', 'loadend']) x.addEventListener(t, () => log.push(t));
+            x.addEventListener('loadend', () => {{ out[k] = log.join() + ' status ' + x.status; done(); }});
+            x.send();
+        }};
+        xhr('xhr-refused', 'http://127.0.0.1:{dead}/');
+        xhr('xhr-cors', 'http://127.0.0.1:{port}/0/private');
+        "#
+    ))
+    .unwrap();
+    p.settle(0.0);
+    assert_eq!(
+        p.body_attr("data-out").as_deref(),
+        Some(
+            r#"{"cors":"TypeError: Failed to fetch","refused":"TypeError: Failed to fetch","xhr-cors":"rs4,error,loadend status 0","xhr-refused":"rs4,error,loadend status 0"}"#
+        )
+    );
+}
+
+#[test]
+fn aborted_requests_end_at_once_and_their_late_responses_do_nothing() {
+    let port = delay_server();
+    let mut p = Page::new("<body></body>");
+    p.run(&format!(
+        r#"
+        const log = [];
+        const late = 'http://127.0.0.1:{port}/300/late';
+        const c = new AbortController();
+        fetch(late, {{ signal: c.signal }}).then(() => log.push('fetch:resolved'), e => log.push('fetch:' + e.name));
+        const events = ['abort', 'error', 'load', 'loadend', 'timeout'];
+        const x = new XMLHttpRequest();
+        x.open('GET', late);
+        x.onreadystatechange = () => log.push('rs' + x.readyState);
+        for (const t of events) x.addEventListener(t, () => log.push(t));
+        x.send();
+        const y = new XMLHttpRequest();
+        y.open('GET', late);
+        y.timeout = 100;
+        for (const t of events) y.addEventListener(t, () => log.push('y:' + t));
+        y.send();
+        setTimeout(() => {{
+            c.abort();
+            x.abort();
+            log.push('aborted ' + x.readyState + ' ' + x.status);
+        }}, 50);
+        window.show = () => {{ document.body.dataset.log = log.join(); }};
+        "#
+    ))
+    .unwrap();
+    p.settle(1000.0);
+    // Nothing is waited for once the page gave up on its requests.
+    assert_eq!(p.engine.requests_in_flight(), 0);
+    // The responses arrive later and are dropped.
+    std::thread::sleep(Duration::from_millis(600));
+    p.settle(1000.0);
+    p.run("show()").unwrap();
+    assert_eq!(
+        p.body_attr("data-log").as_deref(),
+        Some("rs4,abort,loadend,aborted 0 0,fetch:AbortError,y:timeout,y:loadend")
+    );
+}
+
+#[test]
+fn awaiting_a_slow_fetch_does_not_use_up_the_script_budget() {
+    let port = delay_server();
+    let mut p = Page::with_options(
+        "<body></body>",
+        EngineOptions {
+            call_budget_ms: 200,
+            console: false,
+        },
+    );
+    // The task awaits a response for 3.5 times the budget, then runs.
+    p.run(&format!(
+        r#"
+        (async () => {{
+            const r = await fetch('http://127.0.0.1:{port}/700/slow');
+            const t = await r.text();
+            const end = performance.now() + 50;
+            while (performance.now() < end) {{}}
+            document.body.id = t;
+        }})();
+        "#
+    ))
+    .unwrap();
+    p.settle(0.0);
+    assert!(p.doc.element_by_id("slow").is_some(), "{}", p.body_html());
 }
 
 #[test]

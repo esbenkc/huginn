@@ -388,6 +388,27 @@ class AbortSignal extends EventTarget {
   }
 }
 expose(AbortSignal);
+// Abort steps of other APIs (fetch): they run when the signal aborts,
+// before its `abort` event. A signal from elsewhere (a polyfill) gets a
+// listener instead.
+const abortSteps = new WeakMap();
+function addAbortStep(signal, f) {
+  if (!(signal instanceof AbortSignal)) {
+    if (signal && typeof signal.addEventListener === 'function') signal.addEventListener('abort', f);
+    return;
+  }
+  let steps = abortSteps.get(signal);
+  if (!steps) abortSteps.set(signal, steps = new Set());
+  steps.add(f);
+}
+function removeAbortStep(signal, f) {
+  if (!(signal instanceof AbortSignal)) {
+    if (signal && typeof signal.removeEventListener === 'function') signal.removeEventListener('abort', f);
+    return;
+  }
+  const steps = abortSteps.get(signal);
+  if (steps) steps.delete(f);
+}
 class AbortController {
   constructor() { this.signal = new AbortSignal(); }
   abort(reason) {
@@ -395,6 +416,11 @@ class AbortController {
     if (s.aborted) return;
     s.aborted = true;
     s.reason = reason === undefined ? domErr('AbortError', 'signal is aborted without reason') : reason;
+    const steps = abortSteps.get(s);
+    if (steps) {
+      abortSteps.delete(s);
+      for (const f of steps) f();
+    }
     dispatch(s, new Event('abort'));
   }
 }
