@@ -552,8 +552,10 @@ pub struct ScriptRequest { pub url: Url, pub method: String, pub headers: Vec<(S
                            pub body: Option<Vec<u8>>, pub mode: Mode, pub credentials: Credentials,
                            pub redirect: RedirectMode }
 
-/// What a profile's tabs share (Chrome's network context): idle connections
-/// (6 per host, 5 min, TLS sessions), resolved hosts (1 min), HTTP cache, cookie jar.
+/// What a profile's tabs share (Chrome's network context): connections (HTTP/2 by
+/// ALPN, one per host; else HTTP/1.1, 6 per host; idle 5 min; TLS sessions), resolved
+/// hosts (1 min), HTTP cache, cookie jar. Its thread (`huginn-net`) starts on the first
+/// HTTP request.
 pub struct Network { .. }                    // Sync; one per profile, in an Arc
 impl Network {
     pub fn new(cookies: Arc<CookieJar>, cache: HttpCache) -> Arc<Network>;  // HUGINN_NET_LOOPBACK_ONLY=1 -> loopback only
@@ -599,8 +601,8 @@ impl Loader {
     /// any status; opaque responses come back empty, CORS ones with exposed headers only.
     /// A conditional header (If-None-Match, ...) bypasses the HTTP cache (Fetch).
     pub fn fetch_for_script(&self, req: ScriptRequest) -> Result<Resource, NetError>;
-    pub fn fetch_all(&self, requests: &[(Url, ResourceKind)]) -> Vec<Result<Arc<Resource>, NetError>>;  // <= 6 parallel, input order
-    pub fn map_parallel<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>;
+    pub fn fetch_all(&self, requests: &[(Url, ResourceKind)]) -> Vec<Result<Arc<Resource>, NetError>>;  // <= 32 parallel, input order
+    pub fn map_parallel<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>;  // <= 32 threads
     pub fn clear_cache(&self);               // drop the bodies kept in the loader (after CSS parsing); the HTTP cache stays
 }
 
@@ -640,7 +642,7 @@ impl DecodedImage {
 }
 /// PNG JPEG GIF WebP BMP ICO, AVIF (feature `avif`, default on), and SVG (sniffed). `display` = drawn size in
 /// device px if known (0 = unknown side): rasters >= 2x that are downscaled,
-/// SVGs are rendered at it.
+/// SVGs are rendered at it. At most 6 decodes run at once in the process (others wait).
 pub fn decode_image(bytes: &[u8], display: Option<(u32, u32)>) -> Result<DecodedImage, NetError>;
 pub fn decode_svg(bytes: &[u8], size_hint: Option<(u32, u32)>) -> Result<DecodedImage, NetError>;  // resvg, no text
 pub fn is_svg(bytes: &[u8]) -> bool;
