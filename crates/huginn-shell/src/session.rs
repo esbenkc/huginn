@@ -173,7 +173,7 @@ impl Shared {
             Some(&self.net)
         };
         if let Some(net) = net {
-            preconnect(net, url);
+            net.preconnect(url);
         }
     }
 
@@ -495,13 +495,6 @@ impl Drop for Session {
             eprintln!("huginn: cannot save cookies: {e}");
         }
     }
-}
-
-/// Open a connection to `url`'s host ahead of a request: DNS, TCP and TLS.
-/// `huginn_net::Network::preconnect` lands with the first-load work
-/// (branch `perf/first-load`); until then this does nothing.
-fn preconnect(net: &Network, url: &Url) {
-    let _ = (net, url);
 }
 
 /// This process's `phys_footprint` in bytes (`proc_pid_rusage`, macOS).
