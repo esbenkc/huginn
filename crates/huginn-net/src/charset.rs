@@ -31,6 +31,76 @@ pub fn decode_html<'a>(bytes: &'a [u8], transport: Option<&str>) -> Cow<'a, str>
     }
 }
 
+/// [`decode_html`] for a document that arrives in pieces (the preload
+/// scanner reads it while the rest is on the way). The encoding is picked
+/// like `decode_html` does once the first 1024 bytes are in (or at the end
+/// of a shorter document); without a declaration it is UTF-8, invalid bytes
+/// replaced. (`decode_html` decodes such a document as windows-1252 if the
+/// whole of it is not UTF-8.)
+pub struct HtmlStreamDecoder {
+    transport: Option<&'static Encoding>,
+    /// Bytes that came before the encoding was picked.
+    pending: Vec<u8>,
+    decoder: Option<encoding_rs::Decoder>,
+}
+
+impl HtmlStreamDecoder {
+    /// `transport`: the `charset` parameter of the `Content-Type`.
+    pub fn new(transport: Option<&str>) -> HtmlStreamDecoder {
+        HtmlStreamDecoder {
+            transport: transport.and_then(label).map(html_override),
+            pending: Vec::new(),
+            decoder: None,
+        }
+    }
+
+    /// Decode the next `bytes` of the document and append the text to
+    /// `out`. `last`: they are the end of the document.
+    pub fn push(&mut self, bytes: &[u8], last: bool, out: &mut String) {
+        if let Some(d) = &mut self.decoder {
+            decode_into(d, bytes, last, out);
+            return;
+        }
+        self.pending.extend_from_slice(bytes);
+        let enough = if self.transport.is_some() {
+            3
+        } else {
+            PRESCAN_LIMIT
+        };
+        if self.pending.len() < enough && !last {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let (enc, skip) = match Encoding::for_bom(&pending) {
+            Some((enc, bom)) => (enc, bom),
+            None => (
+                self.transport
+                    .or_else(|| {
+                        prescan_meta(&pending[..pending.len().min(PRESCAN_LIMIT)])
+                            .map(html_override)
+                    })
+                    .unwrap_or(UTF_8),
+                0,
+            ),
+        };
+        let d = self.decoder.insert(enc.new_decoder_without_bom_handling());
+        decode_into(d, &pending[skip..], last, out);
+    }
+}
+
+fn decode_into(d: &mut encoding_rs::Decoder, mut bytes: &[u8], last: bool, out: &mut String) {
+    loop {
+        if let Some(n) = d.max_utf8_buffer_length(bytes.len()) {
+            out.reserve(n);
+        }
+        let (result, read, _) = d.decode_to_string(bytes, out, last);
+        bytes = &bytes[read..];
+        if result == encoding_rs::CoderResult::InputEmpty {
+            return;
+        }
+    }
+}
+
 /// Decode a stylesheet or any other text resource. Order (CSS Syntax
 /// "determine the fallback encoding"): byte order mark, the transport charset,
 /// an `@charset "...";` rule at byte 0, then UTF-8.
@@ -268,6 +338,33 @@ mod tests {
         late.extend_from_slice(b"<meta charset=koi8-r>\xC3\xA9");
         assert!(decode_html(&late, None).ends_with("é"));
         assert!(decode_html("<meta charset=utf-16le>é".as_bytes(), None).ends_with("é"));
+    }
+
+    #[test]
+    fn a_document_in_pieces_decodes_like_the_whole() {
+        // A <meta charset> in the first 1024 bytes, a split multi-byte
+        // sequence, and a BOM split over two pieces.
+        let mut meta = b"<meta charset=koi8-r>".to_vec();
+        meta.extend(std::iter::repeat_n(b' ', 1100));
+        meta.extend_from_slice(b"\xC1");
+        let utf8 = "<p>café ok</p>".as_bytes();
+        let bom = b"\xEF\xBB\xBF<p>caf\xC3\xA9";
+        for (bytes, transport) in [
+            (&meta[..], None),
+            (utf8, None),
+            (utf8, Some("utf-8")),
+            (&bom[..], Some("koi8-r")),
+        ] {
+            for piece in [1, 2, 7, 1024, 4096] {
+                let mut d = HtmlStreamDecoder::new(transport);
+                let mut out = String::new();
+                let chunks: Vec<&[u8]> = bytes.chunks(piece).collect();
+                for (i, c) in chunks.iter().enumerate() {
+                    d.push(c, i + 1 == chunks.len(), &mut out);
+                }
+                assert_eq!(out, decode_html(bytes, transport), "piece {piece}");
+            }
+        }
     }
 
     #[test]

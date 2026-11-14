@@ -599,32 +599,55 @@ impl Loader {
     pub fn set_load_kind(&self, kind: LoadKind);       // for the next navigation and its subresources; Normal again when done
     pub fn set_client(&self, client: Option<Client>);   // the document, once its final URL is known
     pub fn client(&self) -> Option<Client>;
-    /// fetch()/async XHR (sent from other threads) wait while a guard lives: the window holds
-    /// them while it loads the first paint's resources. Sync XHR is not held.
+    /// fetch()/async XHR (sent from other threads) and low-priority preloads wait while a
+    /// guard lives: the window holds them while it loads the first paint's resources.
+    /// Sync XHR is not held.
     pub fn hold_script_requests(&self) -> ScriptRequestsHeld<'_>;
     pub fn wait_for_script_turn(&self);      // blocks while held; the threads of fetch()/async XHR call it
     pub fn preconnect(&self, url: &Url);     // Network::preconnect for the client page (public pages: public addresses only)
+    pub fn dns_prefetch(&self, url: &Url);   // look the host up ahead (short thread); nothing connected
+    /// Start a request before the parser asks for it (the preload scanner): the parser's request
+    /// with the same URL, kind and CORS settings (Chrome's preload matching) takes the response.
+    /// High: at once. Low: when no high preload is queued or in flight and no
+    /// hold_script_requests guard lives (a consumer sends a queued one at once). A second call
+    /// does nothing, except High upgrading a queued Low. http(s) only.
+    pub fn preload(self: &Arc<Self>, url: &Url, kind: ResourceKind, cors: CorsSettings, priority: Priority);
+    pub fn clear_preloads(&self);            // end of the load: drop responses nothing took; queued ones still go, kept by nobody
     pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // no-cors subresource, kept in the loader by URL
-    pub fn fetch_with(&self, url: &Url, kind: ResourceKind, cors: CorsSettings) -> Result<Arc<Resource>, NetError>;  // modules, <script crossorigin>
+    /// Modules, <script crossorigin>, <link rel=stylesheet crossorigin>. Takes a matching preload;
+    /// identical calls in flight share one exchange.
+    pub fn fetch_with(&self, url: &Url, kind: ResourceKind, cors: CorsSettings) -> Result<Arc<Resource>, NetError>;
     /// Not kept in the loader (the HTTP cache still answers): for bodies decoded once and
-    /// dropped (images, fonts). Document = a browser-started navigation.
+    /// dropped (images, fonts). Takes a matching preload. Fonts from http(s) are CORS
+    /// `anonymous` requests (CSS Fonts); the rest no-cors. Document = a browser-started navigation.
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError>;
-    /// fetch_uncached only if nothing has to be sent: data:/file: URLs and fresh HTTP cache
-    /// entries (a hard reload has none); None otherwise. The window loads these before its
-    /// first paint.
+    /// fetch_uncached only if nothing has to be sent: data:/file: URLs, preloads that are in
+    /// and fresh HTTP cache entries (a hard reload has none); None otherwise. The window loads
+    /// these before its first paint.
     pub fn fetch_cached(&self, url: &Url, kind: ResourceKind) -> Option<Resource>;
     /// Top-level GET or form POST (content type, body); initiator = the page that started it.
     /// Returns the document and its referrer (document.referrer).
     pub fn navigate(&self, url: &Url, post: Option<(&str, &[u8])>, initiator: Option<&Client>)
         -> Result<(Resource, Option<String>), NetError>;
+    /// navigate, and on_body sees the document while it arrives (http(s), 2xx, after redirects):
+    /// the head (body empty) with no bytes, then each piece with Content-Encoding undone. Runs on
+    /// the calling thread between reads; must not block.
+    pub fn navigate_streaming<'a>(&self, url: &Url, post: Option<(&str, &'a [u8])>,
+        initiator: Option<&Client>, on_body: &'a mut (dyn FnMut(&Resource, &[u8]) + 'a))
+        -> Result<(Resource, Option<String>), NetError>;
     /// fetch()/XHR: any method, CORS (preflight, Access-Control-* checks) for other origins,
     /// any status; opaque responses come back empty, CORS ones with exposed headers only.
     /// A conditional header (If-None-Match, ...) bypasses the HTTP cache (Fetch).
     pub fn fetch_for_script(&self, req: ScriptRequest) -> Result<Resource, NetError>;
-    pub fn fetch_all(&self, requests: &[(Url, ResourceKind)]) -> Vec<Result<Arc<Resource>, NetError>>;  // <= 32 parallel, input order
     pub fn map_parallel<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>;  // <= 32 threads
     pub fn clear_cache(&self);               // drop the bodies kept in the loader (after CSS parsing); the HTTP cache stays
 }
+pub enum Priority { High, Low }             // Loader::preload
+/// decode_html for a document in pieces: the encoding is picked once 1024 bytes are in (or the
+/// end); push(bytes, last, &mut out) appends the text.
+pub struct HtmlStreamDecoder { .. }
+impl HtmlStreamDecoder { pub fn new(transport: Option<&str>) -> Self;
+                         pub fn push(&mut self, bytes: &[u8], last: bool, out: &mut String); }
 pub struct ScriptRequestsHeld<'a> { .. }    // Loader::hold_script_requests; the requests go when it drops
 /// HUGINN_NET_LOG=1: print `huginn: load: +<ms> <what>` on the net log's clock (the shell
 /// marks the phases of a page load with it).
@@ -736,6 +759,14 @@ subresources a page needs: the `<img>` choice (`srcset`, `sizes`,
 `display:none` images skipped, inline `<svg>` serialized and rasterized at
 its CSS size, and the `@font-face` faces CSS font matching picks for the
 page's text (style, weight, `unicode-range`).
+
+The shell's `huginn-shell/src/preload.rs` (owned by huginn-net) is the
+preload scanner: `Scanner::feed(head, bytes)` from
+`Loader::navigate_streaming`'s callback, `Scanner::finish()` after it. It
+must ask for exactly the request the parser will make (URL, kind, CORS
+settings): when `pipeline.rs`, `resources.rs` or huginn-js change how they
+fetch something, change the scanner in the same commit, or the preload is
+wasted and the resource is fetched twice.
 
 ## huginn-js
 

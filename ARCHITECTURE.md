@@ -31,13 +31,15 @@ ordered.
  URL or file path
    |  huginn_net::parse_target
    v
- Loader::navigate                   huginn-net    bytes (cookies, redirects); Resource::html_text picks the charset
+ Loader::navigate_streaming        huginn-net    bytes (cookies, redirects); Resource::html_text picks the charset
+   |  while it arrives: preload::Scanner tokenizes the text so far and starts
+   |  the stylesheets, scripts, fonts and images it finds (Loader::preload)
    |  huginn_dom::parse_html, then resources::plan_images (srcset, <picture>, lazy)
    v
  Document (arena of Node)           huginn-dom    NodeId per node
-   |  collect <style>, <link rel=stylesheet media=...>
+   |  collect <style>, <link rel=stylesheet media=... crossorigin=...>
    v
- Loader::fetch_all(stylesheets)     huginn-net    up to 32 threads, cached for @import
+ Loader::fetch_with(stylesheets)    huginn-net    up to 32 threads, take the preloads, cached for @import
    |  StyleEngine::add_stylesheet (UA sheet + author sheets, @import); then Loader::clear_cache
    v
  StyleEngine::compute(&Document)    huginn-style  StyleMap: Arc<ComputedStyle> per element
@@ -62,7 +64,9 @@ runs phases 1-6 (fetch to style, plus the second fetch wave) and returns a
 `Page`; `Page::register_fonts` and `Page::layout` do layout. Both `render` and
 the `open` window use them, so new pipeline steps (scripts, font decoding) go
 into `load` once and both modes get them. Which subresources a page needs is decided in
-`crates/huginn-shell/src/resources.rs` (owned by huginn-net). `pipeline::render` times each phase
+`crates/huginn-shell/src/resources.rs` and, while the document arrives, in
+`crates/huginn-shell/src/preload.rs` (both owned by huginn-net; see
+"Network and HTTP cache"). `pipeline::render` times each phase
 and prints one JSON line. The keys are `url`,
 `fetch_ms`, `parse_ms` (HTML plus CSS parsing), `style_ms`, `layout_ms`,
 `paint_ms` (display list plus raster), `encode_ms`, `total_ms` (process start
@@ -109,6 +113,10 @@ in, first paint, first contentful paint, images and fonts in, complete.
   TLS records and HTTP/2 frames. Callers block until their response
   arrives. Name lookups, TCP connects and TLS handshakes run on the thread
   that needs the new connection, so they run in parallel.
+- Preloads (`Loader::preload`) go out on up to 32 `huginn-preload`
+  threads of the loader, made when there is something to send and ended
+  when the queue is empty. The preload scanner runs on the render thread,
+  between reads of the document.
 - Parsing, style, layout and paint run on the render thread. They are
   single-threaded today.
 - `Document` is not `Send` or `Sync`. Its strings are `StrTendril`, which has a
@@ -148,7 +156,10 @@ in, first paint, first contentful paint, images and fonts in, complete.
   (`Loader::hold_script_requests`): `fetch()` and async XHR that the
   parser-blocking scripts start wait in the queue until the first paint's
   stylesheets are in and its images and fonts have started. Then they all
-  go, up to 16 at once, while the page is laid out. Chrome gives stylesheets and fonts the
+  go, up to 16 at once, while the page is laid out. Low-priority preloads
+  (images, async, defer and module scripts, stylesheets for other media)
+  wait for the same guard, which is taken before the document is
+  requested. Chrome gives stylesheets and fonts the
   highest priority and `fetch()` and XHR the next one, and servers that
   use HTTP/2 or HTTP/3 priorities send the higher ones first. Huginn's
   requests carry no priority, so it holds the lower ones back instead. It
@@ -724,8 +735,36 @@ run loads from the network.
   body after reading all of it (`compression.rs`), so the connection goes
   back to the pool. (ureq, the client before hyper, stopped reading a
   chunked body at the end of the brotli data and closed the connection:
-  MDN made 57 new connections for 60 requests.) No `zstd`: there is no
-  pure-Rust decoder in the tree, and servers fall back to `br`.
+  MDN made 57 new connections for 60 requests.) The document is decoded
+  while it arrives (`gzip` and `br` frame by frame, still read to the
+  end; other codings at the end), for the preload scanner. No `zstd`:
+  there is no pure-Rust decoder in the tree, and servers fall back to `br`.
+- **Preload scanner** (`huginn-shell/src/preload.rs`, Chrome's,
+  simplified). `Loader::navigate_streaming` hands the document to the
+  scanner while it arrives; an html5ever tokenizer pass over the text so
+  far finds stylesheets, scripts, `<link rel=preload|modulepreload>`,
+  `<img>` and `<link rel=preconnect|dns-prefetch>`, and starts them with
+  `Loader::preload`. Before, the stylesheets of github.com went out after
+  its 526 KB document had arrived and was parsed (82 ms after the first
+  byte of the document, median of 5 cold loads); now 3 ms after it
+  (Chrome: 4 ms). The loader keeps requests in flight in one table, keyed
+  like Chrome's preload matching (URL, destination, CORS mode and
+  credentials): the parser's `fetch_with`, `fetch_uncached` and
+  `fetch_cached` take a preload of the same request, and identical
+  `fetch_with` calls at the same time share one exchange (github.com links
+  one stylesheet seven times; it was fetched seven times at once). A
+  request in another mode does not take a preload, as in Chrome, so the
+  scanner asks for exactly what the parser will: stylesheets honour
+  `crossorigin`, scripts use `huginn_js::script_kind` and `script_cors`,
+  and web fonts are CORS requests (`anonymous`) like in Chrome, so a
+  `<link rel=preload as=font crossorigin>` is used. Stylesheets for the
+  screen, parser-blocking scripts and fonts are high priority and go at
+  once; the rest waits (see "Threading") and, in the head, for the body.
+  After a `<meta http-equiv=Content-Security-Policy>` the scanner starts
+  nothing more (Huginn applies no CSP; Chrome waits for the parser to
+  apply it). When the load is complete, responses of preloads nothing
+  took are dropped; ones still queued or in flight go on, but their
+  responses are not kept (`Loader::clear_preloads`).
 - **DNS.** Answers are kept for a minute, like Chrome's host cache. Only
   new connections look up their host.
 - **HTTP cache** (`cache.rs`, RFC 9111, a private cache). Fresh entries
@@ -757,8 +796,10 @@ run loads from the network.
   connection, `h1` or `h2`, and ms for DNS, connect (TCP and TLS), the
   response head and the body (`netlog.rs`).
 - **Not done.** HTTP/3 (QUIC), request priorities (HTTP/2 sends requests
-  in the order the threads start them), `stale-while-revalidate`, a CORS
-  preflight cache, `zstd`.
+  in the order the threads start them; preloads are held back instead),
+  `stale-while-revalidate`, a CORS preflight cache, `zstd`, preloads for
+  `fetch()` (`as=fetch`) and `<picture>` sources, parsing the document
+  while it arrives.
 
 ## External crates
 

@@ -866,3 +866,155 @@ fn text_in_a_loading_web_font_follows_font_display() {
 fn huginn_net_file_url(path: &std::path::Path) -> String {
     format!("file://{}", path.to_str().expect("UTF-8 path"))
 }
+
+/// How long the streamed test document takes between its head and body.
+const BODY_MS: u64 = 800;
+
+/// Requests a test server saw: path and ms since the document request.
+type Arrivals = Arc<Mutex<Vec<(String, u128)>>>;
+/// When the document request came.
+type Start = Arc<Mutex<std::time::Instant>>;
+
+/// Serve a document whose `<head>` comes at once and whose body comes
+/// `BODY_MS` later (chunked), plus `/a.css` (300 ms) and `/print.css`
+/// (3 s). `head` and `body` get the port of the second server for `{other}`.
+/// Logs every request, and `doc end` when the body ended.
+fn serve_streamed(head: &'static str, body: &'static str, other: u16) -> (u16, Arrivals, Start) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let log: Arrivals = Arc::new(Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let start: Start = Arc::new(Mutex::new(std::time::Instant::now()));
+    let started = start.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (seen, start) = (seen.clone(), start.clone());
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = r.read_line(&mut first);
+                let mut line = String::new();
+                while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    line.clear();
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                if path == "/" {
+                    *start.lock().unwrap() = std::time::Instant::now();
+                }
+                let ms = || start.lock().unwrap().elapsed().as_millis();
+                seen.lock().unwrap().push((path.clone(), ms()));
+                let mut s = stream;
+                if path == "/" {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                    );
+                    for (i, part) in [head, body].iter().enumerate() {
+                        let part = part.replace("{other}", &other.to_string());
+                        let _ = write!(s, "{:x}\r\n{part}\r\n", part.len());
+                        let _ = s.flush();
+                        if i == 0 {
+                            std::thread::sleep(Duration::from_millis(BODY_MS));
+                        }
+                    }
+                    seen.lock().unwrap().push(("doc end".into(), ms()));
+                    let _ = write!(s, "0\r\n\r\n");
+                    return;
+                }
+                let (delay, body) = match path.as_str() {
+                    "/a.css" => (300, "p { color: rgb(0, 128, 0) }"),
+                    "/print.css" => (3000, "p { color: red }"),
+                    _ => (0, ""),
+                };
+                std::thread::sleep(Duration::from_millis(delay));
+                let status = if body.is_empty() {
+                    "404 Not Found"
+                } else {
+                    "200 OK"
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: text/css\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    (port, log, started)
+}
+
+/// A server that only counts connections (when each was accepted) and
+/// the bytes sent on them.
+fn count_connections() -> (u16, Arc<Mutex<Vec<std::time::Instant>>>, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (conns, bytes) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(0)));
+    let (c, b) = (conns.clone(), bytes.clone());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            c.lock().unwrap().push(std::time::Instant::now());
+            let b = b.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0; 1024];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    *b.lock().unwrap() += n;
+                }
+            });
+        }
+    });
+    (port, conns, bytes)
+}
+
+#[test]
+fn the_preload_scanner_starts_requests_while_the_document_arrives() {
+    let (other, conns, bytes) = count_connections();
+    let (port, log, doc_start) = serve_streamed(
+        "<!doctype html><title>t</title>\
+         <link rel=preconnect href=http://localhost:{other}/>\
+         <link rel=stylesheet href=/a.css><link rel=preload as=style href=/a.css>\
+         <link rel=stylesheet media=print href=/print.css>\
+         </head><body><p>Text</p>",
+        "<p>More</p><link rel=stylesheet href=/a.css></body>",
+        other,
+    );
+    // The print stylesheet goes after the first paint; give it time.
+    let s = run(
+        &format!("http://127.0.0.1:{port}/"),
+        "wait; state; sleep 1000",
+        &[],
+    );
+    let log = log.lock().unwrap().clone();
+    let at = |p: &str| -> Vec<u128> {
+        log.iter()
+            .filter(|(path, _)| path == p)
+            .map(|(_, ms)| *ms)
+            .collect()
+    };
+    let doc_end = at("doc end")[0];
+    // The stylesheet went while the body was still on its way, and only
+    // once for two links and a preload.
+    let css = at("/a.css");
+    assert_eq!(css.len(), 1, "{log:?}");
+    assert!(css[0] < doc_end, "{log:?}");
+    // The stylesheet for print went too, after the one for the screen (low
+    // priority), and the first paint did not wait for its 3 s.
+    let print = at("/print.css");
+    assert_eq!(print.len(), 1, "{log:?}");
+    assert!(print[0] >= css[0] + 300, "{log:?}");
+    let first_paint = s[0]["load_ms"].as_f64().unwrap();
+    assert!(first_paint < 2500.0, "{}", s[0]);
+    // The preconnect hint opened a connection before the body came, and
+    // nothing was sent on it.
+    let opened = conns.lock().unwrap().clone();
+    assert_eq!(opened.len(), 1);
+    let connected = opened[0]
+        .duration_since(*doc_start.lock().unwrap())
+        .as_millis();
+    assert!(connected < doc_end, "connected at {connected} ms; {log:?}");
+    assert_eq!(*bytes.lock().unwrap(), 0);
+}
