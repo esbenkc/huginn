@@ -76,6 +76,11 @@ pub(crate) struct Builder<'a, 'e> {
     /// The next `build_block` must build: its caller changes the box
     /// afterwards (table cells).
     no_reuse: bool,
+    /// `Fonts::epoch` when the pass started. Once the fonts change during
+    /// the build (a fallback is installed for text seen for the first
+    /// time), the boxes after that point are built, not kept: a pass
+    /// without a kept tree shapes them with the new fonts too.
+    fonts_epoch: u64,
 }
 
 pub(crate) fn layout(engine: &mut LayoutEngine, input: &LayoutInput<'_>) -> LayoutTree {
@@ -131,6 +136,7 @@ pub(crate) fn layout(engine: &mut LayoutEngine, input: &LayoutInput<'_>) -> Layo
         kept,
         owner: None,
         no_reuse: false,
+        fonts_epoch: started.fonts_epoch,
     };
     let root = b.build_block(El::Dom(html), html_style, Decor::default());
     if let Some((kept, _)) = &mut b.kept {
@@ -517,6 +523,7 @@ impl Builder<'_, '_> {
         };
         let no_reuse = std::mem::take(&mut self.no_reuse);
         if !no_reuse
+            && self.engine.fonts.epoch == self.fonts_epoch
             && let Some((kept, change)) = &self.kept
             && change.is_clean(n)
             && let Some(id) = kept.box_of(n)

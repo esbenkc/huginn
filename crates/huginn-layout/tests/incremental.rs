@@ -1,6 +1,6 @@
 //! A kept box tree must not change the result (`incr.rs`): a pass that uses
-//! boxes, layout caches and shaped text from the pass before gives the same
-//! tree as a pass by a fresh engine.
+//! boxes and shaped text from the pass before gives the same tree as a pass
+//! that builds everything.
 //!
 //! The first test walks a page through changes chosen to hit what a kept box
 //! can depend on from outside (floats, list numbers, tables, positioned
@@ -137,14 +137,44 @@ fn engine(keep: bool, text_index: bool) -> LayoutEngine {
     e
 }
 
-/// Lay out with the long-lived engine and with a fresh one, and compare.
-/// The long-lived engine runs twice, so a pass that changes nothing is
-/// covered at each step.
-fn check(doc: &Document, kept: &mut LayoutEngine, width: f32, text_index: bool, step: &str) {
-    let (fresh, fresh_boxes) = pass_both(doc, &mut engine(false, text_index), width);
+/// Two long-lived engines: one keeps its tree and shaped text, the other
+/// builds everything in every pass. They see the same passes in the same
+/// order, so their fonts are in the same state (on macOS, fallback fonts are
+/// installed when text first needs them, and their order depends on that
+/// history).
+struct Pair {
+    kept: LayoutEngine,
+    plain: LayoutEngine,
+    text_index: bool,
+}
+
+impl Pair {
+    fn new(text_index: bool) -> Pair {
+        Pair {
+            kept: engine(true, text_index),
+            plain: engine(false, text_index),
+            text_index,
+        }
+    }
+}
+
+/// Lay out with both engines and compare. The keeping engine runs twice, so
+/// a pass that changes nothing is covered at each step. Where fonts do not
+/// depend on history (not macOS), a new engine must agree as well.
+fn check(doc: &Document, pair: &mut Pair, width: f32, step: &str) {
+    let text_index = pair.text_index;
+    let (plain, plain_boxes) = pass_both(doc, &mut pair.plain, width);
+    if !cfg!(target_os = "macos") {
+        let fresh = pass_both(doc, &mut engine(false, text_index), width).0;
+        assert!(
+            fresh == plain,
+            "step {step:?} (width {width}): a new engine and a long-lived one without a kept \
+             tree disagree; the test's reference is not stable"
+        );
+    }
     for round in 0..2 {
-        let (got, got_boxes) = pass_both(doc, kept, width);
-        if got != fresh {
+        let (got, got_boxes) = pass_both(doc, &mut pair.kept, width);
+        if got != plain {
             if let Ok(dir) = std::env::var("INCR_DUMP") {
                 let body = doc.body().expect("body");
                 let _ = std::fs::write(
@@ -152,11 +182,11 @@ fn check(doc: &Document, kept: &mut LayoutEngine, width: f32, text_index: bool, 
                     huginn_dom::serialize(doc, body, true),
                 );
                 let _ = std::fs::write(format!("{dir}/kept.txt"), &got_boxes);
-                let _ = std::fs::write(format!("{dir}/fresh.txt"), &fresh_boxes);
+                let _ = std::fs::write(format!("{dir}/plain.txt"), &plain_boxes);
             }
             let at = got
                 .lines()
-                .zip(fresh.lines())
+                .zip(plain.lines())
                 .position(|(a, b)| a != b)
                 .unwrap_or(0);
             let show = |s: &str| {
@@ -168,9 +198,9 @@ fn check(doc: &Document, kept: &mut LayoutEngine, width: f32, text_index: bool, 
             };
             panic!(
                 "step {step:?} (round {round}, width {width}, text index {text_index}): the kept \
-                 tree gives another layout than a fresh engine, first at line {at}\n--- kept\n{}\n--- fresh\n{}",
+                 tree gives another layout than an engine without one, first at line {at}\n--- kept\n{}\n--- without\n{}",
                 show(&got),
-                show(&fresh)
+                show(&plain)
             );
         }
     }
@@ -183,40 +213,39 @@ fn class(doc: &mut Document, id: &str, value: &str) {
 
 fn scripted(text_index: bool) {
     let mut doc = huginn_dom::parse_html(&format!("<!doctype html>{STYLE}{PAGE}"));
-    let mut kept = engine(true, text_index);
-    let ti = text_index;
-    let k = &mut kept;
-    check(&doc, k, 400.0, ti, "first");
-    check(&doc, k, 260.0, ti, "narrower");
-    check(&doc, k, 640.0, ti, "wider");
-    check(&doc, k, 400.0, ti, "back");
+    let mut pair = Pair::new(text_index);
+    let k = &mut pair;
+    check(&doc, k, 400.0, "first");
+    check(&doc, k, 260.0, "narrower");
+    check(&doc, k, 640.0, "wider");
+    check(&doc, k, 400.0, "back");
 
     let p1 = by_id(&doc, "p1");
     doc.set_text_content(p1, "A new and shorter text.");
-    check(&doc, k, 400.0, ti, "text changed");
+    check(&doc, k, 400.0, "text changed");
 
     // Floats: the boxes beside and after a float are unchanged themselves.
     class(&mut doc, "fl1", "fl tall");
-    check(&doc, k, 400.0, ti, "float taller");
+    check(&doc, k, 400.0, "float taller");
     class(&mut doc, "fl1", "fl wide");
-    check(&doc, k, 400.0, ti, "float wider");
+    check(&doc, k, 400.0, "float wider");
     class(&mut doc, "fl1", "hide");
-    check(&doc, k, 400.0, ti, "float gone");
+    check(&doc, k, 400.0, "float gone");
     class(&mut doc, "fl1", "fl");
-    check(&doc, k, 400.0, ti, "float back");
+    check(&doc, k, 400.0, "float back");
     class(&mut doc, "fr1", "fr tall");
-    check(&doc, k, 400.0, ti, "inner float taller");
+    check(&doc, k, 400.0, "inner float taller");
     class(&mut doc, "fr1", "hide");
-    check(&doc, k, 320.0, ti, "inner float gone, narrower");
+    check(&doc, k, 320.0, "inner float gone, narrower");
     class(&mut doc, "fl2", "fl tall wide");
-    check(&doc, k, 400.0, ti, "float in its own context");
+    check(&doc, k, 400.0, "float in its own context");
     let fl = doc.create_html_element("div");
     doc.set_attribute(fl, local_name!("class"), "fr");
     let body = doc.body().expect("body");
     doc.insert_before(body, fl, Some(by_id(&doc, "p2")));
-    check(&doc, k, 400.0, ti, "float inserted");
+    check(&doc, k, 400.0, "float inserted");
     doc.detach(fl);
-    check(&doc, k, 400.0, ti, "float removed");
+    check(&doc, k, 400.0, "float removed");
 
     // List numbers depend on the items before.
     let li = doc.create_html_element("li");
@@ -224,17 +253,17 @@ fn scripted(text_index: bool) {
     doc.append_child(li, t);
     let ol = by_id(&doc, "ol");
     doc.insert_before(ol, li, Some(by_id(&doc, "li1")));
-    check(&doc, k, 400.0, ti, "list item inserted first");
+    check(&doc, k, 400.0, "list item inserted first");
     doc.detach(by_id(&doc, "li2"));
-    check(&doc, k, 400.0, ti, "list item removed");
+    check(&doc, k, 400.0, "list item removed");
     doc.set_attribute(ol, local_name!("start"), "7");
-    check(&doc, k, 400.0, ti, "list start");
+    check(&doc, k, 400.0, "list start");
 
     // Inherited decoration reaches unchanged boxes.
     class(&mut doc, "wrap", "u");
-    check(&doc, k, 400.0, ti, "underline inherited");
+    check(&doc, k, 400.0, "underline inherited");
     class(&mut doc, "wrap", "");
-    check(&doc, k, 400.0, ti, "underline gone");
+    check(&doc, k, 400.0, "underline gone");
 
     // Tables: cells change place and size.
     let td = doc.create_html_element("td");
@@ -242,51 +271,51 @@ fn scripted(text_index: bool) {
     doc.append_child(td, t);
     let row = doc.parent(by_id(&doc, "td1")).expect("row");
     doc.insert_before(row, td, Some(by_id(&doc, "td1")));
-    check(&doc, k, 400.0, ti, "cell inserted");
+    check(&doc, k, 400.0, "cell inserted");
     let tp = by_id(&doc, "tp");
     doc.set_text_content(tp, "a much longer paragraph in the cell than before");
-    check(&doc, k, 400.0, ti, "cell content changed");
+    check(&doc, k, 400.0, "cell content changed");
     class(&mut doc, "td2", "wide");
-    check(&doc, k, 300.0, ti, "cell width");
+    check(&doc, k, 300.0, "cell width");
 
     // Flex and grid: order, sizes, wrapping.
     class(&mut doc, "f3", "first");
-    check(&doc, k, 400.0, ti, "flex order");
+    check(&doc, k, 400.0, "flex order");
     class(&mut doc, "f1", "pad big");
-    check(&doc, k, 400.0, ti, "flex item font");
+    check(&doc, k, 400.0, "flex item font");
     class(&mut doc, "g2", "hide");
-    check(&doc, k, 400.0, ti, "grid item hidden");
+    check(&doc, k, 400.0, "grid item hidden");
     class(&mut doc, "grid", "flex");
-    check(&doc, k, 400.0, ti, "grid becomes flex");
+    check(&doc, k, 400.0, "grid becomes flex");
 
     // Positioned boxes and their containing block.
     class(&mut doc, "a", "");
-    check(&doc, k, 400.0, ti, "containing block moves out");
+    check(&doc, k, 400.0, "containing block moves out");
     class(&mut doc, "a", "rel pad");
-    check(&doc, k, 400.0, ti, "containing block back, padded");
+    check(&doc, k, 400.0, "containing block back, padded");
     class(&mut doc, "abs1", "");
-    check(&doc, k, 400.0, ti, "no longer positioned");
+    check(&doc, k, 400.0, "no longer positioned");
 
     // Form controls, details, generated content.
     let inp = by_id(&doc, "inp");
     doc.set_attribute(inp, local_name!("value"), "abcdef");
-    check(&doc, k, 400.0, ti, "input value");
+    check(&doc, k, 400.0, "input value");
     let det = by_id(&doc, "det");
     doc.set_attribute(det, local_name!("open"), "");
-    check(&doc, k, 400.0, ti, "details open");
+    check(&doc, k, 400.0, "details open");
     class(&mut doc, "p6", "");
-    check(&doc, k, 400.0, ti, "generated content gone");
+    check(&doc, k, 400.0, "generated content gone");
     class(&mut doc, "p6", "q red");
-    check(&doc, k, 400.0, ti, "generated content back, red");
+    check(&doc, k, 400.0, "generated content back, red");
 
     // Whole-page style changes, then nothing left.
     class(&mut doc, "p9", "big");
-    check(&doc, k, 400.0, ti, "font size");
+    check(&doc, k, 400.0, "font size");
     doc.remove_children(by_id(&doc, "wrap"));
     doc.detach(by_id(&doc, "t"));
-    check(&doc, k, 400.0, ti, "subtrees removed");
+    check(&doc, k, 400.0, "subtrees removed");
     doc.remove_children(body);
-    check(&doc, k, 400.0, ti, "empty body");
+    check(&doc, k, 400.0, "empty body");
 }
 
 #[test]
@@ -445,10 +474,10 @@ fn random_change(doc: &mut Document, rng: &mut Rng) -> String {
 
 fn fuzz(seed: u64, steps: usize) {
     let mut doc = huginn_dom::parse_html(&format!("<!doctype html>{STYLE}{PAGE}"));
-    let mut kept = engine(true, true);
+    let mut pair = Pair::new(true);
     let mut rng = Rng(seed);
     let widths = [400.0, 400.0, 400.0, 280.0, 620.0];
-    check(&doc, &mut kept, 400.0, true, "start");
+    check(&doc, &mut pair, 400.0, "start");
     let mut log: Vec<String> = Vec::new();
     for step in 0..steps {
         // Sometimes several changes land in one pass.
@@ -460,9 +489,8 @@ fn fuzz(seed: u64, steps: usize) {
         let tail = log[log.len().saturating_sub(6)..].join(" | ");
         check(
             &doc,
-            &mut kept,
+            &mut pair,
             width,
-            true,
             &format!("seed {seed} step {step}; last changes: {tail}"),
         );
     }
@@ -497,17 +525,11 @@ fn replay_widths() {
     };
     let body = std::fs::read_to_string(path).expect("read");
     let doc = huginn_dom::parse_html(&format!("<!doctype html>{STYLE}{body}"));
-    let mut kept = engine(true, true);
+    let mut pair = Pair::new(true);
     for (i, w) in [400.0, 280.0, 620.0, 400.0, 620.0, 280.0, 400.0]
         .into_iter()
         .enumerate()
     {
-        if let Ok(pat) = std::env::var("INCR_SHOW") {
-            let f = pass_both(&doc, &mut engine(false, true), w).1;
-            for l in f.lines().filter(|l| pat.split(',').any(|p| l.contains(p))) {
-                eprintln!("fresh w{w}: {l}");
-            }
-        }
-        check(&doc, &mut kept, w, true, &format!("replay {i}"));
+        check(&doc, &mut pair, w, &format!("replay {i}"));
     }
 }
