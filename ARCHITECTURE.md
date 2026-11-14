@@ -323,10 +323,9 @@ JavaScript); see CONTRACTS.md, "huginn-shell window: tab hooks".
     the file), then 0.8 ms per keystroke (95th percentile 1.1 ms; `perf`
     phase `suggest`); peak footprint 9.7 MB against 6.4 MB with no history.
   - When the default match is a history page on a new origin, the window
-    asks the network to open a connection to it (`Shared::preconnect`, as
-    Chrome preconnects for the omnibox's default match). Until
-    `huginn_net::Network::preconnect` lands (first-load work), the call
-    does nothing.
+    opens a connection to it (`Network::preconnect`: DNS, TCP and TLS, no
+    request), as Chrome preconnects for the omnibox's default match. The
+    request after Enter then uses that connection.
 - **Tests.** `huginn open <url> --commands "wait; key cmd+t; click 50 100
   cmd; state"` drives the same `Session` without a window and prints JSON
   (`tests/open.rs`, `tests/tabs.rs`, `tests/omnibox.rs`). `--script` runs the same commands in
