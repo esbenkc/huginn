@@ -2,7 +2,8 @@
 //!
 //! This crate defines how the browser drives a script engine and how scripts
 //! reach the DOM. With the `v8` cargo feature, [`create_engine`] returns a V8
-//! engine (the `v8` crate): a JavaScript DOM layer (`src/prelude.js`) over a
+//! engine (the `v8` crate): a JavaScript DOM layer (`src/js/*.js`, the
+//! prelude, already run in a startup snapshot made at build time) over a
 //! small set of native operations on [`huginn_dom::Document`]. Without the
 //! feature, [`create_engine`] returns `None` and pages render like a browser
 //! with JavaScript turned off ([`ScriptingDisabled`]).
@@ -354,6 +355,12 @@ pub trait ScriptEngine {
     /// Time (ms since navigation start) of the earliest pending timer. An
     /// arrived response is due now.
     fn next_timer_due(&self) -> Option<f64>;
+
+    /// Get ready to run the page's scripts now (V8: make the isolate, which
+    /// the first `execute` does otherwise), so the time overlaps the wait
+    /// for the scripts. `cx.now_ms` must be on the clock of the later calls.
+    /// Errors are not returned here: `execute` reports them.
+    fn prepare(&mut self, _cx: &mut HostContext<'_>) {}
 
     /// Requests of scripts (`fetch()`, async `XMLHttpRequest`) that run on
     /// other threads and whose response the page has not got yet.

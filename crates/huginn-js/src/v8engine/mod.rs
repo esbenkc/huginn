@@ -1,6 +1,8 @@
 //! The V8 engine: one isolate and one context per page, created on the first
 //! `execute`. The web platform objects are JavaScript (`src/js/*.js`, the
-//! prelude) over native operations on the document (`ops.rs`).
+//! prelude) over native operations on the document (`ops.rs`). The build
+//! runs the prelude into a V8 startup snapshot (build.rs, `startup.rs`), and
+//! each isolate starts from it.
 //!
 //! Every engine call installs the shell's [`HostContext`] in the isolate's
 //! [`State`] for the duration of the call, so native callbacks can reach the
@@ -10,11 +12,14 @@ mod codec;
 mod fetches;
 mod modules;
 mod ops;
+mod startup;
+#[cfg(test)]
+mod tests;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use huginn_dom::{NodeId, local_name};
@@ -24,26 +29,17 @@ use crate::{
     ScriptError, ScriptKind, Waker,
 };
 
-/// The JavaScript DOM layer, one function scope across the files.
-const PRELUDE: &str = concat!(
-    include_str!("../js/00-base.js"),
-    include_str!("../js/10-tasks.js"),
-    include_str!("../js/20-node.js"),
-    include_str!("../js/30-element.js"),
-    include_str!("../js/40-html.js"),
-    include_str!("../js/50-document.js"),
-    include_str!("../js/60-net.js"),
-    include_str!("../js/65-streams.js"),
-    include_str!("../js/70-window.js"),
-    include_str!("../js/90-hooks.js"),
-);
+use startup::exception_message;
 
-/// ICU data for `Intl`, `toLocaleString` and `localeCompare`. This is the
-/// small (1.8 MB) Flutter desktop subset shipped with the `v8` crate; its
-/// pages are only touched when a script uses them.
-#[repr(C, align(16))]
-struct Aligned<T: ?Sized>(T);
-static ICU_DATA: &Aligned<[u8]> = &Aligned(*include_bytes!("../../data/icudtl.dat"));
+/// The JavaScript DOM layer, one function scope across the files (joined by
+/// build.rs).
+const PRELUDE: &str = include_str!(concat!(env!("OUT_DIR"), "/prelude.js"));
+
+/// An isolate with the prelude already run: the V8 startup snapshot made by
+/// build.rs (not in cross builds).
+#[cfg(huginn_snapshot)]
+static SNAPSHOT: &startup::Aligned<[u8]> =
+    &startup::Aligned(*include_bytes!(concat!(env!("OUT_DIR"), "/prelude.snap")));
 
 /// V8 heap limit. Pages that need more are stopped, not crashed.
 const HEAP_LIMIT: usize = 512 << 20;
@@ -51,24 +47,23 @@ const HEAP_LIMIT: usize = 512 << 20;
 /// zero-delay timer cannot spin forever inside one call.
 const MAX_TIMERS_PER_ROUND: usize = 2000;
 
+/// `HUGINN_V8_FLAGS` replaces V8's flags ([`startup::V8_FLAGS`]), to measure
+/// other settings (for example `--single-threaded` alone, or with
+/// `--jitless`).
 fn init_v8() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let _ = v8::icu::set_common_data_78(&ICU_DATA.0);
-        // One thread: no background compiler or GC threads (less memory, and
-        // a page load is short). Lite mode: interpreter only, no JIT code and
-        // lazy feedback vectors. On the corpus it cuts the V8 heap by up to
-        // half (bbc 58 -> 28 MB) at the same wall time, because page scripts
-        // mostly run once.
-        // `HUGINN_V8_FLAGS` replaces the flags, to measure other settings
-        // (for example `--single-threaded` alone, or with `--jitless`).
-        match std::env::var("HUGINN_V8_FLAGS") {
-            Ok(flags) => v8::V8::set_flags_from_string(&flags),
-            Err(_) => v8::V8::set_flags_from_string("--single-threaded --lite-mode"),
-        }
-        v8::V8::initialize_platform(v8::new_single_threaded_default_platform(false).make_shared());
-        v8::V8::initialize();
-    });
+    let flags = std::env::var("HUGINN_V8_FLAGS");
+    startup::init_v8(flags.as_deref().unwrap_or(startup::V8_FLAGS));
+}
+
+/// The startup snapshot for new isolates. None without one, or with
+/// `HUGINN_V8_FLAGS`: a snapshot works only with the flags it was made with.
+/// Then each isolate runs the prelude itself.
+fn startup_snapshot() -> Option<&'static [u8]> {
+    #[cfg(huginn_snapshot)]
+    if std::env::var_os("HUGINN_V8_FLAGS").is_none() {
+        return Some(&SNAPSHOT.0);
+    }
+    None
 }
 
 /// Per-isolate state, shared by the engine and the native callbacks (it lives
@@ -311,6 +306,9 @@ impl Drop for Runtime {
 /// first `execute`, so pages without scripts never pay for it.
 pub struct V8Engine {
     options: EngineOptions,
+    /// The isolate's startup snapshot; `None` runs the prelude in the new
+    /// isolate instead.
+    snapshot: Option<&'static [u8]>,
     rt: Option<Runtime>,
     /// See [`ScriptEngine::set_waker`]; kept for an isolate made later.
     waker: Option<Waker>,
@@ -318,8 +316,13 @@ pub struct V8Engine {
 
 impl V8Engine {
     pub fn new(options: EngineOptions) -> V8Engine {
+        V8Engine::with_snapshot(options, startup_snapshot())
+    }
+
+    fn with_snapshot(options: EngineOptions, snapshot: Option<&'static [u8]>) -> V8Engine {
         V8Engine {
             options,
+            snapshot,
             rt: None,
             waker: None,
         }
@@ -327,7 +330,7 @@ impl V8Engine {
 
     fn runtime(&mut self, cx: &mut HostContext<'_>) -> Result<&mut Runtime, ScriptError> {
         if self.rt.is_none() {
-            let rt = Runtime::new(self.options.clone(), cx)?;
+            let rt = Runtime::new(self.options.clone(), self.snapshot, cx)?;
             rt.state.borrow().fetches.set_waker(self.waker.clone());
             self.rt = Some(rt);
         }
@@ -379,9 +382,16 @@ impl Drop for Call<'_> {
 }
 
 impl Runtime {
-    fn new(options: EngineOptions, cx: &mut HostContext<'_>) -> Result<Runtime, ScriptError> {
+    fn new(
+        options: EngineOptions,
+        snapshot: Option<&'static [u8]>,
+        cx: &mut HostContext<'_>,
+    ) -> Result<Runtime, ScriptError> {
         init_v8();
-        let params = v8::CreateParams::default().heap_limits(0, HEAP_LIMIT);
+        let mut params = v8::CreateParams::default().heap_limits(0, HEAP_LIMIT);
+        if let Some(blob) = snapshot {
+            params = params.snapshot_blob(v8::StartupData::from(blob));
+        }
         let mut isolate = v8::Isolate::new(params);
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
         isolate.set_host_import_module_dynamically_callback(modules::dynamic_import);
@@ -405,6 +415,7 @@ impl Runtime {
         let state: SharedState = Rc::new(RefCell::new(state));
         isolate.set_slot(state.clone());
 
+        // From a snapshot, this is the context the prelude ran in.
         let context = {
             v8::scope!(let scope, &mut isolate);
             let context = v8::Context::new(scope, Default::default());
@@ -418,61 +429,61 @@ impl Runtime {
             _near_limit: near_limit,
             isolate,
         };
-        rt.install_prelude(cx)?;
+        rt.start_prelude(cx, snapshot.is_some())?;
         Ok(rt)
     }
 
-    /// Run the prelude and keep its hooks.
-    fn install_prelude(&mut self, cx: &mut HostContext<'_>) -> Result<(), ScriptError> {
+    /// Get the prelude's `N` object and hooks from the snapshot, or run the
+    /// prelude. Then add the native operations to `N`, call the `start`
+    /// hook for this page and keep the other hooks.
+    fn start_prelude(
+        &mut self,
+        cx: &mut HostContext<'_>,
+        from_snapshot: bool,
+    ) -> Result<(), ScriptError> {
         let _call = Call::enter(&self.state, &self.watchdog, cx);
         let state = self.state.clone();
         v8::scope!(let scope, &mut self.isolate);
         let context = v8::Local::new(scope, &self.context);
         let scope = &mut v8::ContextScope::new(scope, context);
         v8::tc_scope!(let tc, scope);
-        let fail =
-            |tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>| ScriptError::Runtime {
-                url: "huginn:prelude".into(),
-                message: exception_message(tc),
+        let error = |message: String| ScriptError::Runtime {
+            url: startup::PRELUDE_URL.into(),
+            message,
+        };
+        let (native, hooks) = if from_snapshot {
+            let native = tc.get_context_data_from_snapshot_once::<v8::Object>(startup::N_INDEX);
+            let hooks = tc.get_context_data_from_snapshot_once::<v8::Object>(startup::HOOKS_INDEX);
+            let (Ok(native), Ok(hooks)) = (native, hooks) else {
+                return Err(error("the startup snapshot has no prelude".into()));
             };
-        let native = ops::install_ops(tc);
-        let Some(func) = compile_and_run(tc, PRELUDE, "huginn:prelude") else {
-            return Err(fail(tc));
+            (native, hooks)
+        } else {
+            let Some(prelude) = startup::run_prelude(tc, PRELUDE) else {
+                return Err(error(exception_message(tc)));
+            };
+            prelude
         };
-        let Ok(func) = v8::Local::<v8::Function>::try_from(func) else {
-            return Err(ScriptError::Runtime {
-                url: "huginn:prelude".into(),
-                message: "prelude is not a function".into(),
-            });
-        };
-        let global = context.global(tc);
-        let undefined = v8::undefined(tc).into();
-        let Some(hooks) = func.call(tc, undefined, &[native.into(), global.into()]) else {
-            return Err(fail(tc));
-        };
-        let Ok(hooks) = v8::Local::<v8::Object>::try_from(hooks) else {
-            return Err(ScriptError::Runtime {
-                url: "huginn:prelude".into(),
-                message: "prelude returned no hooks".into(),
-            });
-        };
+        ops::install_ops(tc, native);
         let get = |tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>, name: &str| {
             let key = v8::String::new(tc, name)?;
             let f = hooks.get(tc, key.into())?;
             let f = v8::Local::<v8::Function>::try_from(f).ok()?;
             Some(v8::Global::new(tc, f))
         };
-        let (Some(dispatch), Some(run_one), Some(next_due), Some(net_done)) = (
+        let (Some(start), Some(dispatch), Some(run_one), Some(next_due), Some(net_done)) = (
+            get(tc, "start"),
             get(tc, "dispatch"),
             get(tc, "runOne"),
             get(tc, "nextDue"),
             get(tc, "netDone"),
         ) else {
-            return Err(ScriptError::Runtime {
-                url: "huginn:prelude".into(),
-                message: "prelude hooks missing".into(),
-            });
+            return Err(error("prelude hooks missing".into()));
         };
+        let start = v8::Local::new(tc, start);
+        if start.call(tc, hooks.into(), &[]).is_none() {
+            return Err(error(exception_message(tc)));
+        }
         let object = v8::Global::new(tc, hooks);
         state.borrow_mut().hooks = Some(Hooks {
             object,
@@ -482,56 +493,6 @@ impl Runtime {
             net_done,
         });
         Ok(())
-    }
-}
-
-/// Compile and run a classic script. `None` means an exception is pending in
-/// the try-catch scope.
-fn compile_and_run<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    source: &str,
-    url: &str,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let source = v8::String::new(scope, source)?;
-    let name = v8::String::new(scope, url)?;
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        name.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-    let script = v8::Script::compile(scope, source, Some(&origin))?;
-    script.run(scope)
-}
-
-/// "url:line: message" for the pending exception.
-pub(crate) fn exception_message(
-    tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>,
-) -> String {
-    if tc.has_terminated() {
-        return "script terminated (time or memory budget)".into();
-    }
-    let Some(exception) = tc.exception() else {
-        return "unknown error".into();
-    };
-    let text = exception.to_rust_string_lossy(tc);
-    match tc.message() {
-        Some(m) => {
-            let file = m
-                .get_script_resource_name(tc)
-                .map(|s| s.to_rust_string_lossy(tc))
-                .unwrap_or_default();
-            let line = m.get_line_number(tc).unwrap_or(0);
-            format!("{file}:{line}: {text}")
-        }
-        None => text,
     }
 }
 

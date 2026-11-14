@@ -525,7 +525,8 @@ line (median and 95th percentile); `perf reset` forgets them. The
 to time scrolling, hover, typing, script changes and resizing on synthetic
 pages.
 
-`HUGINN_V8_FLAGS` replaces the V8 flags, to measure other settings.
+`HUGINN_V8_FLAGS` replaces the V8 flags, to measure other settings. Isolates
+then run the prelude themselves: the startup snapshot needs the default flags.
 `HUGINN_NET_LOG=1` prints where the time of each HTTP exchange goes (see
 "Network and HTTP cache").
 
@@ -787,7 +788,7 @@ Versions are the ones in `Cargo.lock`.
 | psl | 2.1 | huginn-net | The Public Suffix List compiled into lookup code: cookie `Domain` checks and site boundaries (`SameSite`, `Sec-Fetch-Site`). No list is parsed at run time, so it costs no heap. |
 | parking_lot | 0.12 | huginn-net | Locks without poisoning for the cookie jar and the loader's client; already in the tree through Stylo. |
 | serde_json | 1.0.154 | huginn-shell | The timing JSON line. |
-| v8 (rusty_v8) | 152.2.0 | huginn-js (feature `v8`, default on in huginn-shell) | The JavaScript engine. The only engine that runs modern framework code (React on todomvc) fast enough. Its build downloads a prebuilt static library (~40 MB). ICU data: the 1.8 MB Flutter subset shipped with the crate (`crates/huginn-js/data/icudtl.dat`, Unicode License V3). |
+| v8 (rusty_v8) | 152.2.0 | huginn-js (feature `v8`, default on in huginn-shell; also its build script, which makes the prelude's startup snapshot) | The JavaScript engine. The only engine that runs modern framework code (React on todomvc) fast enough. Its build downloads a prebuilt static library (~40 MB). ICU data: the 1.8 MB Flutter subset shipped with the crate (`crates/huginn-js/data/icudtl.dat`, Unicode License V3). |
 | stylo (+ selectors, stylo_traits, stylo_dom) | 0.24.0 | huginn-style | Servo's CSS engine: custom properties, `calc()`, every shorthand, `@layer`, `:has()`, media queries level 4. See "The Stylo decision". MPL-2.0. |
 
 Licenses of all dependencies: [THIRD-PARTY.md](THIRD-PARTY.md).

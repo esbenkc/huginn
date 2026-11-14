@@ -168,7 +168,8 @@ const sessionStorage = makeStorage();
 
 // ------------------------------------------------------ location, history --
 
-let curUrl = N.docUrl();
+let curUrl = '';
+onStart(() => { curUrl = N.docUrl(); });
 const urlParts = () => N.url(curUrl, '') || URL_PARTS.map(() => '');
 let historyState = null;
 
@@ -241,26 +242,18 @@ const history = new History();
 // ------------------------------------------------------------- navigator --
 
 // N.os: the system this build runs on; N.ua, N.secChUa: the User-Agent and
-// Sec-CH-UA headers the network sends (`install_ops`), so script and headers agree.
-const OS = N.os === 'macos'
-  ? { platform: 'MacIntel', name: 'macOS', version: '14.0.0', arch: 'arm' }
-  : { platform: 'Linux x86_64', name: 'Linux', version: '6.8.0', arch: 'x86' };
-const UA = N.ua;
-const BRANDS = Object.freeze(Array.from(N.secChUa.matchAll(/"([^"]*)";v="([^"]*)"/g),
-  m => Object.freeze({ brand: m[1], version: m[2] })));
-// Full versions: Chrome's reduced `<major>.0.0.0`, and Huginn's own.
-const FULL_VERSIONS = Object.freeze(BRANDS.map(b => Object.freeze({
-  brand: b.brand, version: b.brand === 'Huginn' ? N.huginnVersion : b.version + '.0.0.0' })));
-const CHROME_FULL = FULL_VERSIONS.find(b => b.brand === 'Chromium').version;
+// Sec-CH-UA headers the network sends (`install_ops`), so script and headers
+// agree. Set at start, with the navigator values made from them.
+let OS, UA, BRANDS, FULL_VERSIONS, CHROME_FULL;
 class Navigator {}
 const navigatorProps = {
-  userAgent: UA, appVersion: UA.slice(8), appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko',
-  productSub: '20030107', vendor: 'Google Inc.', vendorSub: '', platform: OS.platform, language: 'en-US',
+  userAgent: '', appVersion: '', appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko',
+  productSub: '20030107', vendor: 'Google Inc.', vendorSub: '', platform: '', language: 'en-US',
   languages: Object.freeze(['en-US', 'en']), cookieEnabled: true, onLine: true, hardwareConcurrency: 8,
   deviceMemory: 8, maxTouchPoints: 0, webdriver: false, doNotTrack: null, pdfViewerEnabled: true,
   plugins: Object.freeze([]), mimeTypes: Object.freeze([]),
   userAgentData: {
-    brands: BRANDS, mobile: false, platform: OS.name,
+    brands: null, mobile: false, platform: '',
     getHighEntropyValues() {
       return Promise.resolve({ brands: BRANDS, mobile: false, platform: OS.name, platformVersion: OS.version,
         architecture: OS.arch, bitness: '64', model: '', wow64: false, formFactors: ['Desktop'],
@@ -277,6 +270,22 @@ const navigatorProps = {
   mediaSession: { metadata: null, playbackState: 'none', setActionHandler() {} },
 };
 for (const k in navigatorProps) defProp(Navigator.prototype, k, { value: navigatorProps[k], configurable: true, enumerable: true });
+onStart(() => {
+  OS = N.os === 'macos'
+    ? { platform: 'MacIntel', name: 'macOS', version: '14.0.0', arch: 'arm' }
+    : { platform: 'Linux x86_64', name: 'Linux', version: '6.8.0', arch: 'x86' };
+  UA = N.ua;
+  BRANDS = Object.freeze(Array.from(N.secChUa.matchAll(/"([^"]*)";v="([^"]*)"/g),
+    m => Object.freeze({ brand: m[1], version: m[2] })));
+  // Full versions: Chrome's reduced `<major>.0.0.0`, and Huginn's own.
+  FULL_VERSIONS = Object.freeze(BRANDS.map(b => Object.freeze({
+    brand: b.brand, version: b.brand === 'Huginn' ? N.huginnVersion : b.version + '.0.0.0' })));
+  CHROME_FULL = FULL_VERSIONS.find(b => b.brand === 'Chromium').version;
+  for (const [k, v] of [['userAgent', UA], ['appVersion', UA.slice(8)], ['platform', OS.platform]]) {
+    defProp(Navigator.prototype, k, { value: v });
+  }
+  Object.assign(navigatorProps.userAgentData, { brands: BRANDS, platform: OS.name });
+});
 Navigator.prototype.javaEnabled = function () { return false; };
 Navigator.prototype.sendBeacon = function () { return true; };
 Navigator.prototype.vibrate = function () { return false; };
@@ -286,10 +295,13 @@ expose(Navigator);
 const navigator = new Navigator();
 
 const screen = (() => {
-  const v = N.viewport();
   const orientation = Object.assign(new EventTarget(), { type: 'landscape-primary', angle: 0, onchange: null, lock() { return Promise.reject(domErr('NotSupportedError')); }, unlock() {} });
-  return { width: v[0], height: v[1], availWidth: v[0], availHeight: v[1], availLeft: 0, availTop: 0, colorDepth: 24, pixelDepth: 24, orientation };
+  return { width: 0, height: 0, availWidth: 0, availHeight: 0, availLeft: 0, availTop: 0, colorDepth: 24, pixelDepth: 24, orientation };
 })();
+onStart(() => {
+  const v = N.viewport();
+  Object.assign(screen, { width: v[0], height: v[1], availWidth: v[0], availHeight: v[1] });
+});
 
 // ----------------------------------------------------------- matchMedia --
 
@@ -373,7 +385,8 @@ function matchMedia(q) { return new MediaQueryList(q); }
 
 // ----------------------------------------------------------- performance --
 
-const timeOrigin = Date.now() - now();
+let timeOrigin = 0;
+onStart(() => { timeOrigin = Date.now() - now(); });
 // PerformanceNavigationTiming for this load (all phases at time 0).
 function navigationEntry() {
   return { name: curUrl, entryType: 'navigation', initiatorType: 'navigation', type: 'navigate', startTime: 0,

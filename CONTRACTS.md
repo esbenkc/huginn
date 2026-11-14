@@ -840,6 +840,15 @@ DOM rules (pre-insertion checks, queries, URL parts) are in `src/dom_ops.rs`.
 | `document.cookie`, `document.referrer` | `cx.loader.cookies()` (no HttpOnly), `cx.referrer` |
 | wrapper identity | one JS wrapper per `NodeId::to_raw`, cached |
 
+The prelude runs at build time: `build.rs` runs it once and saves the isolate
+as a V8 startup snapshot (`src/v8engine/startup.rs`), and each page's isolate
+starts from it. A cross build has no snapshot, and `HUGINN_V8_FLAGS` turns it
+off (a snapshot needs the flags it was made with); then each isolate runs the
+prelude itself. So the prelude must not call `N` while it runs. The engine
+then adds the native operations and constants to `N` and calls the prelude's
+`start` hook, which reads the page's own values (`onStart` in `00-base.js`:
+the URL, the viewport, the time origin, the user agent).
+
 Event loop, owned by the shell (`huginn-shell/src/scripts.rs`):
 1. Parse. Run `Blocking` scripts in order, then `Async`, then `Defer`
    (all fetched up front with the stylesheets). `run_microtasks` after each.

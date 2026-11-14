@@ -15,7 +15,7 @@ function addTimer(due, fn, interval) {
   timers.set(id, { id, due, fn, interval });
   return id;
 }
-const taskNow = N.taskNow;
+const taskNow = () => N.taskNow();
 function queueTask(fn) { return addTimer(taskNow(), fn, 0); }
 
 function timerFn(handler, args) {
