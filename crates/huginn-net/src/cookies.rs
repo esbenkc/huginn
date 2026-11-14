@@ -758,8 +758,12 @@ fn parse_cookie_date(s: &str) -> Option<i64> {
             day = Some(d);
             continue;
         }
-        if month.is_none() && tok.len() >= 3 {
-            let m = tok[..3].to_ascii_lowercase();
+        // `get`, not a slice: byte 3 may be inside a non-ASCII character
+        // ("éé", or a localized month such as "août").
+        if month.is_none()
+            && let Some(m) = tok.get(..3)
+        {
+            let m = m.to_ascii_lowercase();
             if let Some(i) = [
                 "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
             ]
@@ -984,6 +988,19 @@ fn libc_o_nofollow() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_non_ascii_cookie_date_is_invalid_and_does_not_panic() {
+        // The month check cut tokens at byte 3, inside a character.
+        assert_eq!(parse_cookie_date("éé"), None);
+        assert_eq!(parse_cookie_date("12 août 2030 10:00:00"), None);
+        // A day may have anything after its digits (RFC 6265bis 5.1.1).
+        assert_eq!(
+            parse_cookie_date("1é Jan 2030 10:00:00"),
+            parse_cookie_date("1 Jan 2030 10:00:00")
+        );
+        assert!(parse_cookie_date("12 Aug 2030 10:00:00").is_some());
+    }
 
     fn u(s: &str) -> Url {
         Url::parse(s).unwrap()

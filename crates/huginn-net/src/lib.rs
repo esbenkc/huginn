@@ -452,6 +452,7 @@ impl Loader {
         kind: ResourceKind,
         cors: CorsSettings,
     ) -> Result<Arc<Resource>, NetError> {
+        self.check_local(url)?;
         if let Some(hit) = self.cache.lock().expect("cache poisoned").get(url)
             && (cors == CorsSettings::NoCors || hit.response_type != ResponseType::Opaque)
         {
@@ -528,12 +529,30 @@ impl Loader {
         self.fetch_uncached_with(url, kind, CorsSettings::NoCors)
     }
 
+    /// A document from the web may not load `file:` subresources (scripts,
+    /// styles, images): a page could run or probe the user's local files.
+    /// Chrome refuses them too ("Not allowed to load local resource").
+    /// Documents that are local files themselves, and the browser's own
+    /// pages, may.
+    fn check_local(&self, url: &Url) -> Result<(), NetError> {
+        let from_web = self
+            .client()
+            .is_some_and(|c| matches!(c.url.scheme(), "http" | "https"));
+        if url.scheme() == "file" && from_web {
+            return Err(NetError::Blocked(format!(
+                "{url}: a web page may not load a local file"
+            )));
+        }
+        Ok(())
+    }
+
     fn fetch_uncached_with(
         &self,
         url: &Url,
         kind: ResourceKind,
         cors: CorsSettings,
     ) -> Result<Resource, NetError> {
+        self.check_local(url)?;
         let (mode, credentials) = cors.mode();
         match url.scheme() {
             // Modules from `file:` are refused like in Chrome (opaque origin).
