@@ -1,11 +1,11 @@
 //! The startup snapshot against running the prelude in each isolate.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use huginn_dom::local_name;
 use huginn_net::{Loader, Url};
 
-use super::{PRELUDE, V8Engine};
+use super::{PRELUDE, V8Engine, exception_message};
 use crate::{EngineOptions, HostContext, ScriptEngine, ScriptKind};
 
 /// Everything a page script can see of the prelude: each global and the
@@ -98,12 +98,19 @@ fn probe(snapshot: Option<&'static [u8]>, url: &str, viewport: (f32, f32)) -> (S
     (doc.text_content(title), random)
 }
 
+/// Held by each test here that makes isolates. Some start from the snapshot
+/// and some do not, and V8 crashes when an isolate starts from another
+/// snapshot than the live ones (see `CUSTOM_FLAGS`). Tests of a crate run
+/// in one process.
+static ISOLATES: Mutex<()> = Mutex::new(());
+
 /// A page whose isolate starts from the snapshot sees exactly what it sees
 /// when the prelude runs in its own isolate, with its own URL, viewport,
 /// time origin and random numbers.
 #[cfg(huginn_snapshot)]
 #[test]
 fn snapshot_starts_like_the_prelude_from_source() {
+    let _isolates = ISOLATES.lock().unwrap_or_else(|e| e.into_inner());
     let snapshot = Some(&super::SNAPSHOT.0[..]);
     for (url, viewport) in [
         ("https://a.example/dir/page.html?q#h", (1280.0, 800.0)),
@@ -140,4 +147,35 @@ fn prelude_is_the_current_source() {
         .map(|f| std::fs::read_to_string(f).unwrap())
         .collect();
     assert!(PRELUDE == source, "the built prelude is not src/js");
+}
+
+/// The build runs the prelude with an empty `N`, so a value it read from `N`
+/// while it ran would be `undefined` on every page, frozen in the snapshot.
+/// Page values must come through `onStart`. Here every read of `N` throws.
+#[test]
+fn prelude_reads_nothing_of_n_while_it_runs() {
+    fn run<'s>(scope: &mut v8::PinScope<'s, '_>, source: &str) -> Option<v8::Local<'s, v8::Value>> {
+        let source = v8::String::new(scope, source)?;
+        v8::Script::compile(scope, source, None)?.run(scope)
+    }
+    let _isolates = ISOLATES.lock().unwrap_or_else(|e| e.into_inner());
+    super::init_v8();
+    let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+    v8::scope!(let scope, &mut isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(let tc, scope);
+    let trap = "new Proxy({}, { get(_, k) { throw new Error('N.' + String(k) + ' read while the prelude runs'); } })";
+    let (Some(prelude), Some(trap)) = (run(tc, PRELUDE), run(tc, trap)) else {
+        panic!("{}", exception_message(tc));
+    };
+    let prelude = v8::Local::<v8::Function>::try_from(prelude).unwrap();
+    let global = context.global(tc);
+    let undefined = v8::undefined(tc).into();
+    if prelude
+        .call(tc, undefined, &[trap, global.into()])
+        .is_none()
+    {
+        panic!("{}", exception_message(tc));
+    }
 }

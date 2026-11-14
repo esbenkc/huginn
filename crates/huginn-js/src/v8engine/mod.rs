@@ -19,7 +19,7 @@ mod tests;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use huginn_dom::{NodeId, local_name};
@@ -47,12 +47,17 @@ const HEAP_LIMIT: usize = 512 << 20;
 /// zero-delay timer cannot spin forever inside one call.
 const MAX_TIMERS_PER_ROUND: usize = 2000;
 
-/// `HUGINN_V8_FLAGS` replaces V8's flags ([`startup::V8_FLAGS`]), to measure
-/// other settings (for example `--single-threaded` alone, or with
-/// `--jitless`).
+/// `HUGINN_V8_FLAGS`, which replaces V8's flags ([`startup::V8_FLAGS`]), to
+/// measure other settings (for example `--single-threaded` alone, or with
+/// `--jitless`). Read once: V8 takes its flags once per process, and all
+/// isolates of a process must start from the same snapshot (they share
+/// parts of V8's heap; an isolate made from another snapshot while one is
+/// alive crashes in V8).
+static CUSTOM_FLAGS: LazyLock<Option<String>> =
+    LazyLock::new(|| std::env::var("HUGINN_V8_FLAGS").ok());
+
 fn init_v8() {
-    let flags = std::env::var("HUGINN_V8_FLAGS");
-    startup::init_v8(flags.as_deref().unwrap_or(startup::V8_FLAGS));
+    startup::init_v8(CUSTOM_FLAGS.as_deref().unwrap_or(startup::V8_FLAGS));
 }
 
 /// The startup snapshot for new isolates. None without one, or with
@@ -60,7 +65,7 @@ fn init_v8() {
 /// Then each isolate runs the prelude itself.
 fn startup_snapshot() -> Option<&'static [u8]> {
     #[cfg(huginn_snapshot)]
-    if std::env::var_os("HUGINN_V8_FLAGS").is_none() {
+    if CUSTOM_FLAGS.is_none() {
         return Some(&SNAPSHOT.0);
     }
     None
