@@ -811,7 +811,8 @@ pub enum HostRequest { Navigate { url: Url, post: Option<forms::PostBody>, new_t
 // requests_in_flight() -> usize (fetch()/async XHR started, response not delivered, aborted
 // ones excluded), wait_for_response(&self, timeout: Duration) -> bool (sleep until a response
 // arrives; true: run_timers delivers it), set_waker(Waker) (called on the request's thread when
-// a response arrives).
+// a response arrives), prepare(cx) (make the isolate now instead of in the first execute;
+// errors come from execute).
 pub type Waker = Arc<dyn Fn() + Send + Sync>;
 // huginn_js::forms: activation behavior (Activation), form owner, entry list, submission
 // (GET query / POST urlencoded, multipart, text/plain), checkedness, select options.
@@ -850,8 +851,9 @@ then adds the native operations and constants to `N` and calls the prelude's
 the URL, the viewport, the time origin, the user agent).
 
 Event loop, owned by the shell (`huginn-shell/src/scripts.rs`):
-1. Parse. Run `Blocking` scripts in order, then `Async`, then `Defer`
-   (all fetched up front with the stylesheets). `run_microtasks` after each.
+1. Parse. `prepare` if scripts run before the first paint, then fetch the
+   stylesheets and scripts (all up front). Run `Blocking` scripts in order,
+   then `Async`, then `Defer`. `run_microtasks` after each.
 2. `dispatch_event(Document, "DOMContentLoaded")`, then
    `dispatch_event(Window, "load")`, each followed by `run_microtasks`.
 3. Settle: jump virtual time to each due timer and `run_timers`, up to
