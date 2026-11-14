@@ -9,6 +9,12 @@
 //
 // The completion value is a function (N, global) -> hooks; the engine calls
 // the hooks for event dispatch and timers (see 90-hooks.js).
+//
+// The prelude must not use `N` while it runs: the build runs it once into a
+// V8 startup snapshot, before any page exists. The engine then adds the
+// native operations and constants to `N` and calls the `start` hook, which
+// runs the functions given to `onStart` to read the page's own values (its
+// URL, the viewport, the time origin).
 (function (N, G) {
 'use strict';
 
@@ -43,6 +49,10 @@ function tag(C, name) {
 
 // Every exposed interface, for `idlEnumerable` at the end of the prelude.
 const interfaces = [];
+
+// Work for the `start` hook, in order.
+const startTasks = [];
+function onStart(fn) { startTasks.push(fn); }
 
 // Make an interface object visible on the global object.
 function expose(C, name) {

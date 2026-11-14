@@ -94,5 +94,11 @@ function hostDispatch(kind, id, type, bubbles, cancelable, iface, init, trusted)
   return r;
 }
 
-return { dispatch: hostDispatch, runOne, nextDue, netDone };
+// Called once per page, after the engine filled `N` and before any page
+// script (see the top of 00-base.js).
+function start() {
+  for (const fn of startTasks) fn();
+}
+
+return { start, dispatch: hostDispatch, runOne, nextDue, netDone };
 })

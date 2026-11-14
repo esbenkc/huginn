@@ -1118,9 +1118,8 @@ op!(op_disabled(scope, args, rv) {
     rv.set_bool(r);
 });
 
-/// Build the `N` object with every op.
-pub(super) fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
-    let obj = v8::Object::new(scope);
+/// Add every op, and the constants below, to the prelude's `N` object.
+pub(super) fn install_ops(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<'_, v8::Object>) {
     super::codec::install(scope, obj);
     macro_rules! install {
         ($($name:literal => $f:ident),* $(,)?) => {
@@ -1174,5 +1173,4 @@ pub(super) fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s,
             obj.set(scope, key.into(), value.into());
         }
     }
-    obj
 }
