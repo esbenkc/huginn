@@ -36,12 +36,15 @@ markup5ever = "0.40.0"
 # CSS tokenizer (Servo). Same major as stylo 0.24.
 cssparser = "0.38"
 # CSS engine (Servo's Stylo): cascade, selectors, computed values. huginn-style
-# runs its sequential traversal only (no rayon pool). See ARCHITECTURE.md.
+# runs Stylo's parallel traversal on a rayon pool of its own on big documents.
+# See ARCHITECTURE.md.
 style = { package = "stylo", version = "0.24.0" }
 style_traits = { package = "stylo_traits", version = "0.24.0" }
 style_dom = { package = "stylo_dom", version = "0.24.0" }
 style_config = { package = "stylo_static_prefs", version = "0.24.0" }
 selectors = "0.43.0"
+# Stylo's parallel traversal takes a rayon pool (the version Stylo uses).
+rayon = "1.12"
 euclid = "0.22"
 app_units = "0.7"
 

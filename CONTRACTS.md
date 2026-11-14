@@ -191,12 +191,23 @@ impl StyleEngine {
     pub fn set_document_url(&mut self, url: &str);
     /// Call in document order. `base_url` resolves url() and @import.
     pub fn add_stylesheet(&mut self, css: &str, base_url: &str, origin: Origin, loader: &dyn StylesheetLoader);
+    /// Sheets from parse_stylesheet, in document order. A sheet that comes again later
+    /// (the same parse) is left out at its earlier places when that cannot change a value.
+    pub fn add_parsed_stylesheets(&mut self, sheets: &[ParsedStylesheet]);
     /// Some document rule uses :hover / :active / the focus pseudo-classes (true with shadow roots).
     pub fn uses_state(&self, doc: &Document, hover: bool, active: bool, focus: bool) -> bool;
     pub fn font_faces(&self) -> &[FontFaceRule];
     pub fn compute(&self, doc: &Document) -> StyleMap;
 }
 pub const UA_STYLESHEET: &str;                 // src/ua.css
+
+/// Parse on any thread. Same origin, URL and text: the same parse while the
+/// process-wide cache keeps it (8 MB of source, LRU; sheets with @import are not kept).
+pub fn parse_stylesheet(css: &str, base_url: &str, origin: Origin, loader: &dyn StylesheetLoader) -> ParsedStylesheet;
+pub struct ParsedStylesheet { .. }             // Clone + Send + Sync
+impl ParsedStylesheet {
+    pub fn same_parse(&self, other: &ParsedStylesheet) -> bool;
+}
 
 pub struct StyleMap { .. }
 impl StyleMap {

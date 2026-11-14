@@ -37,10 +37,11 @@ ordered.
  Document (arena of Node)           huginn-dom    NodeId per node
    |  collect <style>, <link rel=stylesheet media=...>
    v
- Loader::fetch_all(stylesheets)     huginn-net    up to 32 threads, cached for @import
-   |  StyleEngine::add_stylesheet (UA sheet + author sheets, @import); then Loader::clear_cache
+ Loader::map_parallel(stylesheets)   huginn-net    up to 32 threads, cached for @import; each sheet is
+   |  parsed on the thread that fetched it (huginn_style::parse_stylesheet), inline ones in parallel
+   |  StyleEngine::add_parsed_stylesheets (UA sheet + author sheets in order); then Loader::clear_cache
    v
- StyleEngine::compute(&Document)    huginn-style  StyleMap: Arc<ComputedStyle> per element
+ StyleEngine::compute(&Document)    huginn-style  StyleMap: Arc<ComputedStyle> per element (parallel on big documents)
    |  resources::load: one parallel batch of <img> (not display:none, decoded at
    |  display size), CSS backgrounds, inline <svg> (resvg) and the @font-face
    |  files the text uses (WOFF2 -> sfnt); bodies dropped after decoding. The
@@ -64,7 +65,8 @@ the `open` window use them, so new pipeline steps (scripts, font decoding) go
 into `load` once and both modes get them. Which subresources a page needs is decided in
 `crates/huginn-shell/src/resources.rs` (owned by huginn-net). `pipeline::render` times each phase
 and prints one JSON line. The keys are `url`,
-`fetch_ms`, `parse_ms` (HTML plus CSS parsing), `style_ms`, `layout_ms`,
+`fetch_ms`, `parse_ms` (HTML parsing, inline CSS and adding the parsed
+sheets; external sheets are parsed on the fetch threads, in `fetch_ms`), `style_ms`, `layout_ms`,
 `paint_ms` (display list plus raster), `encode_ms`, `total_ms` (process start
 to PNG written), `nodes`, `styled`, `boxes`, `images`, `width`, `height`.
 
@@ -109,13 +111,28 @@ in, first paint, first contentful paint, images and fonts in, complete.
   TLS records and HTTP/2 frames. Callers block until their response
   arrives. Name lookups, TCP connects and TLS handshakes run on the thread
   that needs the new connection, so they run in parallel.
-- Parsing, style, layout and paint run on the render thread. They are
-  single-threaded today.
+- HTML parsing, layout and paint run on the render thread, single-threaded.
+- Each external stylesheet is parsed on the thread that fetched it, as soon
+  as its bytes are in, while the other sheets are still on the network;
+  inline `<style>` sheets are parsed in parallel after the fetches. Parsed
+  sheets are immutable and shared by every engine of the process: all of
+  them read stylesheets under one `SharedRwLock`, which nothing takes for
+  writing (scripts' CSSOM writes `<style>` text). See "The Stylo decision".
+- Style: Stylo's parallel traversal on a rayon pool of its own
+  (`huginn-style-N` threads, Gecko's count: three quarters of the cores, at
+  most 6, made on the first big document) for documents with at least 600
+  elements; smaller ones are styled on the calling thread, where handing
+  them to the pool costs more than it saves. Stylo starts each pass
+  breadth-first and hands chunks of 16 elements to other threads; an
+  element is styled by one thread, after its parent.
+  `HUGINN_STYLE_THREADS=n` sets the pool size (0 or 1: always sequential).
 - `Document` is not `Send` or `Sync`. Its strings are `StrTendril`, which has a
-  non-atomic refcount. It stays on the render thread.
-- Planned: Stylo's parallel traversal (rayon) for style, and vello_cpu's
-  `multithreading` feature for raster. Both only pay off on big pages, and
-  both add threads and memory, so measure before switching them on.
+  non-atomic refcount. It stays on the render thread; the style threads
+  only read it during a style pass (no tendril is cloned or dropped there,
+  and it has no interior mutability).
+- Planned: vello_cpu's `multithreading` feature for raster. It only pays
+  off on big pages and adds threads and memory, so measure before
+  switching it on.
 - V8 runs on the render thread with `--single-threaded` (no background
   compiler or GC threads) and `--lite-mode` (interpreter only: no JIT code,
   lazy feedback vectors; about half the V8 heap on script-heavy pages at the
@@ -564,8 +581,12 @@ our biggest memory lever, so keep it that way: no helper processes.
   viewport, and the rasterizer allocates only `width x height` pixels.
 - **Bodies are not kept.** The document, images and fonts are fetched without
   the loader's memory and dropped right after parsing or decoding (the
-  window's HTTP cache keeps them on disk, not in memory). Stylesheets are
-  cached only until CSS parsing ends (`Loader::clear_cache`). Images are
+  window's HTTP cache keeps them on disk, not in memory). Stylesheet texts
+  are kept only until CSS parsing ends (`Loader::clear_cache`); the parsed
+  sheets stay in a process-wide cache (by origin, URL and text, at most
+  8 MB of source, least recently used out first), as Chrome keeps parsed
+  sheets in its memory cache: a repeated `<link>`, a revisit, a reload,
+  another tab and a restyle after scripts use the same parse. Images are
   decoded only when they generate a box, at most at about twice their
   displayed size, and `loading=lazy` images only when layout puts them in
   the painted region. Web fonts load only for faces the page text uses.
@@ -870,8 +891,9 @@ Why Stylo and not completing the phase-1 engine:
    filter, the style sharing cache and the rule tree. The phase-1 engine
    matched every rule against every element.
 3. **It fits our DOM.** Stylo's `TElement`/`TNode` traits do not need
-   `Send`/`Sync`. We run the *sequential* traversal (`traverse_dom(.., None)`),
-   so no rayon pool and no extra threads; `Document` keeps `StrTendril`.
+   `Send`/`Sync`. The parallel traversal (`traverse_dom(.., Some(pool))`)
+   only reads the document; per-element data and flags live in our side
+   table (see "Threading"); `Document` keeps `StrTendril`.
 4. **Memory.** Stylo's per-element data lives in a side table only during
    `compute`. Elements that share a Stylo style share one converted
    `Arc<ComputedStyle>`.
@@ -890,7 +912,20 @@ How it fits together (`crates/huginn-style/src`):
 - `engine.rs`: Stylo prefs (`:has`, `text-overflow`, ...), the `Device`
   (screen, light scheme, fine pointer with hover), stylesheet parsing with
   synchronous `@import` through our `StylesheetLoader`, `@font-face`
-  extraction (incl. `unicode-range`), the traversal.
+  extraction (incl. `unicode-range`), the traversal and the style pool.
+- `sheets.rs`: `parse_stylesheet` (any thread), the process-wide lock and
+  cache of parsed sheets, and which places of a repeated sheet a cascade
+  can leave out. A page that links the same sheet several times (github:
+  one sheet 6 times, another 4 times, 61 % of its 6.6 MB of CSS) gets one
+  parse, and its earlier places are left out of the cascade when that
+  cannot change a value: every rule matches again at the last place, with
+  the same specificity, in the same named layer and later, so an earlier
+  copy never wins. That needs the layer order to stay the same (it is the
+  order of first declaration), so a copy that declares layers is left out
+  only if the first declarations keep their order without it; sheets with
+  `@import`, `@scope`, `@custom-media`, an anonymous layer or a layer
+  inside a condition are never left out. `@font-face` rules count at every
+  place.
 - `dom.rs`: `HuginnNode` implements `TNode`, `TElement`, `TDocument` and
   `selectors::Element`. Stylo's style sharing cache stores elements in TLS
   as `usize`, so `HuginnNode` must be one pointer: it points at a per-node
@@ -963,8 +998,11 @@ terms; the ratios between phases still hold.
 ## Task lists per crate, by impact on the corpus
 
 **huginn-style**
-1. `style_ms` on github is 145-290 ms at background QoS; profile `flush`
-   (rule hash build) vs traversal vs `convert`.
+1. `style_ms` on github (bench-release, 2026-11-14): flush (rule hash
+   build) 4-5 ms, traversal 8 ms on 6 threads (13-15 ms on one; half of it
+   is the cascade, a third of that custom properties), `convert` 2 ms.
+   Next: build the rule hash while the last sheets are on the network, and
+   split the parse of a big sheet that arrives last (tailwind: 8 ms).
 2. Reuse one `DomCx` across `query_selector` calls while the DOM does not
    change (huginn-js calls them often).
 3. `StyleMap::pseudo` scans every pseudo style; index it by node.
