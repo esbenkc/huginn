@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CSS filters, blending and backdrop filters</title>
+<style>
+  body { margin: 0; background: #fff; font: 16px/1 sans-serif; }
+  .abs { position: absolute; }
+  /* White content in a blending layer over a white page, a black panel and
+     a photo: difference turns it black, white and inverted. */
+  #panel { left: 0; top: 0; width: 200px; height: 100px; background: #000; }
+  #photo { left: 200px; top: 0; width: 120px; height: 80px; }
+  #main { position: relative; z-index: 30; mix-blend-mode: difference; color: #fff; height: 300px; }
+  #bar { left: 100px; top: 40px; width: 200px; height: 20px; background: #fff; }
+  /* Letters animate in with filter and transform; at rest both are identity. */
+  .letter { display: inline-block; filter: blur(0px); transform: scale(1); }
+  #word { left: 20px; top: 70px; }
+  /* A link underline in its own blending layer inside the blending main. */
+  #link { left: 20px; top: 110px; width: 100px; height: 20px; }
+  #link::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 4px;
+                 background: #ffffff80; mix-blend-mode: difference; }
+  /* The blog's terminal theme on an image, and its hover brightness. */
+  #tinted { left: 340px; top: 0; width: 120px; height: 80px;
+            filter: sepia(20%) hue-rotate(60deg) brightness(90%) contrast(110%); }
+  #button { left: 480px; top: 0; width: 60px; height: 60px; background: rgb(40, 90, 200);
+            filter: brightness(1.08); }
+  /* Blur and drop shadow reach past the box. */
+  #blur { left: 40px; top: 180px; width: 60px; height: 60px; background: #000; filter: blur(8px); }
+  #shadow { left: 160px; top: 160px; width: 60px; height: 60px; border: 10px solid #00f;
+            filter: drop-shadow(20px 20px 0 red); }
+  /* Frosted glass over the photo, with rounded corners. */
+  #glass-photo { left: 340px; top: 160px; width: 120px; height: 80px; }
+  #glass { left: 360px; top: 170px; width: 80px; height: 60px; border-radius: 10px;
+           background: rgba(255, 255, 255, .2); backdrop-filter: blur(6px) saturate(2); }
+</style>
+</head>
+<body>
+  <div class="abs" id="panel"></div>
+  <img class="abs" id="photo" src="assets/photo.png" alt="">
+  <img class="abs" id="tinted" src="assets/photo.png" alt="">
+  <div class="abs" id="button"></div>
+  <div class="abs" id="blur"></div>
+  <div class="abs" id="shadow"></div>
+  <img class="abs" id="glass-photo" src="assets/photo.png" alt="">
+  <div class="abs" id="glass"></div>
+  <!-- An SVG filter on a path, like a page-curl shadow. -->
+  <svg class="abs" style="left: 520px; top: 160px" width="80" height="80" viewBox="0 0 80 80">
+    <defs><filter id="fold" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="-4" dy="4" stdDeviation="6" flood-color="black" flood-opacity="0.2"/>
+    </filter></defs>
+    <path d="M 20 0 L 80 60 L 80 0 Z" fill="#f5f3ef" filter="url(#fold)"/>
+  </svg>
+  <main id="main">
+    <div class="abs" id="bar"></div>
+    <div class="abs" id="word"><span class="letter">K</span><span class="letter">R</span><span class="letter">A</span><span class="letter">N</span></div>
+    <a class="abs" id="link" href="#">link</a>
+  </main>
+</body>
+</html>

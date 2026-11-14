@@ -554,6 +554,83 @@ pub enum TransformOp {
     Matrix([f32; 6]),
 }
 
+/// One CSS filter function (Filter Effects 1), computed. Used by `filter`
+/// and `backdrop-filter`; the list applies left to right.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum FilterFunction {
+    /// `blur()`: the standard deviation in px.
+    Blur(f32),
+    /// `brightness()`, `contrast()`, `saturate()`: factor, 1 = unchanged.
+    Brightness(f32),
+    Contrast(f32),
+    Saturate(f32),
+    /// `grayscale()`, `invert()`, `sepia()`: amount 0..=1, 0 = unchanged.
+    Grayscale(f32),
+    Invert(f32),
+    Sepia(f32),
+    /// `opacity()`: 0..=1, 1 = unchanged.
+    Opacity(f32),
+    /// `hue-rotate()` in degrees.
+    HueRotate(f32),
+    /// `drop-shadow()`: the blur is a standard deviation, as in `blur()`
+    /// (not half the radius, as in `box-shadow`). The color is resolved.
+    DropShadow {
+        offset_x: f32,
+        offset_y: f32,
+        blur: f32,
+        color: Color,
+    },
+}
+
+impl FilterFunction {
+    /// The function leaves every pixel as it is (e.g. `blur(0)`).
+    pub fn is_identity(&self) -> bool {
+        match *self {
+            FilterFunction::Blur(s) => s <= 0.0,
+            FilterFunction::Brightness(v)
+            | FilterFunction::Contrast(v)
+            | FilterFunction::Saturate(v)
+            | FilterFunction::Opacity(v) => v == 1.0,
+            FilterFunction::Grayscale(v) | FilterFunction::Invert(v) | FilterFunction::Sepia(v) => {
+                v == 0.0
+            }
+            FilterFunction::HueRotate(deg) => deg.rem_euclid(360.0) == 0.0,
+            FilterFunction::DropShadow { color, .. } => color.is_transparent(),
+        }
+    }
+}
+
+/// `mix-blend-mode` (Compositing and Blending 1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
+    PlusLighter,
+}
+
+/// `isolation`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Isolation {
+    #[default]
+    Auto,
+    Isolate,
+}
+
 /// A computed `clip-path` basic shape, relative to the border box.
 /// (`url()` references and box-only values are not kept.)
 #[derive(Clone, Debug, PartialEq)]

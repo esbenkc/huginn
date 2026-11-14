@@ -17,12 +17,13 @@ use huginn_layout::{
 };
 use huginn_net::DecodedImage;
 use huginn_style::{
-    BackgroundImage, BackgroundRepeat, BorderStyle, ClipPath, Color, Edges, Float, Gradient,
-    Overflow, Position, ShapeRadius, Visibility,
+    BackgroundImage, BackgroundRepeat, BlendMode, BorderStyle, ClipPath, Color, Edges,
+    FilterFunction, Float, Gradient, Isolation, Overflow, Position, ShapeRadius, Visibility,
 };
 use vello_cpu::kurbo::{Affine, BezPath, Shape};
 
 mod background;
+mod filter;
 pub use background::ResolvedGradient;
 
 /// One paint operation. Coordinates are absolute document CSS px.
@@ -109,6 +110,28 @@ pub enum DisplayItem<'a> {
     /// (`x' = a x + c y + e`, `y' = b x + d y + f`, document coordinates).
     PushTransform([f32; 6]),
     PopTransform,
+    /// Run everything until the matching `PopFilter` through a `filter`
+    /// list (Filter Effects 1), left to right, as one group. The result may
+    /// reach past the content (blur, drop shadow).
+    PushFilter(&'a [FilterFunction]),
+    PopFilter,
+    /// Composite everything until the matching `PopBlend` as one group onto
+    /// what is below it with this `mix-blend-mode`. `Normal` only isolates
+    /// the group (a stacking context with blending children).
+    PushBlend(BlendMode),
+    PopBlend,
+    /// `backdrop-filter` (Filter Effects 2): what is painted below, back to
+    /// the backdrop root (the nearest enclosing opacity, mask, blend or
+    /// filter group, else the canvas), clipped to the border box `rect`,
+    /// run through `filters` with mirrored edges and painted inside `rect`
+    /// with `radii`. It follows the element's own layer pushes; the
+    /// innermost `own_layers` of the enclosing layers are those.
+    BackdropFilter {
+        rect: Rect,
+        radii: [f32; 4],
+        filters: &'a [FilterFunction],
+        own_layers: u8,
+    },
 }
 
 /// The image of a [`DisplayItem::PushMask`].
@@ -138,7 +161,9 @@ pub struct DisplayList<'a> {
 ///
 /// Paint order follows CSS 2.1 Appendix E. The root element and every box
 /// that creates a stacking context (positioned with a `z-index`, flex/grid
-/// items with a `z-index`, `opacity < 1`, `position: fixed/sticky`) paint as:
+/// items with a `z-index`, `opacity < 1`, a transform, mask, clip-path,
+/// filter, backdrop-filter or blend mode, `isolation: isolate`,
+/// `position: fixed/sticky`) paint as:
 /// own background and border, child contexts with negative `z-index`,
 /// backgrounds of in-flow blocks, floats, inline content (text, replaced
 /// images, atomic inlines), then positioned descendants and child contexts
@@ -160,6 +185,8 @@ pub fn build_display_list<'a>(tree: &'a LayoutTree, cull: Option<Rect>) -> Displ
         cb_len: 0,
         pending: BinaryHeap::new(),
         floats: Vec::new(),
+        canvas: Color::WHITE,
+        blend_inside: false,
     };
     let mut canvas = Color::WHITE;
     if let Some(root) = tree.root {
@@ -178,6 +205,7 @@ pub fn build_display_list<'a>(tree: &'a LayoutTree, cull: Option<Rect>) -> Displ
             canvas = blend_over_white(tree.get(body).style.background_color);
             b.canvas_source = Some(body);
         }
+        b.canvas = canvas;
         if tree.get(root).style.opacity > 0.0 {
             b.paint_stacking_context(root);
         }
@@ -278,6 +306,11 @@ struct ListBuilder<'a> {
     pending: BinaryHeap<Reverse<Deferred>>,
     /// Floats of the current (pseudo) stacking context, in tree order.
     floats: Vec<Deferred>,
+    /// The canvas color (root or body background).
+    canvas: Color,
+    /// The current stacking context has a child context with a
+    /// `mix-blend-mode`: it must composite as an isolated group.
+    blend_inside: bool,
 }
 
 fn radii(b: &huginn_layout::LayoutBox) -> [f32; 4] {
@@ -326,6 +359,10 @@ fn classify(b: &huginn_layout::LayoutBox, parent_is_flex_or_grid: bool) -> Layer
         || s.transform.is_some()
         || s.mask.is_some()
         || s.clip_path.is_some()
+        || s.filter.is_some()
+        || s.backdrop_filter.is_some()
+        || s.mix_blend_mode != BlendMode::Normal
+        || s.isolation == Isolation::Isolate
         || matches!(s.position, Position::Fixed | Position::Sticky);
     if real || positioned {
         Layer::Deferred {
@@ -567,11 +604,28 @@ impl<'a> ListBuilder<'a> {
     }
 
     /// Paint a box that creates a stacking context, with all its descendants.
+    ///
+    /// Items around the content, outside in: transform, clip-path, blend
+    /// (or an isolation group), opacity, mask, the filtered backdrop, then
+    /// the filter (Filter Effects 1: filter first, then clipping, masking
+    /// and opacity; blending composites the result).
     fn paint_stacking_context(&mut self, id: BoxId) {
         let b = self.tree.get(id);
         let s = &b.style;
+        let root = Some(id) == self.tree.root;
         let opacity = s.opacity;
         let positioned = s.position != Position::Static;
+        // Filters that change pixels. An identity list (`blur(0)`) only
+        // makes a stacking context and a containing block.
+        let active = |f: &'a [FilterFunction]| f.iter().any(|f| !f.is_identity());
+        let filter = s.filter.as_deref().filter(|f| active(f));
+        let backdrop = s.backdrop_filter.as_deref().filter(|f| active(f));
+        // The root blends with the canvas only: nothing to do.
+        let blend = if root {
+            BlendMode::Normal
+        } else {
+            s.mix_blend_mode
+        };
         let transform = s
             .transform
             .as_deref()
@@ -622,25 +676,69 @@ impl<'a> ListBuilder<'a> {
                 .push(DisplayItem::PushTransform(m.as_coeffs().map(|v| v as f32)));
             self.cull = None;
         }
+        let saved_blend_inside = std::mem::replace(&mut self.blend_inside, false);
         // clip-path applies in the element's own (transformed) coordinates.
         let clip_path_layer = clip_path.is_some();
         if let Some(item) = clip_path {
             self.items.push(item);
         }
+        let layers_start = self.items.len();
         let opacity_layer = opacity < 1.0;
+        let mask_layer = mask.is_some();
+        // An element with backdrop-filter is a backdrop root for its
+        // descendants, so it gets a group of its own.
+        let blend_layer =
+            blend != BlendMode::Normal || (backdrop.is_some() && !opacity_layer && !mask_layer);
+        if blend_layer {
+            self.items.push(DisplayItem::PushBlend(blend));
+        }
         if opacity_layer {
             self.items.push(DisplayItem::PushOpacity(opacity));
         }
-        let mask_layer = mask.is_some();
         if let Some(item) = mask {
             self.items.push(item);
         }
+        if let Some(filters) = backdrop {
+            self.items.push(DisplayItem::BackdropFilter {
+                rect: b.rect,
+                radii: radii(b),
+                filters,
+                own_layers: u8::from(blend_layer) + u8::from(opacity_layer) + u8::from(mask_layer),
+            });
+        }
+        if let Some(filters) = filter {
+            self.items.push(DisplayItem::PushFilter(filters));
+            // Content within the filter's reach of the region shows in it.
+            let reach = filter::reach(filters);
+            self.cull = self.cull.map(|c| Rect {
+                x: c.x - reach,
+                y: c.y - reach,
+                width: c.width + 2.0 * reach,
+                height: c.height + 2.0 * reach,
+            });
+        }
         let start = self.items.len();
+        if filter.is_some() && root && self.canvas_source.is_some() {
+            // The root's filter also applies to the root (or body)
+            // background on the canvas, not to the default white (Chrome).
+            self.items.push(DisplayItem::Rect {
+                rect: Rect {
+                    x: -1.0e6,
+                    y: -1.0e6,
+                    width: 2.0e6 + self.tree.document_size.width,
+                    height: 2.0e6 + self.tree.document_size.height,
+                },
+                radii: [0.0; 4],
+                color: self.canvas,
+            });
+        }
 
         self.box_background(id);
         self.outline(id);
         let clipped = self.enter_clip(id);
-        if positioned || transform.is_some() {
+        // Transforms and filters make a containing block for absolutely
+        // positioned and fixed descendants.
+        if positioned || transform.is_some() || s.filter.is_some() || s.backdrop_filter.is_some() {
             self.cb_len = self.clips.len();
         }
         self.walk(id, Phase::Collect);
@@ -665,18 +763,38 @@ impl<'a> ListBuilder<'a> {
         self.sync_clips();
 
         let empty = self.items.len() == start;
-        if mask_layer {
+        // Stacking contexts are isolated groups (Compositing 1, 3.2): a
+        // blending child must not see what is below this context.
+        if self.blend_inside
+            && !empty
+            && !root
+            && !blend_layer
+            && !opacity_layer
+            && !mask_layer
+            && filter.is_none()
+        {
+            self.items
+                .insert(start, DisplayItem::PushBlend(BlendMode::Normal));
+            self.items.push(DisplayItem::PopBlend);
+        }
+        if filter.is_some() {
             if empty {
                 self.items.pop();
             } else {
-                self.items.push(DisplayItem::PopMask);
+                self.items.push(DisplayItem::PopFilter);
             }
         }
-        if opacity_layer {
-            if empty {
-                self.items.pop();
-            } else {
+        if empty && backdrop.is_none() {
+            self.items.truncate(layers_start);
+        } else {
+            if mask_layer {
+                self.items.push(DisplayItem::PopMask);
+            }
+            if opacity_layer {
                 self.items.push(DisplayItem::PopOpacity);
+            }
+            if blend_layer {
+                self.items.push(DisplayItem::PopBlend);
             }
         }
         if clip_path_layer {
@@ -689,14 +807,14 @@ impl<'a> ListBuilder<'a> {
                 self.items.push(DisplayItem::PopClip);
             }
         }
-        if transform.is_some() {
-            if matches!(self.items.last(), Some(DisplayItem::PushTransform(_))) {
-                self.items.pop();
-            } else {
-                self.items.push(DisplayItem::PopTransform);
-            }
-            self.cull = saved_cull;
+        if transform.is_some() && matches!(self.items.last(), Some(DisplayItem::PushTransform(_))) {
+            self.items.pop();
+        } else if transform.is_some() {
+            self.items.push(DisplayItem::PopTransform);
         }
+        self.cull = saved_cull;
+        // A blending context makes its parent context an isolated group.
+        self.blend_inside = saved_blend_inside || blend != BlendMode::Normal;
         self.restore_context(
             saved_clips,
             saved_emitted,

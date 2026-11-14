@@ -760,10 +760,20 @@ content; dashed, dotted and double borders; mipmapped image downscaling and
 bicubic upscaling; synthetic bold; text baselines on whole device pixels
 like Skia (x stays subpixel; hackernews 0.974 -> 0.990); PNG with
 `Compression::Fastest` (encode on plain: 65 ms -> 38 ms at background QoS,
-single run).
+single run); CSS filters (Filter Effects 1 and 2): `filter` with all ten
+functions, left to right, with Chrome's sRGB color math (`filter.rs`); a
+filtered stacking context paints into its own pixmap, sized to its ink plus
+the filter's reach and cut to what the region can show, then the pixmap is
+filtered and drawn; `backdrop-filter` paints the items since its backdrop
+root again, clipped to the border box, and blurs with mirrored edges;
+`mix-blend-mode` and `isolation` are vello blend layers, and a stacking
+context with a blending child becomes an isolated group. An identity list
+(`blur(0)`) adds no layer. Not yet: filters and blending on non-atomic
+inline elements, `filter: url()` (Stylo's servo build does not parse it),
+`-webkit-backdrop-filter` (no alias in Stylo).
 Backgrounds, gradients, shadows, transforms, outline and object-fit take
 effect as huginn-style fills those `ComputedStyle` fields (defaults today).
-Pixel tests: `crates/huginn-paint/tests/paint_order.rs`.
+Pixel tests: `crates/huginn-paint/tests/paint_order.rs`, `filters.rs`.
 1. Paint inline fragments once huginn-layout produces them (one `Rect` +
    `Border` per fragment, sliced by `first`/`last`).
 2. Text: Chrome on macOS draws text with more ink than our vello glyphs

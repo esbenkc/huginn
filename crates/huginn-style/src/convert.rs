@@ -896,6 +896,13 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
         fill: svg_paint(s, &s.get_inherited_svg().fill),
         stroke: svg_paint(s, &s.get_inherited_svg().stroke),
         clip_path: clip_path(cx, &s.get_svg().clip_path),
+        filter: filters(s, &effects.filter.0),
+        backdrop_filter: filters(s, &effects.backdrop_filter.0),
+        mix_blend_mode: blend_mode(effects.mix_blend_mode),
+        isolation: match bx.isolation {
+            c::Isolation::Auto => Isolation::Auto,
+            c::Isolation::Isolate => Isolation::Isolate,
+        },
         font_feature_settings: {
             let list = &font.font_feature_settings.0;
             (!list.is_empty()).then(|| {
@@ -937,6 +944,59 @@ fn svg_paint(s: &ComputedValues, p: &c::SVGPaint) -> Option<Color> {
             F::Color(col) => Some(color(&s.resolve_color(col))),
             _ => None,
         },
+    }
+}
+
+/// A `filter` / `backdrop-filter` list; `None` for `none`.
+fn filters(s: &ComputedValues, list: &[c::Filter]) -> Option<Arc<[FilterFunction]>> {
+    use generics::effects::GenericFilter as F;
+    if list.is_empty() {
+        return None;
+    }
+    Some(
+        list.iter()
+            .map(|f| match f {
+                F::Blur(l) => FilterFunction::Blur(l.0.px()),
+                F::Brightness(v) => FilterFunction::Brightness(v.0),
+                F::Contrast(v) => FilterFunction::Contrast(v.0),
+                F::Saturate(v) => FilterFunction::Saturate(v.0),
+                F::Grayscale(v) => FilterFunction::Grayscale(v.0.min(1.0)),
+                F::Invert(v) => FilterFunction::Invert(v.0.min(1.0)),
+                F::Sepia(v) => FilterFunction::Sepia(v.0.min(1.0)),
+                F::Opacity(v) => FilterFunction::Opacity(v.0.min(1.0)),
+                F::HueRotate(a) => FilterFunction::HueRotate(a.degrees()),
+                F::DropShadow(sh) => FilterFunction::DropShadow {
+                    offset_x: px(sh.horizontal),
+                    offset_y: px(sh.vertical),
+                    blur: sh.blur.0.px(),
+                    color: color(&s.resolve_color(&sh.color)),
+                },
+                F::Url(u) => match *u {},
+            })
+            .collect(),
+    )
+}
+
+fn blend_mode(b: c::effects::Blend) -> BlendMode {
+    use c::effects::Blend as B;
+    match b {
+        B::Normal => BlendMode::Normal,
+        B::Multiply => BlendMode::Multiply,
+        B::Screen => BlendMode::Screen,
+        B::Overlay => BlendMode::Overlay,
+        B::Darken => BlendMode::Darken,
+        B::Lighten => BlendMode::Lighten,
+        B::ColorDodge => BlendMode::ColorDodge,
+        B::ColorBurn => BlendMode::ColorBurn,
+        B::HardLight => BlendMode::HardLight,
+        B::SoftLight => BlendMode::SoftLight,
+        B::Difference => BlendMode::Difference,
+        B::Exclusion => BlendMode::Exclusion,
+        B::Hue => BlendMode::Hue,
+        B::Saturation => BlendMode::Saturation,
+        B::Color => BlendMode::Color,
+        B::Luminosity => BlendMode::Luminosity,
+        B::PlusLighter => BlendMode::PlusLighter,
     }
 }
 

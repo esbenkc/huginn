@@ -236,6 +236,14 @@ pub struct ComputedStyle {
     pub stroke: Option<Color>,
     /// `None` = `clip-path: none` (also for `url()` and box-only values).
     pub clip_path: Option<Arc<ClipPath>>,
+    /// `None` = `filter: none`. Applied left to right. A list of identity
+    /// functions (`blur(0)`) is kept: it still makes a stacking context.
+    /// `url()` filters do not parse (Stylo's servo build).
+    pub filter: Option<Arc<[FilterFunction]>>,
+    /// `None` = `backdrop-filter: none`.
+    pub backdrop_filter: Option<Arc<[FilterFunction]>>,
+    pub mix_blend_mode: BlendMode,
+    pub isolation: Isolation,
     /// `None` = `normal`. Sorted by tag, one entry per tag. Inherited.
     pub font_feature_settings: Option<Arc<[FontFeature]>>,
 }
@@ -339,6 +347,10 @@ impl Default for ComputedStyle {
             fill: Some(Color::BLACK),
             stroke: None,
             clip_path: None,
+            filter: None,
+            backdrop_filter: None,
+            mix_blend_mode: BlendMode::Normal,
+            isolation: Isolation::Auto,
             font_feature_settings: None,
         }
     }
@@ -918,6 +930,69 @@ mod tests {
             (
                 LengthPercentage::Percent(50.0),
                 LengthPercentage::Percent(100.0)
+            )
+        );
+    }
+
+    #[test]
+    fn filter_lists_blend_modes_and_isolation() {
+        // Utility CSS builds the list from custom properties, most of them
+        // empty; the empty ones drop out.
+        let css = "* { --b: ; --c: ; color: rgb(0, 0, 255) } \
+                   #a { --b: blur(8px); filter: var(--b) brightness(150%) contrast(.5) grayscale(2) \
+                        hue-rotate(.5turn) invert(30%) opacity(0.4) saturate(3) sepia(1) \
+                        drop-shadow(2px 3px 4px) var(--c); \
+                        mix-blend-mode: difference; isolation: isolate } \
+                   #c { backdrop-filter: blur(4px) drop-shadow(1px 1px red); filter: none }";
+        let html = "<div id=a><span id=b>x</span></div><div id=c></div>";
+        let a = style_of(css, html, "a");
+        let blue = Color::rgb(0, 0, 255);
+        assert_eq!(
+            a.filter.as_deref(),
+            Some(
+                &[
+                    FilterFunction::Blur(8.0),
+                    FilterFunction::Brightness(1.5),
+                    FilterFunction::Contrast(0.5),
+                    FilterFunction::Grayscale(1.0),
+                    FilterFunction::HueRotate(180.0),
+                    FilterFunction::Invert(0.3),
+                    FilterFunction::Opacity(0.4),
+                    FilterFunction::Saturate(3.0),
+                    FilterFunction::Sepia(1.0),
+                    // The shadow color defaults to currentcolor.
+                    FilterFunction::DropShadow {
+                        offset_x: 2.0,
+                        offset_y: 3.0,
+                        blur: 4.0,
+                        color: blue
+                    },
+                ][..]
+            )
+        );
+        assert_eq!(a.mix_blend_mode, BlendMode::Difference);
+        assert_eq!(a.isolation, Isolation::Isolate);
+        assert_eq!(a.backdrop_filter, None);
+        // None of them inherit.
+        let b = style_of(css, html, "b");
+        assert_eq!(
+            (b.filter.clone(), b.mix_blend_mode, b.isolation),
+            (None, BlendMode::Normal, Isolation::Auto)
+        );
+        let c = style_of(css, html, "c");
+        assert_eq!(c.filter, None);
+        assert_eq!(
+            c.backdrop_filter.as_deref(),
+            Some(
+                &[
+                    FilterFunction::Blur(4.0),
+                    FilterFunction::DropShadow {
+                        offset_x: 1.0,
+                        offset_y: 1.0,
+                        blur: 0.0,
+                        color: Color::rgb(255, 0, 0)
+                    },
+                ][..]
             )
         );
     }
