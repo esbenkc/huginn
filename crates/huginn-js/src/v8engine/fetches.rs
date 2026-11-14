@@ -2,8 +2,10 @@
 //! threads, as in Chrome: several are in flight at once, and the engine
 //! thread keeps running scripts meanwhile. Each one runs the page's own
 //! [`Loader::fetch_for_script`], so cookies, CORS, referrers and the caches
-//! work as on the engine thread. Responses queue up in arrival order; the
-//! engine delivers them as tasks in `run_timers`.
+//! work as on the engine thread. Before the window's first paint they wait
+//! until the requests it needs are done ([`Loader::hold_script_requests`]).
+//! Responses queue up in arrival order; the engine delivers them as tasks in
+//! `run_timers`.
 
 use std::collections::{HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -231,6 +233,13 @@ impl Drop for Fetches {
 /// A request thread: send waiting requests until none are left.
 fn work(shared: &Shared) {
     loop {
+        // Before the first paint, the page's own requests go first
+        // (`Loader::hold_script_requests`). The request waits in the queue,
+        // so one aborted meanwhile never goes out.
+        let next = shared.lock().waiting.front().map(|j| j.loader.clone());
+        if let Some(loader) = next {
+            loader.wait_for_script_turn();
+        }
         let job = {
             let mut q = shared.lock();
             match q.waiting.pop_front() {

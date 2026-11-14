@@ -362,8 +362,9 @@ pub fn load(
 /// `Referer` and `SameSite` cookies). `live`: the window. It keeps the
 /// script engine alive in [`Page::js`] and runs only the parser-blocking
 /// scripts before style, so the page paints without waiting for async,
-/// defer and module scripts ([`Page::later`]). The loader's client becomes
-/// the new document.
+/// defer and module scripts ([`Page::later`]). Requests that the scripts
+/// start meanwhile (`fetch()`, async XHR) wait until it returns. The
+/// loader's client becomes the new document.
 #[allow(clippy::too_many_arguments)]
 pub fn load_document(
     loader: &Arc<Loader>,
@@ -410,6 +411,13 @@ pub fn load_document(
     }));
     let base = document_base(&doc, &doc_url);
     let mut parse = t.elapsed();
+
+    // The window's first paint goes first: requests that scripts send from
+    // threads of their own (`fetch()`, async XHR) wait until it has its
+    // stylesheets, images and fonts (the guard drops when this returns).
+    // `render` waits for those requests before style (scripts.rs), so it
+    // holds none.
+    let _first_paint = live.then(|| loader.hold_script_requests());
 
     // Scripts run only with a script engine (the `v8` feature). Without one,
     // or without scripts, no isolate is ever created.
