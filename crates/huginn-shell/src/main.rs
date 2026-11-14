@@ -24,6 +24,7 @@ mod livepage;
 mod omnibox;
 mod perf;
 mod pipeline;
+mod preload;
 mod resources;
 mod scripts;
 mod session;

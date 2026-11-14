@@ -1,10 +1,14 @@
 //! huginn-net: fetching and resource decoding.
 //!
 //! - [`Loader`] fetches `http:`, `https:`, `file:` and `data:` URLs. It keeps
-//!   an in-memory cache keyed by URL, so a resource used twice is fetched once.
-//!   [`Loader::fetch_all`] fetches many URLs in parallel on scoped threads.
-//!   Images and fonts go through [`Loader::fetch_uncached`]: their bodies are
-//!   decoded on the fetching thread and dropped right away. It follows
+//!   an in-memory cache keyed by URL, so a resource used twice is fetched once,
+//!   and identical requests in flight share one exchange.
+//!   [`Loader::map_parallel`] fetches many URLs in parallel on scoped threads.
+//!   [`Loader::preload`] starts requests before the parser asks for them
+//!   (the shell's preload scanner); the parser's request takes the response.
+//!   [`Loader::navigate_streaming`] hands the document to the caller while
+//!   it arrives. Images and fonts go through [`Loader::fetch_uncached`]: their
+//!   bodies are decoded on the fetching thread and dropped right away. It follows
 //!   redirects itself, hop by hop: cookies ([`CookieJar`], RFC 6265bis with
 //!   `SameSite`), `Referer` ([`ReferrerPolicy`]), and for scripts' requests
 //!   the Fetch standard's modes and CORS ([`Loader::fetch_for_script`]).
@@ -40,6 +44,7 @@ mod cors;
 mod font;
 mod media;
 mod netlog;
+mod preload;
 mod referrer;
 mod srcset;
 mod svg;
@@ -48,11 +53,12 @@ pub mod ua;
 
 use cache::CacheMode;
 pub use cache::{HttpCache, LoadKind};
-pub use charset::{decode_html, decode_text};
+pub use charset::{HtmlStreamDecoder, decode_html, decode_text};
 pub use cookies::{CookieContext, CookieJar, SameSite, registrable_domain, same_site, site_key};
 pub use font::{FontFormat, decode_font, font_format, size_adjust_font};
 pub use media::{Screen, media_matches, parse_length};
 pub use netlog::log_phase;
+pub use preload::Priority;
 pub use referrer::{ReferrerPolicy, referrer_for};
 pub use srcset::{Descriptor, SrcsetCandidate, choose_candidate, eval_sizes, parse_srcset};
 pub use svg::{decode_svg, is_svg};
@@ -230,6 +236,21 @@ impl Resource {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The resource out of a shared response (no copy if nothing else
+    /// holds it).
+    fn unshare(r: Arc<Resource>) -> Resource {
+        Arc::try_unwrap(r).unwrap_or_else(|r| Resource {
+            url: r.url.clone(),
+            status: r.status,
+            content_type: r.content_type.clone(),
+            charset: r.charset.clone(),
+            headers: r.headers.clone(),
+            response_type: r.response_type,
+            redirected: r.redirected,
+            body: r.body.clone(),
+        })
     }
 
     fn local(
@@ -420,6 +441,8 @@ pub struct Loader {
     /// ([`Loader::hold_script_requests`]), and those threads' wait.
     script_holds: parking_lot::Mutex<usize>,
     script_turn: parking_lot::Condvar,
+    /// Preloads, and requests in flight that others can join (`preload.rs`).
+    preloads: parking_lot::Mutex<preload::Preloads>,
 }
 
 impl Default for Loader {
@@ -438,6 +461,10 @@ impl Drop for ScriptRequestsHeld<'_> {
         *holds -= 1;
         if *holds == 0 {
             self.0.script_turn.notify_all();
+            drop(holds);
+            // Low-priority preloads waited too.
+            let mut p = self.0.preloads.lock();
+            self.0.pump(&mut p);
         }
     }
 }
@@ -458,6 +485,10 @@ struct Request<'a> {
     /// Return non-2xx responses (with their body) instead of an error.
     any_status: bool,
     cache: CacheMode,
+    /// Told about the final response's body while it arrives (the
+    /// document, for the preload scanner): first with the head and no
+    /// bytes, then with each decoded piece.
+    on_body: Option<&'a mut dyn FnMut(&Resource, &[u8])>,
 }
 
 /// What a request's chain of URLs has been relative to its client, for `Sec-Fetch-Site`.
@@ -489,6 +520,7 @@ impl Loader {
             load: parking_lot::Mutex::new(LoadKind::Normal),
             script_holds: parking_lot::Mutex::new(0),
             script_turn: parking_lot::Condvar::new(),
+            preloads: parking_lot::Mutex::new(preload::Preloads::default()),
         }
     }
 
@@ -565,6 +597,19 @@ impl Loader {
         self.net.preconnect_from(url, public_only);
     }
 
+    /// Look up `url`'s host ahead of a request (`<link rel=dns-prefetch>`),
+    /// on a short thread, into the name cache. Nothing is connected.
+    pub fn dns_prefetch(&self, url: &Url) {
+        if !matches!(url.scheme(), "http" | "https") {
+            return;
+        }
+        let client = self.client();
+        let public_only = self.public_only(Mode::NoCors, client.as_ref());
+        if let Ok(uri) = url.as_str().parse::<http::Uri>() {
+            self.net.transport.resolve_ahead(&uri, public_only);
+        }
+    }
+
     /// Wait until no [`Loader::hold_script_requests`] is in place. The
     /// threads that send scripts' requests call it before each request.
     pub fn wait_for_script_turn(&self) {
@@ -583,7 +628,9 @@ impl Loader {
 
     /// [`Loader::fetch`] with a `crossorigin` state: `Anonymous` and
     /// `UseCredentials` make a CORS request, so another origin must allow it
-    /// (module scripts, `<script crossorigin>`).
+    /// (module scripts, `<script crossorigin>`). A preload of the same
+    /// request ([`Loader::preload`]) answers it, and so does an identical
+    /// request in flight.
     pub fn fetch_with(
         &self,
         url: &Url,
@@ -596,20 +643,11 @@ impl Loader {
         {
             return Ok(hit.clone());
         }
-        let res = Arc::new(self.fetch_uncached_with(url, kind, cors)?);
-        self.cache
-            .lock()
-            .expect("cache poisoned")
-            .insert(url.clone(), res.clone());
-        Ok(res)
-    }
-
-    /// Fetch many URLs in parallel (at most 32 at a time). Results are in input order.
-    pub fn fetch_all(
-        &self,
-        requests: &[(Url, ResourceKind)],
-    ) -> Vec<Result<Arc<Resource>, NetError>> {
-        self.map_parallel(requests, |(url, kind)| self.fetch(url, *kind))
+        self.fetch_shared(&preload::Key {
+            url: url.clone(),
+            kind,
+            cors,
+        })
     }
 
     /// Drop the responses this loader keeps in memory. Call when their
@@ -658,28 +696,51 @@ impl Loader {
 
     /// Fetch without keeping the response in this loader's memory (the
     /// HTTP cache still answers). Use for bodies that are decoded once and
-    /// then dropped (images, fonts). `ResourceKind::Document` is a
-    /// navigation started by the browser itself (view source, save page).
+    /// then dropped (images, fonts). A preload of the same request answers
+    /// it. Fonts from the web are CORS requests without credentials for
+    /// other origins (CSS Fonts). `ResourceKind::Document` is a navigation
+    /// started by the browser itself (view source, save page).
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError> {
         if kind == ResourceKind::Document {
             return self.navigate(url, None, None).map(|(r, _)| r);
         }
-        self.fetch_uncached_with(url, kind, CorsSettings::NoCors)
+        let cors = request_cors(url, kind);
+        let key = preload::Key {
+            url: url.clone(),
+            kind,
+            cors,
+        };
+        match self.join(&key) {
+            Some(r) => r.map(Resource::unshare),
+            None => self.fetch_uncached_with(url, kind, cors),
+        }
     }
 
     /// [`Loader::fetch_uncached`] if no request has to go out: `data:` and
-    /// `file:` URLs, and http(s) URLs the HTTP cache has a fresh entry for
-    /// (the hit is logged like any other). `None` otherwise, without
-    /// sending anything. A hard reload takes nothing from the cache. The
-    /// window loads these before its first paint and the rest after it.
+    /// `file:` URLs, http(s) URLs the HTTP cache has a fresh entry for (the
+    /// hit is logged like any other), and preloads that are in. `None`
+    /// otherwise, without sending anything. A hard reload takes nothing
+    /// from the cache. The window loads these before its first paint and
+    /// the rest after it.
     pub fn fetch_cached(&self, url: &Url, kind: ResourceKind) -> Option<Resource> {
         if !matches!(url.scheme(), "http" | "https") {
             return self.fetch_uncached(url, kind).ok();
         }
-        if kind == ResourceKind::Document || self.load.lock().subresources() != CacheMode::Default {
+        if kind == ResourceKind::Document {
             return None;
         }
-        let (mode, credentials) = CorsSettings::NoCors.mode();
+        let cors = request_cors(url, kind);
+        if let Some(r) = self.take_finished(&preload::Key {
+            url: url.clone(),
+            kind,
+            cors,
+        }) {
+            return r.map(Resource::unshare).ok();
+        }
+        if self.load.lock().subresources() != CacheMode::Default {
+            return None;
+        }
+        let (mode, credentials) = cors.mode();
         self.send(Request {
             url: url.clone(),
             method: "GET".into(),
@@ -692,6 +753,7 @@ impl Loader {
             client: self.client(),
             any_status: false,
             cache: CacheMode::OnlyFresh,
+            on_body: None,
         })
         .ok()
     }
@@ -741,6 +803,7 @@ impl Loader {
                 client: self.client(),
                 any_status: false,
                 cache,
+                on_body: None,
             }),
             _ => fetch_local(url),
         }
@@ -756,6 +819,32 @@ impl Loader {
         url: &Url,
         post: Option<(&str, &[u8])>,
         initiator: Option<&Client>,
+    ) -> Result<(Resource, Option<String>), NetError> {
+        self.navigate_inner(url, post, initiator, None)
+    }
+
+    /// [`Loader::navigate`], telling `on_body` about the document while it
+    /// arrives (http and https only, after redirects, 2xx responses): first
+    /// the response head (`Resource::body` is always empty) with no bytes,
+    /// then each piece of the body with `Content-Encoding` undone, in
+    /// order. It runs on the calling thread between reads, so it must not
+    /// block; the preload scanner starts requests from it.
+    pub fn navigate_streaming<'a>(
+        &self,
+        url: &Url,
+        post: Option<(&str, &'a [u8])>,
+        initiator: Option<&Client>,
+        on_body: &'a mut (dyn FnMut(&Resource, &[u8]) + 'a),
+    ) -> Result<(Resource, Option<String>), NetError> {
+        self.navigate_inner(url, post, initiator, Some(on_body))
+    }
+
+    fn navigate_inner<'a>(
+        &self,
+        url: &Url,
+        post: Option<(&str, &'a [u8])>,
+        initiator: Option<&Client>,
+        on_body: Option<&'a mut (dyn FnMut(&Resource, &[u8]) + 'a)>,
     ) -> Result<(Resource, Option<String>), NetError> {
         if !matches!(url.scheme(), "http" | "https") {
             if post.is_some() {
@@ -784,6 +873,7 @@ impl Loader {
             client: initiator.cloned(),
             any_status: false,
             cache,
+            on_body,
         })?;
         Ok((res, referrer))
     }
@@ -859,6 +949,7 @@ impl Loader {
             client,
             any_status: true,
             cache,
+            on_body: None,
         })?;
         match res.response_type {
             ResponseType::Basic => {}
@@ -1343,11 +1434,31 @@ impl Loader {
                     .to_ascii_lowercase()
             });
             let charset = header.as_deref().and_then(charset_param).map(str::to_owned);
+            // The head the observer of a streamed body sees with each piece.
+            let head = req.on_body.as_ref().map(|_| Resource {
+                url: url.clone(),
+                status,
+                content_type: content_type.clone(),
+                charset: charset.clone(),
+                headers: headers.clone(),
+                response_type: tainting,
+                redirected,
+                body: Vec::new(),
+            });
             let body = match (response.as_mut(), cached_body) {
-                (_, Some(body)) => body,
+                (_, Some(body)) => {
+                    if let (Some(f), Some(head)) = (req.on_body.as_mut(), &head) {
+                        f(head, &[]);
+                        f(head, &body);
+                    }
+                    body
+                }
                 (Some(_), None) if req.method == "HEAD" => Vec::new(),
                 (Some(resp), None) => {
-                    let body = read_body(resp, &headers, &url)?;
+                    let body = match (req.on_body.as_mut(), &head) {
+                        (Some(f), Some(head)) => read_body_streaming(resp, &url, head, &mut **f)?,
+                        _ => read_body(resp, &headers, &url)?,
+                    };
                     let (h, body) = store(status, headers, body);
                     headers = h;
                     body
@@ -1567,6 +1678,59 @@ fn read_body(
         MAX_BODY,
     )
     .map_err(|e| NetError::Decode(format!("{url}: {e}")))
+}
+
+/// [`read_body`], telling `on_body` about each decoded piece as it comes
+/// (and `head` with no bytes first). Codings that cannot be undone piece by
+/// piece are decoded at the end, then handed over at once.
+fn read_body_streaming(
+    resp: &mut transport::Response,
+    url: &Url,
+    head: &Resource,
+    on_body: &mut dyn FnMut(&Resource, &[u8]),
+) -> Result<Vec<u8>, NetError> {
+    on_body(head, &[]);
+    let encoding = cors::header_value(&head.headers, "content-encoding");
+    let Some(mut decoder) = compression::StreamDecoder::new(encoding.as_deref(), MAX_BODY) else {
+        let body = read_body(resp, &head.headers, url)?;
+        on_body(head, &body);
+        return Ok(body);
+    };
+    let mut seen = 0;
+    let mut bad = None;
+    let read = resp.read_each(MAX_BODY, &mut |raw| match decoder.push(raw) {
+        Ok(out) => {
+            on_body(head, &out[seen..]);
+            seen = out.len();
+            Ok(())
+        }
+        Err(e) => {
+            bad = Some(e);
+            Err("bad encoding".into())
+        }
+    });
+    read.map_err(|e| match bad.take() {
+        Some(d) => NetError::Decode(format!("{url}: {d}")),
+        None => NetError::Transport(format!("{url}: {e}")),
+    })?;
+    let body = decoder
+        .finish()
+        .map_err(|e| NetError::Decode(format!("{url}: {e}")))?;
+    if body.len() > seen {
+        on_body(head, &body[seen..]);
+    }
+    Ok(body)
+}
+
+/// The CORS settings the browser's own request for `url` uses: fonts from
+/// the web are CORS requests without credentials for other origins (CSS
+/// Fonts, as in Chrome); other subresources are `no-cors`.
+fn request_cors(url: &Url, kind: ResourceKind) -> CorsSettings {
+    if kind == ResourceKind::Font && matches!(url.scheme(), "http" | "https") {
+        CorsSettings::Anonymous
+    } else {
+        CorsSettings::NoCors
+    }
 }
 
 /// The cache mode of a script's request (Fetch): one with a conditional
@@ -1862,7 +2026,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fetch_all_keeps_a_burst_in_flight_over_http2() {
+    fn parallel_fetches_keep_a_burst_in_flight_over_http2() {
         use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
         let s = transport::test_server::server(
@@ -1879,7 +2043,7 @@ mod tests {
             })
             .collect();
         let started = Instant::now();
-        let got = loader.fetch_all(&requests);
+        let got = loader.map_parallel(&requests, |(url, kind)| loader.fetch(url, *kind));
         let took = started.elapsed();
         for (k, r) in got.iter().enumerate() {
             assert_eq!(r.as_ref().unwrap().text(), format!("HTTP/2.0 /{k}.css"));

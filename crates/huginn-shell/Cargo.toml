@@ -19,6 +19,7 @@ v8 = ["huginn-js/v8"]
 
 [dependencies]
 huginn-dom.workspace = true
+html5ever.workspace = true
 huginn-style.workspace = true
 huginn-layout.workspace = true
 huginn-paint.workspace = true

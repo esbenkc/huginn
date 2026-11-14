@@ -367,6 +367,21 @@ impl Transport {
             });
         }
     }
+
+    /// Look up `uri`'s host ahead of a request (`<link rel=dns-prefetch>`):
+    /// the answer goes to the name cache; nothing is connected. Returns at
+    /// once; the lookup runs on a short thread.
+    pub(crate) fn resolve_ahead(&self, uri: &http::Uri, public_only: bool) {
+        let Some(key) = key_for(uri) else {
+            return;
+        };
+        let dial = self.dial.clone();
+        let _ = std::thread::Builder::new()
+            .name("huginn-dns".into())
+            .spawn(move || {
+                let _ = dial.resolve(&key, public_only, &mut Exchange::begin());
+            });
+    }
 }
 
 impl Dial {
@@ -882,16 +897,32 @@ impl Response {
     }
 
     fn read_into(&mut self, out: &mut Vec<u8>, limit: u64) -> Result<(), String> {
+        self.read_each(limit, &mut |data| {
+            out.extend_from_slice(data);
+            Ok(())
+        })
+    }
+
+    /// Read the body to its end, handing `each` every frame as it arrives;
+    /// more than `limit` bytes is an error, and so is an error from `each`
+    /// (the rest is not read).
+    pub(crate) fn read_each(
+        &mut self,
+        limit: u64,
+        each: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
         let (body, deadline) = (&mut self.body, self.deadline);
         let read = self.handle.block_on(async {
             let read = async {
+                let mut len = 0u64;
                 while let Some(frame) = body.frame().await {
                     let frame = frame.map_err(|e| e.to_string())?;
                     if let Ok(data) = frame.into_data() {
-                        if (out.len() + data.len()) as u64 > limit {
+                        len += data.len() as u64;
+                        if len > limit {
                             return Err(format!("body is larger than {limit} bytes"));
                         }
-                        out.extend_from_slice(&data);
+                        each(&data)?;
                     }
                 }
                 Ok(())
