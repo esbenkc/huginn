@@ -62,6 +62,8 @@ pub struct Page {
     pub layout_engine: Option<LayoutEngine>,
     /// Decoded web fonts, moved into the layout engine by `register_fonts`.
     fonts: Vec<resources::WebFont>,
+    /// Font files fetched so far (`load_added` loads the others text needs).
+    font_urls: std::collections::HashSet<Url>,
     /// The `<img>` choices; `loading=lazy` ones load in `load_lazy`.
     img_plan: resources::ImagePlan,
     /// Stylesheets in the cascade, in document order (`restyle_dom` diffs them).
@@ -79,7 +81,8 @@ pub struct Page {
 }
 
 impl Page {
-    /// Move the page's web fonts into `layout_engine` (no copy; call once).
+    /// Move the page's web fonts into `layout_engine` (no copy; call after
+    /// `load` and after `load_added`).
     pub fn register_fonts(&mut self, layout_engine: &mut LayoutEngine) {
         for f in std::mem::take(&mut self.fonts) {
             layout_engine.register_font(f.data, &f.family, f.weight, f.style);
@@ -155,15 +158,16 @@ impl Page {
         self.styles = self.style_engine.compute(&self.doc);
     }
 
-    /// Load the images the current styles and DOM use but the page does not
-    /// have yet (added by scripts, or by a `:checked`/`:hover` style).
-    /// `tried`: URLs fetched before. True if any image was added.
+    /// Load the images, inline `<svg>`s and web fonts the current styles and
+    /// DOM use but the page does not have yet (added by scripts, or by a
+    /// `:checked`/`:hover` style). `tried`: URLs fetched before. True if any
+    /// was added; new fonts wait for `register_fonts`.
     pub fn load_added(
         &mut self,
         loader: &Loader,
         tried: &mut std::collections::HashSet<String>,
     ) -> bool {
-        resources::load_added(
+        let images = resources::load_added(
             loader,
             &self.doc,
             &self.styles,
@@ -171,7 +175,17 @@ impl Page {
             &self.screen,
             &mut self.images,
             tried,
-        )
+        );
+        let fonts = resources::load_added_fonts(
+            loader,
+            &self.doc,
+            &self.styles,
+            self.style_engine.font_faces(),
+            &mut self.font_urls,
+        );
+        let any_font = !fonts.is_empty();
+        self.fonts.extend(fonts);
+        images || any_font
     }
 }
 
@@ -466,7 +480,11 @@ pub fn load_document(
     // fonts the text uses. Bodies are dropped as soon as they are decoded.
     let t = Instant::now();
     let img_plan = resources::plan_images(&doc, &base, &screen);
-    let resources::Loaded { images, fonts } = resources::load(
+    let resources::Loaded {
+        images,
+        fonts,
+        font_urls,
+    } = resources::load(
         loader,
         &doc,
         &styles,
@@ -486,6 +504,7 @@ pub fn load_document(
         images,
         layout_engine,
         fonts,
+        font_urls,
         img_plan,
         sheets,
         screen,

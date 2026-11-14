@@ -237,6 +237,9 @@ pub struct Tab {
     pub cursor: Option<CursorKind>,
     /// Link and button of the current press in the page.
     pressed: Option<(Url, MouseButton)>,
+    /// Document point of the last press in the page: keys scroll the
+    /// scroll container there when nothing is focused (like Chrome).
+    scroll_anchor: Option<(f32, f32)>,
     requests: Vec<Request>,
     dirty: bool,
     /// `interact`'s per-tab state (selection, find, focus, menu).
@@ -289,6 +292,7 @@ impl Tab {
             hover: None,
             cursor: None,
             pressed: None,
+            scroll_anchor: None,
             requests: Vec::new(),
             dirty: true,
             interact: interact::PageState::default(),
@@ -849,17 +853,62 @@ impl Tab {
     /// pointer that the user may scroll (`overflow-y: auto` or `scroll`) and
     /// that can still move that way scrolls (on the engine thread, which
     /// fires `scroll` and lays out again); otherwise the page does.
+    /// The page gets a `wheel` event at the node under the pointer first; a
+    /// listener that cancels it keeps a container from scrolling (the page
+    /// itself scrolls at once, as for Chrome's passive listeners).
     pub fn wheel(&mut self, x: f32, y: f32, dy: f32) {
         if y >= PAGE_TOP
             && let Some(view) = &self.view
         {
             let (doc_x, doc_y) = self.to_doc(x, y);
-            if let Some((node, max)) = inner_scroller(&view.tree, doc_x, doc_y, dy) {
-                self.input(live::PageInput::Scroll { node, dy, max });
-                return;
+            let start = interact::hit::topmost_box(&view.tree, doc_x, doc_y);
+            let scroll = inner_scroller(&view.tree, start, dy).map(|(node, max, _)| (node, max));
+            let target = interact::hit::node_at(&view.tree, doc_x, doc_y);
+            let client = (doc_x, doc_y - self.scroll);
+            if scroll.is_none() {
+                self.scroll_by(dy);
             }
+            self.input(live::PageInput::Wheel {
+                x: doc_x,
+                y: doc_y,
+                client,
+                target,
+                dy,
+                scroll,
+            });
+            return;
         }
         self.scroll_by(dy);
+    }
+
+    /// A scrolling key: `lines`, `pages` or `ends` (Home/End) of movement,
+    /// signed. Like Chrome, it scrolls the scroll container of the focused
+    /// element, else the one at the last press, if that can move; otherwise
+    /// the page.
+    fn scroll_key(&mut self, lines: f32, pages: f32, ends: f32) {
+        let sign = (lines + pages + ends).signum();
+        let target = self.view.as_ref().and_then(|v| {
+            let focus = live::focused(self);
+            let start = focus
+                .and_then(|n| v.tree.boxes.iter().position(|b| b.node == Some(n)))
+                .map(|i| huginn_layout::BoxId(i as u32))
+                .or_else(|| {
+                    let (x, y) = self.scroll_anchor?;
+                    interact::hit::topmost_box(&v.tree, x, y)
+                });
+            inner_scroller(&v.tree, start, sign)
+        });
+        let by = |page: f32| lines * LINE_SCROLL + pages * page * 0.875 + ends * f32::MAX;
+        match target {
+            Some((node, max, height)) => {
+                let dy = by(height);
+                self.input(live::PageInput::Scroll { node, dy, max });
+            }
+            None => {
+                let dy = by(self.page_size().1);
+                self.scroll_by(dy);
+            }
+        }
     }
 
     pub fn set_scroll(&mut self, y: f32) {
@@ -881,18 +930,17 @@ impl Tab {
     }
 
     fn default_key(&mut self, ev: &KeyEvent) -> bool {
-        let page = self.page_size().1 * 0.875;
         let m = ev.mods;
         match &ev.key {
-            Key::Space if m.shift && !m.cmd => self.scroll_by(-page),
-            Key::Space | Key::PageDown if !m.cmd => self.scroll_by(page),
-            Key::PageUp if !m.cmd => self.scroll_by(-page),
-            Key::Down if m.cmd => self.set_scroll(f32::MAX),
-            Key::Up if m.cmd => self.set_scroll(0.0),
-            Key::Down if m.none() => self.scroll_by(LINE_SCROLL),
-            Key::Up if m.none() => self.scroll_by(-LINE_SCROLL),
-            Key::Home => self.set_scroll(0.0),
-            Key::End => self.set_scroll(f32::MAX),
+            Key::Space if m.shift && !m.cmd => self.scroll_key(0.0, -1.0, 0.0),
+            Key::Space | Key::PageDown if !m.cmd => self.scroll_key(0.0, 1.0, 0.0),
+            Key::PageUp if !m.cmd => self.scroll_key(0.0, -1.0, 0.0),
+            Key::Down if m.cmd => self.scroll_key(0.0, 0.0, 1.0),
+            Key::Up if m.cmd => self.scroll_key(0.0, 0.0, -1.0),
+            Key::Down if m.none() => self.scroll_key(1.0, 0.0, 0.0),
+            Key::Up if m.none() => self.scroll_key(-1.0, 0.0, 0.0),
+            Key::Home => self.scroll_key(0.0, 0.0, -1.0),
+            Key::End => self.scroll_key(0.0, 0.0, 1.0),
             Key::Left if m.cmd && !m.alt => self.back(),
             Key::Right if m.cmd && !m.alt => self.forward(),
             Key::Escape => return self.stop(),
@@ -906,6 +954,9 @@ impl Tab {
     pub(crate) fn mouse(&mut self, ev: &MouseEvent) -> bool {
         let handled =
             interact::mouse_capture(self, ev) || live::mouse(self, ev) || interact::mouse(self, ev);
+        if ev.kind == MouseKind::Down {
+            self.scroll_anchor = Some(self.to_doc(ev.x, ev.y));
+        }
         if ev.kind == MouseKind::Move {
             let link = self.link_at(ev.x, ev.y).cloned();
             if link != self.hover {
@@ -1095,12 +1146,16 @@ pub(crate) fn same_document(a: &Url, b: &Url) -> bool {
     strip(a) == strip(b)
 }
 
-/// For a wheel turn of `dy` at document point (`x`, `y`): the innermost
-/// user-scrollable container on the box path under the point that can still
-/// move by `dy`, and its largest scroll offset.
-fn inner_scroller(tree: &LayoutTree, x: f32, y: f32, dy: f32) -> Option<(NodeId, f32)> {
+/// For a scroll by `dy`: the innermost user-scrollable container on the box
+/// path from `start` up that can still move that way, its largest scroll
+/// offset and its client height.
+fn inner_scroller(
+    tree: &LayoutTree,
+    start: Option<huginn_layout::BoxId>,
+    dy: f32,
+) -> Option<(NodeId, f32, f32)> {
     use huginn_style::Overflow::{Auto, Scroll};
-    let mut cur = interact::hit::topmost_box(tree, x, y);
+    let mut cur = start;
     while let Some(id) = cur {
         let b = tree.get(id);
         if let (Some(node), Some((_, top))) = (b.node, b.scroll_offset)
@@ -1109,7 +1164,7 @@ fn inner_scroller(tree: &LayoutTree, x: f32, y: f32, dy: f32) -> Option<(NodeId,
             let max = b.scroll_size.height - b.padding_rect().height;
             // Half a pixel of slack: offsets come from float layout.
             if (dy > 0.0 && top < max - 0.5) || (dy < 0.0 && top > 0.5) {
-                return Some((node, max));
+                return Some((node, max, b.padding_rect().height));
             }
         }
         cur = b.parent;

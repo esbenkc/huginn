@@ -235,6 +235,8 @@ pub struct ComputedStyle {
     /// `None` = `stroke: none` (the initial value).
     pub stroke: Option<Color>,
     /// `None` = `clip-path: none` (also for `url()` and box-only values).
+    /// An absolutely positioned box without `clip-path` gets its legacy
+    /// `clip: rect()` here, as an `Inset`.
     pub clip_path: Option<Arc<ClipPath>>,
     /// `None` = `filter: none`. Applied left to right. A list of identity
     /// functions (`blur(0)`) is kept: it still makes a stacking context.

@@ -229,7 +229,7 @@ CSS initial values with 16px serif, `ComputedStyle::inherit_from(&parent)`,
 | flex/align | `flex_direction`, `flex_wrap`, `flex_grow`, `flex_shrink`, `flex_basis`, `order`, `justify_content`, `align_items`, `align_self`, `align_content`, `justify_items`, `justify_self` (`Alignment`), `row_gap`, `column_gap` |
 | grid | `grid_template_columns`, `grid_template_rows: Option<Arc<[GridTrack]>>` (`None` = `none`), `grid_template_areas: Option<Arc<[GridArea]>>`, `grid_auto_columns`, `grid_auto_rows: Option<Arc<[TrackSize]>>` (`None` = `auto`), `grid_auto_flow: GridAutoFlow`, `grid_column`, `grid_row: (GridLine, GridLine)` (start, end) |
 | tables | `border_collapse: BorderCollapse` (inherited), `border_spacing: (f32, f32)` (h, v px, inherited), `table_layout: TableLayout`, `caption_side: CaptionSide` (inherited) |
-| effects | `box_shadow: Option<Arc<[BoxShadow]>>`, `transform: Option<Arc<[TransformOp]>>` (2D, left to right), `transform_origin: (LengthPercentage, LengthPercentage)`, `outline_width`, `outline_style: BorderStyle`, `outline_color`, `outline_offset`, `object_fit: ObjectFit`, `text_overflow: TextOverflow`, `clip_path: Option<Arc<ClipPath>>` (border-box relative; `None` also for `url()`), `filter`, `backdrop_filter: Option<Arc<[FilterFunction]>>` (`None` = `none`; left to right; identity lists such as `blur(0)` are kept; `url()` does not parse), `mix_blend_mode: BlendMode`, `isolation: Isolation` |
+| effects | `box_shadow: Option<Arc<[BoxShadow]>>`, `transform: Option<Arc<[TransformOp]>>` (2D, left to right), `transform_origin: (LengthPercentage, LengthPercentage)`, `outline_width`, `outline_style: BorderStyle`, `outline_color`, `outline_offset`, `object_fit: ObjectFit`, `text_overflow: TextOverflow`, `clip_path: Option<Arc<ClipPath>>` (border-box relative; `None` also for `url()`; an absolutely positioned box without one gets its legacy `clip: rect()` as an `Inset`), `filter`, `backdrop_filter: Option<Arc<[FilterFunction]>>` (`None` = `none`; left to right; identity lists such as `blur(0)` are kept; `url()` does not parse), `mix_blend_mode: BlendMode`, `isolation: Isolation` |
 | text (inherited) | `color`, `font_family: Arc<str>` (the list as written), `font_size`, `font_weight` (1..=1000), `font_style`, `line_height: LineHeight`, `text_align` (incl. `WebkitCenter/Left/Right`: also aligns block children), `text_indent`, `text_transform`, `white_space`, `text_wrap_balance` (`text-wrap-style: balance`), `letter_spacing`, `word_spacing`, `list_style_type`, `list_style_position`, `font_feature_settings: Option<Arc<[FontFeature]>>` (`None` = `normal`) |
 | SVG paint (inherited) | `fill: Option<Color>` (`None` = `none`, initial black), `stroke: Option<Color>` (initial `None`) |
 | decoration | `text_decoration_line: TextDecorationLine`, `text_decoration_color`, `vertical_align: VerticalAlign` |
@@ -902,7 +902,7 @@ discarded tab gets fresh `PageState`/`TabState`.
 Engine-side hook points (the live JavaScript code in `engine.rs`): `Current`
 (the page on the engine thread), `load()` (build the isolate), the wait in
 `run()` (timers), `live::input(cur, event, visible, notify)`. `live.rs` also exports
-`text_control_focused(&Tab)` (interact skips Cmd+A/C then), `select_picked(&mut Tab, node,
+`text_control_focused(&Tab)` (interact skips Cmd+A/C then), `focused(&Tab) -> Option<NodeId>` (keys scroll its container), `select_picked(&mut Tab, node,
 index)` and `mouse_leave(&mut Tab)`; the engine half is `livepage.rs` (`LivePage` in `Current`).
 
 ### huginn-shell window: in-page interaction

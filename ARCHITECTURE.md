@@ -341,11 +341,23 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   `HUGINN_KEEP_TREE=0` turns it off.
 - **Scrolling.** A wheel turn scrolls the innermost `overflow-y: auto` or
   `scroll` container under the pointer that can still move that way, else
-  the page (scroll chaining). The engine sets the offset, fires `scroll` at
-  the element and lays out again; layout draws content at the offset
-  (`LayoutBox::scroll_offset`). Offsets that scripts set (`scrollTop`) show
-  the same way. Hit testing skips `pointer-events: none` boxes (overlay
-  containers that cover the window).
+  the page (scroll chaining). The page first gets a cancelable `wheel`
+  event at the node under the pointer; canceling it keeps a container
+  still (the page itself scrolls at once, like Chrome's passive
+  listeners). Arrows, PageUp/PageDown, Space, Home/End and Cmd+Up/Down
+  scroll the container of the focused element, else the one at the last
+  press, else the page (a page is 87.5 % of the container's height). The
+  engine sets the offset, fires `scroll` at the element and lays out
+  again; layout draws content at the offset (`LayoutBox::scroll_offset`).
+  Offsets that scripts set (`scrollTop`) show the same way. Hit testing
+  skips `pointer-events: none` boxes (overlay containers that cover the
+  window).
+- **Resources after load.** After a DOM change, `Page::load_added` loads
+  the images, inline `<svg>` elements and `@font-face` files the page now
+  uses (icon fonts whose glyphs are ligatures in text that scripts add,
+  `<svg>` icons that components insert), like `load` does before the first
+  layout. New fonts go into the tab's layout engine before the pass. An
+  `<svg>` whose content a script changes keeps its first image.
 - **Requests from scripts.** `location.href/assign/replace/reload`,
   `form.submit()`, `requestSubmit()`, `a.click()` become
   `HostRequest::Navigate`; `javascript:` URLs run in the page.
@@ -359,9 +371,7 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   access (`form.q`), `form.reset()` restoring defaults, IME, multi-line
   caret by clicks in wrapped textareas, `<select multiple>`, drag and drop,
   `contenteditable`. XHR/fetch after load block the tab's engine thread,
-  one request at a time. No `wheel` events, and keys scroll only the page.
-  Web fonts and inline `<svg>` that scripts add after load are not loaded
-  (`resources::load_added` loads images only).
+  one request at a time; so do fonts and `<svg>` loaded after load.
 
 ## Timing (`perf.rs`)
 
