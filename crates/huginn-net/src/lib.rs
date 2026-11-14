@@ -380,6 +380,25 @@ impl Network {
     pub fn cache(&self) -> &HttpCache {
         &self.cache
     }
+
+    /// Open a connection to `url`'s origin ahead of a request (name lookup,
+    /// TCP, TLS and the HTTP/2 handshake; nothing is sent), as Chrome does
+    /// for the address bar's top suggestion. Returns at once; the work runs
+    /// on a short thread. Does nothing when the origin has a connection or
+    /// one is being opened, and for URLs other than http and https. A
+    /// request that comes while it connects waits for the connection.
+    pub fn preconnect(&self, url: &Url) {
+        self.preconnect_from(url, false);
+    }
+
+    fn preconnect_from(&self, url: &Url, public_only: bool) {
+        if !matches!(url.scheme(), "http" | "https") {
+            return;
+        }
+        if let Ok(uri) = url.as_str().parse::<http::Uri>() {
+            self.transport.preconnect(&uri, public_only);
+        }
+    }
 }
 
 /// Fetches resources for one document, through its profile's [`Network`].
@@ -535,6 +554,15 @@ impl Loader {
     pub fn hold_script_requests(&self) -> ScriptRequestsHeld<'_> {
         *self.script_holds.lock() += 1;
         ScriptRequestsHeld(self)
+    }
+
+    /// [`Network::preconnect`] for the client document (`<link
+    /// rel=preconnect>`, the preload scanner): from a public page, only to
+    /// public addresses, like its requests.
+    pub fn preconnect(&self, url: &Url) {
+        let client = self.client();
+        let public_only = self.public_only(Mode::NoCors, client.as_ref());
+        self.net.preconnect_from(url, public_only);
     }
 
     /// Wait until no [`Loader::hold_script_requests`] is in place. The

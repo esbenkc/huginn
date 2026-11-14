@@ -710,6 +710,17 @@ run loads from the network.
   connection (the server closed it, or an HTTP/2 connection went away) is
   sent once more on a new one, as in Chrome. Redirects, errors and `304`s
   up to 64 KiB are read to the end, so their connection is used again.
+  A page's requests share the connection its navigation opened: each
+  connection knows whether it goes to a loopback or private address, and
+  requests from public pages skip only those (before, they had a pool of
+  their own and paid a new TCP and TLS handshake for the first request to
+  the page's own host). An HTTP/2 connection that read nothing for 10 s
+  sends a PING with its next request and is closed if no answer comes in
+  10 s (Chrome's hung-connection check); idle ones send nothing.
+  `Network::preconnect` (the address bar's top suggestion) and
+  `Loader::preconnect` open a connection ahead of a request; unused
+  HTTP/1.1 ones are kept 10 s. Connecting races the other address family
+  after 300 ms (Happy Eyeballs, Chrome's delay).
 - **Content-Encoding.** Huginn asks for `gzip, deflate, br` and decodes a
   body after reading all of it (`compression.rs`), so the connection goes
   back to the pool. (ureq, the client before hyper, stopped reading a

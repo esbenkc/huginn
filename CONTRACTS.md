@@ -568,6 +568,10 @@ impl Network {
     pub fn new(cookies: Arc<CookieJar>, cache: HttpCache) -> Arc<Network>;  // HUGINN_NET_LOOPBACK_ONLY=1 -> loopback only
     pub fn cookies(&self) -> &Arc<CookieJar>;
     pub fn cache(&self) -> &HttpCache;
+    /// Warm DNS + TCP + TLS (+ HTTP/2 handshake) to url's origin, nothing sent (Chrome's
+    /// omnibox preconnect). Returns at once (short thread); no-op if the origin has a
+    /// connection or one is opening, and for non-http(s) URLs. Unused HTTP/1.1 ones live 10 s.
+    pub fn preconnect(&self, url: &Url);
 }
 /// RFC 9111 private cache: fresh entries answer, stale ones are revalidated (ETag,
 /// Last-Modified, 304), no-store and Vary honoured, keyed by top-level site + URL.
@@ -599,6 +603,7 @@ impl Loader {
     /// them while it loads the first paint's resources. Sync XHR is not held.
     pub fn hold_script_requests(&self) -> ScriptRequestsHeld<'_>;
     pub fn wait_for_script_turn(&self);      // blocks while held; the threads of fetch()/async XHR call it
+    pub fn preconnect(&self, url: &Url);     // Network::preconnect for the client page (public pages: public addresses only)
     pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // no-cors subresource, kept in the loader by URL
     pub fn fetch_with(&self, url: &Url, kind: ResourceKind, cors: CorsSettings) -> Result<Arc<Resource>, NetError>;  // modules, <script crossorigin>
     /// Not kept in the loader (the HTTP cache still answers): for bodies decoded once and
