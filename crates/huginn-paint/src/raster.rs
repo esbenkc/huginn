@@ -114,7 +114,7 @@ pub(crate) fn rasterize(
         scale,
         canvas: list.canvas,
     };
-    r.paint(&mut ctx, (w16, h16), &list.items, true);
+    r.paint(&mut ctx, (w16, h16), &list.items, true, None);
 
     let mut pixmap = Pixmap::new(w16, h16);
     ctx.flush();
@@ -140,19 +140,28 @@ struct Raster<'r> {
 impl Raster<'_> {
     /// Paint `items` (balanced) into `ctx`, which is `size` device px.
     /// `on_canvas`: `ctx` starts with the canvas color, so it is part of
-    /// any backdrop read here.
+    /// any backdrop read here. `cull` (device px): drawing items that
+    /// cannot touch it are skipped (offscreen groups and backdrops).
     fn paint(
         &mut self,
         ctx: &mut RenderContext,
         size: (u16, u16),
         items: &[DisplayItem<'_>],
         on_canvas: bool,
+        cull: Option<kurbo::Rect>,
     ) {
         let first_transform = *ctx.transform();
         let scale = self.scale;
         let mut stack: Vec<Pushed> = Vec::new();
         let mut i = 0;
         while i < items.len() {
+            if let Some(c) = cull
+                && let Some(r) = item_rect(&items[i])
+                && !ctx.transform().transform_rect_bbox(r).overlaps(c)
+            {
+                i += 1;
+                continue;
+            }
             match &items[i] {
                 DisplayItem::Rect {
                     rect,
@@ -452,7 +461,13 @@ impl Raster<'_> {
         };
         let mut sub = RenderContext::new(area.2, area.3);
         sub.set_transform(Affine::translate((-f64::from(area.0), -f64::from(area.1))) * t);
-        self.paint(&mut sub, (area.2, area.3), items, false);
+        self.paint(
+            &mut sub,
+            (area.2, area.3),
+            items,
+            false,
+            Some(device_rect((area.2, area.3))),
+        );
         let mut pm = Pixmap::new(area.2, area.3);
         sub.flush();
         sub.render(&mut pm, self.resources);
@@ -489,7 +504,13 @@ impl Raster<'_> {
             sub.fill_rect(&device_rect((area.2, area.3)));
         }
         sub.set_transform(Affine::translate((-f64::from(area.0), -f64::from(area.1))) * t0);
-        self.paint(&mut sub, (area.2, area.3), backdrop, canvas);
+        self.paint(
+            &mut sub,
+            (area.2, area.3),
+            backdrop,
+            canvas,
+            Some(device_rect((area.2, area.3))),
+        );
         let mut pm = Pixmap::new(area.2, area.3);
         sub.flush();
         sub.render(&mut pm, self.resources);
@@ -575,6 +596,56 @@ fn draw_device_pixmap(
     ctx.set_transform(saved);
 }
 
+/// What a drawing item can paint, in its own coordinates (shadows and
+/// glyphs generously); `None` for Push and Pop items.
+fn item_rect(item: &DisplayItem<'_>) -> Option<kurbo::Rect> {
+    match item {
+        DisplayItem::Rect { rect, .. }
+        | DisplayItem::Border { rect, .. }
+        | DisplayItem::Image { rect, .. }
+        | DisplayItem::BackdropFilter { rect, .. } => Some(krect(*rect)),
+        DisplayItem::TiledImage { clip, .. } | DisplayItem::Gradient { clip, .. } => {
+            Some(krect(*clip))
+        }
+        DisplayItem::BoxShadow {
+            rect,
+            offset,
+            blur,
+            spread,
+            inset,
+            ..
+        } => {
+            let reach = if *inset {
+                0.0
+            } else {
+                blur * 1.5 + spread.max(0.0) + offset.0.abs().max(offset.1.abs())
+            };
+            Some(krect(*rect).inflate(f64::from(reach), f64::from(reach)))
+        }
+        DisplayItem::Glyphs { run, glyphs, .. } => {
+            let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+            for g in glyphs.iter() {
+                x0 = x0.min(g.x);
+                x1 = x1.max(g.x);
+                y0 = y0.min(g.y);
+                y1 = y1.max(g.y);
+            }
+            // Glyph boxes are not known here: allow an em before the
+            // origin, two after, 1.5 above the baseline and one below.
+            let em = run.font_size;
+            (x0 <= x1).then(|| {
+                kurbo::Rect::new(
+                    f64::from(x0 - em),
+                    f64::from(y0 - 1.5 * em),
+                    f64::from(x1 + 2.0 * em),
+                    f64::from(y1 + em),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Device-space bounds of what `items` paint, drawn under `t`, before any
 /// filter of the group itself; `None` if they paint nothing.
 fn content_bounds(items: &[DisplayItem<'_>], t: Affine) -> Option<kurbo::Rect> {
@@ -603,48 +674,6 @@ fn content_bounds(items: &[DisplayItem<'_>], t: Affine) -> Option<kurbo::Rect> {
     };
     for item in items {
         let r = match item {
-            DisplayItem::Rect { rect, .. }
-            | DisplayItem::Border { rect, .. }
-            | DisplayItem::Image { rect, .. }
-            | DisplayItem::BackdropFilter { rect, .. } => Some(krect(*rect)),
-            DisplayItem::TiledImage { clip, .. } | DisplayItem::Gradient { clip, .. } => {
-                Some(krect(*clip))
-            }
-            DisplayItem::BoxShadow {
-                rect,
-                offset,
-                blur,
-                spread,
-                inset,
-                ..
-            } => {
-                let reach = if *inset {
-                    0.0
-                } else {
-                    blur * 1.5 + spread.max(0.0) + offset.0.abs().max(offset.1.abs())
-                };
-                Some(krect(*rect).inflate(f64::from(reach), f64::from(reach)))
-            }
-            DisplayItem::Glyphs { run, glyphs, .. } => {
-                let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
-                for g in glyphs.iter() {
-                    x0 = x0.min(g.x);
-                    x1 = x1.max(g.x);
-                    y0 = y0.min(g.y);
-                    y1 = y1.max(g.y);
-                }
-                // Glyph boxes are not known here: allow an em before the
-                // origin, two after, 1.5 above the baseline and one below.
-                let em = run.font_size;
-                (x0 <= x1).then(|| {
-                    kurbo::Rect::new(
-                        f64::from(x0 - em),
-                        f64::from(y0 - 1.5 * em),
-                        f64::from(x1 + 2.0 * em),
-                        f64::from(y1 + em),
-                    )
-                })
-            }
             DisplayItem::PushTransform(m) => {
                 stack.push(Frame::Transform(t));
                 t *= Affine::new(m.map(f64::from));
@@ -692,6 +721,7 @@ fn content_bounds(items: &[DisplayItem<'_>], t: Affine) -> Option<kurbo::Rect> {
                 }
                 None
             }
+            _ => item_rect(item),
         };
         let Some(r) = r else { continue };
         // Innermost group first: its clips, then its filter's growth.

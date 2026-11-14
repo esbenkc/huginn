@@ -2,6 +2,7 @@
 //! stylesheet parsing (with `@import`), the style traversal and
 //! `@font-face` extraction.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc as StdArc, Once};
 
@@ -174,6 +175,44 @@ pub(crate) fn parse_sheet(
     )
 }
 
+/// Chrome parses `-webkit-line-clamp` and `-webkit-backdrop-filter` as
+/// other names of `line-clamp` and `backdrop-filter`. Stylo's servo build
+/// has neither name (Gecko-only), so declarations with them are renamed
+/// before parsing. Only a property name is renamed: the name must start a
+/// declaration (after `{`, `;` or white space) and be followed by `:`.
+pub(crate) fn webkit_aliases(css: &str) -> Cow<'_, str> {
+    const ALIASES: [(&str, &str); 2] = [
+        ("-webkit-line-clamp", "line-clamp"),
+        ("-webkit-backdrop-filter", "backdrop-filter"),
+    ];
+    if !ALIASES.iter().any(|(from, _)| css.contains(from)) {
+        return Cow::Borrowed(css);
+    }
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    'scan: while let Some(at) = rest.find("-webkit-") {
+        for (from, to) in ALIASES {
+            let Some(after) = rest[at..].strip_prefix(from) else {
+                continue;
+            };
+            let starts = rest[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c == '{' || c == ';' || c.is_whitespace());
+            if starts && after.trim_start().starts_with(':') {
+                out.push_str(&rest[..at]);
+                out.push_str(to);
+                rest = after;
+                continue 'scan;
+            }
+        }
+        let skip = at + "-webkit-".len();
+        out.push_str(&rest[..skip]);
+        rest = &rest[skip..];
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
 #[allow(clippy::too_many_arguments)]
 fn parse_sheet_with_media(
     css: &str,
@@ -192,7 +231,7 @@ fn parse_sheet_with_media(
         quirks,
     };
     Arc::new(Stylesheet::from_str(
-        css,
+        &webkit_aliases(css),
         url_data(base_url),
         stylo_origin(origin),
         media,
@@ -347,7 +386,7 @@ impl BlockCache {
             return b.clone();
         }
         let block = Arc::new(lock.wrap(parse_style_attribute(
-            css,
+            &webkit_aliases(css),
             url,
             None,
             quirks,
