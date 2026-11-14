@@ -7,14 +7,27 @@
 //! - **HTTP/2.** One connection per host carries every request to it at
 //!   once. While the first TLS connection to a host is being opened, other
 //!   requests to the host wait for it, as in Chrome: if the server picks
-//!   `h2`, they share it; if it picks `http/1.1`, they open their own.
+//!   `h2`, they share it; if it picks `http/1.1`, they open their own. A
+//!   request on a connection that read nothing for 10 s sends a PING with
+//!   it; without an answer in 10 s the connection is closed and the
+//!   request goes again on a new one (Chrome's check of connections at
+//!   risk of loss). Idle connections send nothing.
 //! - **HTTP/1.1.** At most 6 connections per host (Chrome's limit), used one
 //!   request at a time. A connection whose response was read to the end goes
 //!   back to the pool. At most 32 idle connections are kept in all.
 //! - Idle connections of both kinds are kept for 5 minutes, with their TLS
-//!   sessions for resumption (one rustls config per network).
+//!   sessions for resumption (one rustls config per network); HTTP/1.1
+//!   connections that were opened ahead of a request
+//!   ([`Transport::preconnect`]) and never used, for 10 s (Chrome's
+//!   limits).
+//! - Requests from public pages may not reach loopback or private
+//!   addresses: they use only connections to public addresses, and open
+//!   theirs with the others dropped. So a page's requests share the
+//!   connection its navigation opened, as in Chrome.
 //! - Name lookups are kept for a minute, and are only made for new
-//!   connections.
+//!   connections. Connecting tries the addresses in the order the resolver
+//!   gave; the other address family starts after 300 ms (Happy Eyeballs,
+//!   Chrome's delay).
 //!
 //! The API is blocking: callers are the loader's worker threads and the
 //! engine threads. One tokio worker thread (`huginn-net`) drives the
@@ -26,13 +39,14 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::pin::pin;
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body as _, Incoming};
 use hyper::client::conn::{http1, http2};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
@@ -46,11 +60,22 @@ const IDLE_TOTAL: usize = 32;
 /// How long an idle connection is kept: Chrome's limit for sockets that
 /// were used once.
 const IDLE_AGE: Duration = Duration::from_secs(300);
+/// How long a connection opened ahead of a request waits for one:
+/// Chrome's limit for sockets that were never used.
+const UNUSED_AGE: Duration = Duration::from_secs(10);
 /// How long a resolved address is used: Chrome's default for answers of
 /// the system resolver.
 const DNS_TTL: Duration = Duration::from_secs(60);
 /// Time limit for one exchange: connecting, the response head and the body.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// An HTTP/2 connection that read nothing for this long is checked with a
+/// PING when it carries a request, and closed when the answer takes as
+/// long again (Chrome: connection at risk of loss, hung interval).
+const H2_PING_AFTER: Duration = Duration::from_secs(10);
+const H2_PING_TIMEOUT: Duration = Duration::from_secs(10);
+/// When the other address family starts connecting (Chrome's Happy
+/// Eyeballs delay).
+const FALLBACK_DELAY: Duration = Duration::from_millis(300);
 
 type ReqBody = Full<Bytes>;
 
@@ -59,21 +84,26 @@ pub(crate) struct Transport {
     /// Made on the first request, so loaders that only read `file:` and
     /// `data:` URLs start no thread.
     runtime: LazyLock<tokio::runtime::Runtime>,
+    dial: Dial,
+}
+
+/// The pool and what opens connections; cheap to clone (a preconnect
+/// thread takes one).
+#[derive(Clone)]
+struct Dial {
     /// One TLS config, so sessions are resumed across connections.
     tls: Arc<rustls::ClientConfig>,
     pool: Arc<Pool>,
-    dns: Mutex<HashMap<(String, u16), (Vec<SocketAddr>, Instant)>>,
+    dns: Arc<Mutex<HashMap<(String, u16), (Vec<SocketAddr>, Instant)>>>,
     loopback_only: bool,
 }
 
-/// Where a connection goes. Requests from public pages (`public_only`) get
-/// connections of their own, made with the private addresses dropped.
+/// Where a connection goes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Key {
     https: bool,
     host: String,
     port: u16,
-    public_only: bool,
 }
 
 #[derive(Default)]
@@ -85,17 +115,47 @@ struct Pool {
 
 #[derive(Default)]
 struct Host {
-    /// The host's HTTP/2 connection and when it was last used.
-    h2: Option<(http2::SendRequest<ReqBody>, Instant)>,
+    /// The host's HTTP/2 connection.
+    h2: Option<H2>,
     /// What the last TLS connection to the host negotiated (`None`: none
     /// was made yet).
     speaks_h2: Option<bool>,
-    /// Idle HTTP/1.1 connections and since when.
-    idle: Vec<(http1::SendRequest<ReqBody>, Instant)>,
+    /// Idle HTTP/1.1 connections.
+    idle: Vec<Idle>,
     /// HTTP/1.1 connections in use, and connections being opened.
     busy: usize,
     /// Connections being opened.
     connecting: usize,
+}
+
+struct H2 {
+    sender: http2::SendRequest<ReqBody>,
+    /// When it was last used (or made).
+    used: Instant,
+    /// It goes to a loopback or private address: requests from public pages
+    /// may not use it.
+    local: bool,
+}
+
+struct Idle {
+    sender: http1::SendRequest<ReqBody>,
+    since: Instant,
+    local: bool,
+    /// It carried a request (else it was opened ahead of one).
+    used: bool,
+}
+
+impl Idle {
+    fn alive(&self) -> bool {
+        let age = if self.used { IDLE_AGE } else { UNUSED_AGE };
+        !self.sender.is_closed() && self.since.elapsed() < age
+    }
+}
+
+impl H2 {
+    fn alive(&self) -> bool {
+        !self.sender.is_closed() && self.used.elapsed() < IDLE_AGE
+    }
 }
 
 /// A request ready to send: method, absolute URI and headers.
@@ -125,6 +185,7 @@ struct Lease {
     pool: Arc<Pool>,
     key: Key,
     sender: Option<http1::SendRequest<ReqBody>>,
+    local: bool,
     reusable: bool,
 }
 
@@ -137,22 +198,31 @@ impl Drop for Lease {
                 && let Some(s) = self.sender.take()
                 && !s.is_closed()
             {
-                h.idle.push((s, Instant::now()));
+                h.idle.push(Idle {
+                    sender: s,
+                    since: Instant::now(),
+                    local: self.local,
+                    used: true,
+                });
             }
         }
-        // Keep at most IDLE_TOTAL idle connections: drop the oldest.
-        let idle: usize = hosts.values().map(|h| h.idle.len()).sum();
-        for _ in IDLE_TOTAL..idle {
-            let oldest = hosts
-                .iter()
-                .filter_map(|(k, h)| h.idle.first().map(|(_, at)| (*at, k.clone())))
-                .min_by_key(|(at, _)| *at);
-            if let Some(h) = oldest.and_then(|(_, k)| hosts.get_mut(&k)) {
-                h.idle.remove(0);
-            }
-        }
+        trim_idle(&mut hosts);
         drop(hosts);
         self.pool.changed.notify_waiters();
+    }
+}
+
+/// Keep at most IDLE_TOTAL idle connections: drop the oldest.
+fn trim_idle(hosts: &mut HashMap<Key, Host>) {
+    let idle: usize = hosts.values().map(|h| h.idle.len()).sum();
+    for _ in IDLE_TOTAL..idle {
+        let oldest = hosts
+            .iter()
+            .filter_map(|(k, h)| h.idle.first().map(|i| (i.since, k.clone())))
+            .min_by_key(|(at, _)| *at);
+        if let Some(h) = oldest.and_then(|(_, k)| hosts.get_mut(&k)) {
+            h.idle.remove(0);
+        }
     }
 }
 
@@ -181,20 +251,21 @@ impl Transport {
     pub(crate) fn new(loopback_only: bool) -> Transport {
         Transport {
             runtime: LazyLock::new(runtime),
-            tls: tls_config(),
-            pool: Arc::default(),
-            dns: Mutex::default(),
-            loopback_only,
+            dial: Dial {
+                tls: tls_config(),
+                pool: Arc::default(),
+                dns: Arc::default(),
+                loopback_only,
+            },
         }
     }
 
     /// A transport that trusts `tls`'s roots (tests).
     #[cfg(test)]
     pub(crate) fn with_tls(tls: Arc<rustls::ClientConfig>) -> Transport {
-        Transport {
-            tls,
-            ..Transport::new(false)
-        }
+        let mut t = Transport::new(false);
+        t.dial.tls = tls;
+        t
     }
 
     fn handle(&self) -> &tokio::runtime::Handle {
@@ -204,7 +275,8 @@ impl Transport {
     /// Send `head` (with `body`) and wait for the response head. A request
     /// that failed on a kept-alive connection (the server closed it in the
     /// meantime, or an HTTP/2 connection went away) is sent once more, on
-    /// a new connection, as in Chrome.
+    /// a new connection, as in Chrome. `public_only`: the request may not
+    /// reach loopback or private addresses.
     pub(crate) fn send(
         &self,
         head: Head,
@@ -213,17 +285,22 @@ impl Transport {
         exchange: &mut Exchange,
     ) -> Result<Response, NetError> {
         let url = head.uri.to_string();
-        let key = key_for(&head.uri, public_only)
-            .ok_or_else(|| NetError::InvalidUrl(format!("{url}: no host")))?;
+        let key =
+            key_for(&head.uri).ok_or_else(|| NetError::InvalidUrl(format!("{url}: no host")))?;
         let body = body.map(Bytes::copy_from_slice).unwrap_or_default();
         let handle = self.handle().clone();
         let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let dial = &self.dial;
         let result = handle.block_on(async {
             let send = async {
-                match self.send_once(&key, &head, &body, false, exchange).await {
+                match dial
+                    .send_once(&key, public_only, &head, &body, false, exchange)
+                    .await
+                {
                     Err((_, true)) => {
                         *exchange = Exchange::begin();
-                        self.send_once(&key, &head, &body, true, exchange).await
+                        dial.send_once(&key, public_only, &head, &body, true, exchange)
+                            .await
                     }
                     r => r,
                 }
@@ -246,11 +323,59 @@ impl Transport {
         })
     }
 
+    /// Open a connection to `uri`'s host ahead of a request, if it has no
+    /// usable one and none is being opened: name lookup, TCP, TLS and the
+    /// HTTP/2 handshake, nothing sent beyond that (Chrome's preconnect).
+    /// Returns at once; the work runs on a thread of its own, and requests
+    /// that come meanwhile wait for the connection like for any other one
+    /// being opened. With `HUGINN_NET_LOG=1` it prints a `preconnect` line.
+    pub(crate) fn preconnect(&self, uri: &http::Uri, public_only: bool) {
+        let Some(key) = key_for(uri) else {
+            return;
+        };
+        {
+            let mut hosts = self.dial.pool.hosts.lock();
+            let h = hosts.entry(key.clone()).or_default();
+            h.idle.retain(Idle::alive);
+            if h.h2.as_ref().is_some_and(|c| !c.alive()) {
+                h.h2 = None;
+            }
+            let usable = |local: bool| !public_only || !local;
+            let has = h.h2.as_ref().is_some_and(|c| usable(c.local))
+                || h.idle.iter().any(|i| usable(i.local));
+            if has || h.connecting > 0 || h.busy >= MAX_PER_HOST {
+                return;
+            }
+            h.busy += 1;
+            h.connecting += 1;
+            sweep(&mut hosts);
+        }
+        let (dial, handle, k) = (self.dial.clone(), self.handle().clone(), key.clone());
+        let opened = std::thread::Builder::new()
+            .name("huginn-preconnect".into())
+            .spawn(move || {
+                handle.block_on(async {
+                    let _ = tokio::time::timeout(TIMEOUT, dial.open_idle(&k, public_only)).await;
+                });
+            });
+        if opened.is_err() {
+            // No thread: undo the count.
+            drop(Opening {
+                pool: &self.dial.pool,
+                key: &key,
+                leased: false,
+            });
+        }
+    }
+}
+
+impl Dial {
     /// One try. The error says whether the connection was a kept-alive one
     /// (then a retry on a new connection may work).
     async fn send_once(
         &self,
         key: &Key,
+        public_only: bool,
         head: &Head,
         body: &Bytes,
         fresh: bool,
@@ -258,7 +383,7 @@ impl Transport {
     ) -> Result<(http::Response<Incoming>, Option<Lease>), (String, bool)> {
         loop {
             let (conn, reused) = self
-                .connection(key, fresh, exchange)
+                .connection(key, public_only, fresh, exchange)
                 .await
                 .map_err(|e| (e, false))?;
             match conn {
@@ -297,27 +422,29 @@ impl Transport {
     }
 
     /// A connection for `key`: the host's HTTP/2 connection, an idle
-    /// HTTP/1.1 one, or a new one. `fresh`: only a new one. Returns whether
-    /// it was kept alive from before.
+    /// HTTP/1.1 one, or a new one. `fresh`: only a new one. `public_only`:
+    /// only one to a public address. Returns whether it was kept alive from
+    /// before.
     async fn connection(
         &self,
         key: &Key,
+        public_only: bool,
         fresh: bool,
         exchange: &mut Exchange,
     ) -> Result<(Conn, bool), String> {
+        let usable = |local: bool| !public_only || !local;
         loop {
             let mut notified = pin!(self.pool.changed.notified());
             {
                 let mut hosts = self.pool.hosts.lock();
                 let h = hosts.entry(key.clone()).or_default();
-                h.idle
-                    .retain(|(s, at)| !s.is_closed() && at.elapsed() < IDLE_AGE);
-                if let Some((s, used)) = &mut h.h2 {
-                    if s.is_closed() || used.elapsed() >= IDLE_AGE {
+                h.idle.retain(Idle::alive);
+                if let Some(c) = &mut h.h2 {
+                    if !c.alive() {
                         h.h2 = None;
-                    } else if !fresh {
-                        *used = Instant::now();
-                        return Ok((Conn::H2(s.clone()), true));
+                    } else if !fresh && usable(c.local) {
+                        c.used = Instant::now();
+                        return Ok((Conn::H2(c.sender.clone()), true));
                     }
                 }
                 // A TLS connection is being opened and may become an
@@ -325,9 +452,10 @@ impl Transport {
                 let wait_for_alpn =
                     !fresh && key.https && h.speaks_h2 != Some(false) && h.connecting > 0;
                 if !wait_for_alpn {
-                    if !fresh && let Some((sender, _)) = h.idle.pop() {
+                    if !fresh && let Some(i) = h.idle.iter().rposition(|i| usable(i.local)) {
+                        let idle = h.idle.remove(i);
                         h.busy += 1;
-                        return Ok((Conn::H1(self.lease(key, sender)), true));
+                        return Ok((Conn::H1(self.lease(key, idle.sender, idle.local)), true));
                     }
                     if h.busy < MAX_PER_HOST {
                         h.busy += 1;
@@ -346,58 +474,105 @@ impl Transport {
             leased: false,
         };
         let t = Instant::now();
-        let made = self.connect(key, exchange).await;
+        let made = self.connect(key, public_only, exchange).await;
         exchange.connect = Some(t.elapsed().saturating_sub(exchange.dns));
         let made = made?;
         let mut hosts = self.pool.hosts.lock();
         let h = hosts.entry(key.clone()).or_default();
         match made {
-            Made::H2(sender) => {
+            Made::H2(sender, local) => {
                 h.speaks_h2 = Some(true);
-                h.h2 = Some((sender.clone(), Instant::now()));
+                h.h2 = Some(H2 {
+                    sender: sender.clone(),
+                    used: Instant::now(),
+                    local,
+                });
                 drop(hosts);
                 drop(opening);
                 Ok((Conn::H2(sender), false))
             }
-            Made::H1(sender) => {
+            Made::H1(sender, local) => {
                 if key.https {
                     h.speaks_h2 = Some(false);
                 }
                 drop(hosts);
                 opening.leased = true;
                 drop(opening);
-                Ok((Conn::H1(self.lease(key, sender)), false))
+                Ok((Conn::H1(self.lease(key, sender, local)), false))
             }
         }
     }
 
-    fn lease(&self, key: &Key, sender: http1::SendRequest<ReqBody>) -> Lease {
+    /// Open a connection that waits in the pool for a request
+    /// ([`Transport::preconnect`], which counted it as being opened).
+    async fn open_idle(&self, key: &Key, public_only: bool) {
+        let opening = Opening {
+            pool: &self.pool,
+            key,
+            leased: false,
+        };
+        let mut exchange = Exchange::begin();
+        let t = Instant::now();
+        let made = self.connect(key, public_only, &mut exchange).await;
+        let connect = t.elapsed().saturating_sub(exchange.dns);
+        let mut hosts = self.pool.hosts.lock();
+        let h = hosts.entry(key.clone()).or_default();
+        let protocol = match made {
+            Ok(Made::H2(sender, local)) => {
+                h.speaks_h2 = Some(true);
+                if h.h2.as_ref().is_none_or(|c| !c.alive()) {
+                    h.h2 = Some(H2 {
+                        sender,
+                        used: Instant::now(),
+                        local,
+                    });
+                }
+                "h2"
+            }
+            Ok(Made::H1(sender, local)) => {
+                if key.https {
+                    h.speaks_h2 = Some(false);
+                }
+                h.idle.push(Idle {
+                    sender,
+                    since: Instant::now(),
+                    local,
+                    used: false,
+                });
+                trim_idle(&mut hosts);
+                "h1"
+            }
+            Err(_) => "failed",
+        };
+        drop(hosts);
+        drop(opening);
+        exchange.preconnected(protocol, connect, key.https, &key.host, key.port);
+    }
+
+    fn lease(&self, key: &Key, sender: http1::SendRequest<ReqBody>, local: bool) -> Lease {
         Lease {
             pool: self.pool.clone(),
             key: key.clone(),
             sender: Some(sender),
+            local,
             reusable: false,
         }
     }
 
-    /// Open a connection: name lookup, TCP, then TLS for `https:`.
-    async fn connect(&self, key: &Key, exchange: &mut Exchange) -> Result<Made, String> {
-        let addrs = self.resolve(key, exchange)?;
-        let mut last = String::from("no address");
-        let mut tcp = None;
-        for a in addrs {
-            match tokio::net::TcpStream::connect(a).await {
-                Ok(s) => {
-                    tcp = Some(s);
-                    break;
-                }
-                Err(e) => last = format!("{a}: {e}"),
-            }
-        }
-        let tcp = tcp.ok_or(last)?;
+    /// Open a connection: name lookup, TCP, then TLS for `https:`. Also
+    /// whether it goes to a loopback or private address.
+    async fn connect(
+        &self,
+        key: &Key,
+        public_only: bool,
+        exchange: &mut Exchange,
+    ) -> Result<Made, String> {
+        let addrs = self.resolve(key, public_only, exchange)?;
+        let tcp = connect_tcp(&addrs).await?;
+        let local = tcp.peer_addr().map_or(true, |a| crate::is_local_ip(a.ip()));
         let _ = tcp.set_nodelay(true);
         if !key.https {
-            return h1(tcp).await;
+            return h1(tcp, local).await;
         }
         let name = rustls::pki_types::ServerName::try_from(key.host.clone())
             .map_err(|e| format!("{}: {e}", key.host))?;
@@ -410,15 +585,21 @@ impl Transport {
             // Chrome's flow-control windows.
             b.initial_stream_window_size(6 << 20)
                 .initial_connection_window_size(15 << 20)
-                .max_header_list_size(256 << 10);
+                .max_header_list_size(256 << 10)
+                // PING a connection that was quiet for a while when it
+                // carries a request; never while it is idle.
+                .timer(TokioTimer::new())
+                .keep_alive_interval(H2_PING_AFTER)
+                .keep_alive_timeout(H2_PING_TIMEOUT)
+                .keep_alive_while_idle(false);
             let (sender, conn) = b
                 .handshake(TokioIo::new(tls))
                 .await
                 .map_err(|e| e.to_string())?;
             tokio::spawn(conn);
-            Ok(Made::H2(sender))
+            Ok(Made::H2(sender, local))
         } else {
-            h1(tls).await
+            h1(tls, local).await
         }
     }
 
@@ -428,10 +609,15 @@ impl Transport {
     /// other host (no lookup). For public pages, loopback and private
     /// addresses are dropped (Local Network Access); the check is on the
     /// resolved addresses, so DNS rebinding cannot get around it.
-    fn resolve(&self, key: &Key, exchange: &mut Exchange) -> Result<Vec<SocketAddr>, String> {
+    fn resolve(
+        &self,
+        key: &Key,
+        public_only: bool,
+        exchange: &mut Exchange,
+    ) -> Result<Vec<SocketAddr>, String> {
         let (host, port) = (key.host.as_str(), key.port);
         if host == "localhost" || host.ends_with(".localhost") {
-            if key.public_only {
+            if public_only {
                 return Err("host not found".into());
             }
             return Ok(vec![
@@ -467,13 +653,69 @@ impl Transport {
         };
         let addrs: Vec<SocketAddr> = addrs
             .into_iter()
-            .filter(|a| !key.public_only || !crate::is_local_ip(a.ip()))
+            .filter(|a| !public_only || !crate::is_local_ip(a.ip()))
             .collect();
         if addrs.is_empty() {
             return Err("host not found".into());
         }
         Ok(addrs)
     }
+}
+
+/// Connect to the first of `addrs` that answers. The addresses of the
+/// first one's family are tried in order; the other family's start
+/// `FALLBACK_DELAY` later, or at once when the first family has failed
+/// (Happy Eyeballs, RFC 8305, with Chrome's delay).
+async fn connect_tcp(addrs: &[SocketAddr]) -> Result<tokio::net::TcpStream, String> {
+    let Some(first) = addrs.first() else {
+        return Err("no address".into());
+    };
+    let (primary, secondary): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.iter().partition(|a| a.is_ipv6() == first.is_ipv6());
+    let in_order = |list: Vec<SocketAddr>| async move {
+        let mut last = String::from("no address");
+        for a in list {
+            match tokio::net::TcpStream::connect(a).await {
+                Ok(s) => return Ok(s),
+                Err(e) => last = format!("{a}: {e}"),
+            }
+        }
+        Err(last)
+    };
+    if secondary.is_empty() {
+        return in_order(primary).await;
+    }
+    let mut first = pin!(in_order(primary));
+    let mut other = pin!(in_order(secondary));
+    let mut delay = pin!(tokio::time::sleep(FALLBACK_DELAY));
+    let (mut first_err, mut other_err, mut other_started) = (None, None, false);
+    std::future::poll_fn(|cx| {
+        if first_err.is_none()
+            && let Poll::Ready(r) = first.as_mut().poll(cx)
+        {
+            match r {
+                Ok(s) => return Poll::Ready(Ok(s)),
+                Err(e) => first_err = Some(e),
+            }
+        }
+        if !other_started && (first_err.is_some() || delay.as_mut().poll(cx).is_ready()) {
+            other_started = true;
+        }
+        if other_started
+            && other_err.is_none()
+            && let Poll::Ready(r) = other.as_mut().poll(cx)
+        {
+            match r {
+                Ok(s) => return Poll::Ready(Ok(s)),
+                Err(e) => other_err = Some(e),
+            }
+        }
+        match (&first_err, &other_err) {
+            (Some(a), Some(b)) => Poll::Ready(Err(format!("{a}; {b}"))),
+            _ => Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// The network thread: one tokio worker.
@@ -512,25 +754,22 @@ fn tls_config_with(roots: rustls::RootCertStore) -> Arc<rustls::ClientConfig> {
 /// requests that reuse one).
 fn sweep(hosts: &mut HashMap<Key, Host>) {
     hosts.retain(|_, h| {
-        h.idle
-            .retain(|(s, at)| !s.is_closed() && at.elapsed() < IDLE_AGE);
-        if h.h2
-            .as_ref()
-            .is_some_and(|(s, used)| s.is_closed() || used.elapsed() >= IDLE_AGE)
-        {
+        h.idle.retain(Idle::alive);
+        if h.h2.as_ref().is_some_and(|c| !c.alive()) {
             h.h2 = None;
         }
         h.h2.is_some() || !h.idle.is_empty() || h.busy > 0 || h.connecting > 0
     });
 }
 
+/// A new connection, and whether it goes to a loopback or private address.
 enum Made {
-    H1(http1::SendRequest<ReqBody>),
-    H2(http2::SendRequest<ReqBody>),
+    H1(http1::SendRequest<ReqBody>, bool),
+    H2(http2::SendRequest<ReqBody>, bool),
 }
 
 /// An HTTP/1.1 connection on `io`; its driver runs on the network thread.
-async fn h1<T>(io: T) -> Result<Made, String>
+async fn h1<T>(io: T, local: bool) -> Result<Made, String>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -543,11 +782,11 @@ where
         .await
         .map_err(|e| e.to_string())?;
     tokio::spawn(conn);
-    Ok(Made::H1(sender))
+    Ok(Made::H1(sender, local))
 }
 
 /// The pool key of a URI.
-fn key_for(uri: &http::Uri, public_only: bool) -> Option<Key> {
+fn key_for(uri: &http::Uri) -> Option<Key> {
     let https = uri.scheme_str() == Some("https");
     let host = uri
         .host()?
@@ -556,12 +795,7 @@ fn key_for(uri: &http::Uri, public_only: bool) -> Option<Key> {
         .trim_end_matches('.')
         .to_ascii_lowercase();
     let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
-    Some(Key {
-        https,
-        host,
-        port,
-        public_only,
-    })
+    Some(Key { https, host, port })
 }
 
 /// The request for HTTP/1.1 or (`h2`) HTTP/2. HTTP/1.1 gets the path as its target and
@@ -963,5 +1197,83 @@ mod tests {
                 String::from_utf8_lossy(alpn)
             );
         }
+    }
+
+    /// Wait until the server has `n` connections (a preconnect runs on a
+    /// thread of its own).
+    fn wait_for_connections(s: &test_server::Server, n: usize) {
+        let t = Instant::now();
+        while s.connections.load(Ordering::SeqCst) < n && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The handshake may still be finishing on the client.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn a_preconnected_host_needs_no_new_handshake() {
+        for alpn in [&b"h2"[..], &b"http/1.1"[..]] {
+            let s = server(&[alpn], Duration::ZERO, usize::MAX);
+            let t = client();
+            let uri: http::Uri = format!("https://127.0.0.1:{}/", s.port).parse().unwrap();
+            t.preconnect(&uri, false);
+            // A second call while the first connects, and one after it, open nothing.
+            t.preconnect(&uri, false);
+            wait_for_connections(&s, 1);
+            t.preconnect(&uri, false);
+            let (body, _, connected) = get(&t, s.port, "/a");
+            assert!(body.ends_with(" /a"), "{body}");
+            assert!(
+                !connected,
+                "{}: the request used the preconnected connection",
+                String::from_utf8_lossy(alpn)
+            );
+            assert_eq!(s.connections.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn requests_of_public_pages_do_not_use_connections_to_local_addresses() {
+        let s = server(&[b"h2"], Duration::ZERO, usize::MAX);
+        let t = client();
+        let send = |public_only: bool| {
+            let head = http::Request::get(format!("https://127.0.0.1:{}/x", s.port))
+                .body(())
+                .unwrap()
+                .into_parts()
+                .0;
+            let mut ex = Exchange::begin();
+            t.send(head, None, public_only, &mut ex)
+                .map(|_| ex.connect.is_some())
+        };
+        assert_eq!(send(false).unwrap(), true, "the first request connects");
+        // 127.0.0.1 is loopback: not reachable from a public page, neither
+        // through the open connection nor a new one.
+        let err = send(true).unwrap_err().to_string();
+        assert!(err.contains("host not found"), "{err}");
+        assert_eq!(send(false).unwrap(), false, "the connection is reused");
+        assert_eq!(s.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_other_address_family_connects_when_the_first_does_not_answer() {
+        // An IPv6 listener; the IPv4 address first goes nowhere (TEST-NET-1:
+        // the connect hangs or fails), so the IPv6 one starts after the
+        // fallback delay, or at once.
+        let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
+            return; // No IPv6 loopback here.
+        };
+        let v6 = listener.local_addr().unwrap();
+        let addrs = ["192.0.2.1:9".parse().unwrap(), v6];
+        let rt = runtime();
+        let started = Instant::now();
+        let tcp = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), connect_tcp(&addrs)).await
+            })
+            .expect("not timed out")
+            .expect("connected");
+        assert_eq!(tcp.peer_addr().unwrap(), v6);
+        assert!(started.elapsed() < FALLBACK_DELAY + Duration::from_secs(1));
     }
 }

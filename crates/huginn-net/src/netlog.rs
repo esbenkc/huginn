@@ -122,4 +122,29 @@ impl Exchange {
             ms(body),
         );
     }
+
+    /// Print the line of a connection opened ahead of a request (only with
+    /// `HUGINN_NET_LOG=1`): `huginn: preconnect: +12.3 h2 dns=1.0
+    /// connect=30.2 https://example.com:443`. `protocol` is `h1`, `h2` or
+    /// `failed`.
+    pub(crate) fn preconnected(
+        &self,
+        protocol: &str,
+        connect: Duration,
+        https: bool,
+        host: &str,
+        port: u16,
+    ) {
+        if !*ENABLED {
+            return;
+        }
+        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        eprintln!(
+            "huginn: preconnect: +{:.1} {protocol} dns={:.1} connect={:.1} {}://{host}:{port}",
+            ms(self.start.duration_since(*ORIGIN)),
+            ms(self.dns),
+            ms(connect),
+            if https { "https" } else { "http" },
+        );
+    }
 }
