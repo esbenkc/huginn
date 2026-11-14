@@ -578,11 +578,17 @@ pub(crate) fn compute(
             }
             tf::Size {
                 width,
-                height: ifc.layout.height(),
+                height: clamped_height(&ifc.layout, style.line_clamp),
             }
         });
+    let shown = style.line_clamp.map_or(usize::MAX, |n| (n as usize).max(1));
     let first = ifc.layout.lines().next().map(|l| l.metrics().baseline);
-    let last = ifc.layout.lines().last().map(|l| l.metrics().baseline);
+    let last = ifc
+        .layout
+        .lines()
+        .take(shown)
+        .last()
+        .map(|l| l.metrics().baseline);
     out.baselines = taffy::Baselines {
         first: first.map(|b| b + inset_top),
         last: last.map(|b| b + inset_top),
@@ -809,6 +815,19 @@ fn break_around_floats(
         }
     }
     br.finish();
+}
+
+/// Height of the laid-out lines. With `line-clamp: N` and more than N
+/// lines, the box ends after line N (CSS Overflow 4; Chrome's
+/// `-webkit-line-clamp`). Later lines still paint unless `overflow` clips
+/// them.
+fn clamped_height(layout: &parley::Layout<Brush>, clamp: Option<u32>) -> f32 {
+    match clamp {
+        Some(n) if layout.len() > n as usize => layout
+            .get((n as usize).max(1) - 1)
+            .map_or(layout.height(), |l| l.metrics().block_max_coord),
+        _ => layout.height(),
+    }
 }
 
 /// Does this `white-space` value allow soft wraps?

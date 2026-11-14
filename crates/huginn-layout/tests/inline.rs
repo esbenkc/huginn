@@ -365,3 +365,24 @@ fn empty_textarea_shows_its_placeholder_in_grey() {
     let (runs, all_grey) = grey("<textarea placeholder='Search issues'>typed</textarea>");
     assert!(runs >= 1 && !all_grey, "a value hides the placeholder");
 }
+
+#[test]
+fn line_clamp_ends_the_box_after_n_lines() {
+    // Utility CSS clamps with the -webkit- names; Chrome reads them as
+    // `line-clamp`. Four 20px lines, clamped to two: the box is 40px tall,
+    // and the block after it moves up. Without a clamp it stays 80px.
+    let (doc, tree) = layout(
+        "<!DOCTYPE html><style>body{margin:0} p{margin:0;width:50px;font:20px/20px monospace}
+        .c{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}</style>
+        <p class=c>aa bb cc dd</p><div>x</div><span><p>aa bb cc dd</p></span>",
+    );
+    let clamped = rect(&doc, &tree, "p");
+    assert_eq!(clamped.height, 40.0, "{clamped:?}");
+    assert_eq!(rect(&doc, &tree, "div").y, 40.0);
+    // A two-line text under a clamp of two keeps its height.
+    let (doc, tree) = layout(
+        "<!DOCTYPE html><style>body{margin:0} p{margin:0;width:50px;font:20px/20px monospace;-webkit-line-clamp:3}</style>
+        <p>aa bb</p>",
+    );
+    assert_eq!(rect(&doc, &tree, "p").height, 40.0);
+}

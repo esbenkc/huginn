@@ -903,6 +903,10 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
             .then(|| clip_rect(&effects.clip))
             .flatten()
         }),
+        line_clamp: match &bx.line_clamp.max_lines.lines {
+            generics::Optional::Some(n) => Some(n.0.max(1) as u32),
+            generics::Optional::None => None,
+        },
         filter: filters(s, &effects.filter.0),
         backdrop_filter: filters(s, &effects.backdrop_filter.0),
         mix_blend_mode: blend_mode(effects.mix_blend_mode),

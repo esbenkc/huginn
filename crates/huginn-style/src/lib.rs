@@ -238,6 +238,9 @@ pub struct ComputedStyle {
     /// An absolutely positioned box without `clip-path` gets its legacy
     /// `clip: rect()` here, as an `Inset`.
     pub clip_path: Option<Arc<ClipPath>>,
+    /// `line-clamp` (also `-webkit-line-clamp`): keep only the first N
+    /// lines of a block container's inline content. `None` = `none`.
+    pub line_clamp: Option<u32>,
     /// `None` = `filter: none`. Applied left to right. A list of identity
     /// functions (`blur(0)`) is kept: it still makes a stacking context.
     /// `url()` filters do not parse (Stylo's servo build).
@@ -349,6 +352,7 @@ impl Default for ComputedStyle {
             fill: Some(Color::BLACK),
             stroke: None,
             clip_path: None,
+            line_clamp: None,
             filter: None,
             backdrop_filter: None,
             mix_blend_mode: BlendMode::Normal,
@@ -997,6 +1001,23 @@ mod tests {
                 ][..]
             )
         );
+    }
+
+    #[test]
+    fn webkit_line_clamp_and_backdrop_filter_are_aliases() {
+        // Chrome reads the -webkit- names as `line-clamp` and
+        // `backdrop-filter`; Stylo's servo build has no such names. Only
+        // property names are renamed: not a class or a custom property.
+        let css = ".c { -webkit-line-clamp: 3; -webkit-backdrop-filter: blur(4px) } \
+                   .-webkit-line-clamp { --x-webkit-line-clamp: 2 }";
+        let html = "<div id=a class=c></div><div id=b class=-webkit-line-clamp></div>";
+        let a = style_of(css, html, "a");
+        assert_eq!(a.line_clamp, Some(3));
+        assert_eq!(
+            a.backdrop_filter.as_deref(),
+            Some(&[FilterFunction::Blur(4.0)][..])
+        );
+        assert_eq!(style_of(css, html, "b").line_clamp, None);
     }
 
     // CSS Shadow Parts: `::part()` rules in the host's tree style elements
