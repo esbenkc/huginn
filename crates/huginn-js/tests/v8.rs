@@ -462,71 +462,152 @@ fn delay_server() -> u16 {
     port
 }
 
+/// An HTTP server on 127.0.0.1 that holds every answer until the test calls
+/// `release`: `/<text>` answers `text`, readable by other origins. It counts
+/// the requests that arrived and the answers it sent, so a test can prove
+/// that requests are in flight together by order, not by time. A held
+/// request is answered anyway after 20 s, so a broken engine fails the test
+/// instead of hanging it.
+struct HeldServer {
+    port: u16,
+    state: Arc<(parking_lot::Mutex<Held>, parking_lot::Condvar)>,
+}
+
+#[derive(Default)]
+struct Held {
+    arrived: usize,
+    answered: usize,
+    released: bool,
+}
+
+impl HeldServer {
+    fn start() -> HeldServer {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = Arc::new((
+            parking_lot::Mutex::new(Held::default()),
+            parking_lot::Condvar::new(),
+        ));
+        let shared = state.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    use std::io::{BufRead, BufReader, Write};
+                    let mut r = BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    let _ = r.read_line(&mut first);
+                    let mut line = String::new();
+                    while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        line.clear();
+                    }
+                    let path = first.split_whitespace().nth(1).unwrap_or("/");
+                    let text = path[1..].to_owned();
+                    {
+                        let (held, changed) = &*shared;
+                        let mut h = held.lock();
+                        h.arrived += 1;
+                        changed.notify_all();
+                        let end = Instant::now() + Duration::from_secs(20);
+                        while !h.released && !changed.wait_until(&mut h, end).timed_out() {}
+                        h.answered += 1;
+                    }
+                    let mut s = stream;
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                });
+            }
+        });
+        HeldServer { port, state }
+    }
+
+    /// Wait until `n` requests have arrived, at most 10 s. Returns how many
+    /// did.
+    fn wait_for_requests(&self, n: usize) -> usize {
+        let (held, changed) = &*self.state;
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut h = held.lock();
+        while h.arrived < n && !changed.wait_until(&mut h, end).timed_out() {}
+        h.arrived
+    }
+
+    fn answered(&self) -> usize {
+        self.state.0.lock().answered
+    }
+
+    /// Answer the held requests and every later one.
+    fn release(&self) {
+        let (held, changed) = &*self.state;
+        held.lock().released = true;
+        changed.notify_all();
+    }
+}
+
 #[test]
 fn fetches_started_together_are_in_flight_together() {
-    let port = delay_server();
+    let server = HeldServer::start();
     let mut p = Page::new("<body></body>");
-    let t = Instant::now();
     p.run(&format!(
         r#"
-        const base = 'http://127.0.0.1:{port}/400/';
+        const base = 'http://127.0.0.1:{}/';
         Promise.all([0, 1, 2, 3].map(i => fetch(base + i).then(r => r.text())))
             .then(t => {{ document.body.id = 'got' + t.join(''); }});
-        "#
+        "#,
+        server.port
     ))
     .unwrap();
-    // The script does not wait for the network.
-    assert!(
-        t.elapsed() < Duration::from_millis(300),
-        "{:?}",
-        t.elapsed()
-    );
+    // The script returned before the server answered anything: it does not
+    // wait for the network.
+    assert_eq!(server.answered(), 0);
     assert_eq!(p.engine.requests_in_flight(), 4);
+    // All four reach the server while none is answered, so they are in
+    // flight together: one after the other, only the first would arrive.
+    assert_eq!(server.wait_for_requests(4), 4);
+    server.release();
     p.settle(0.0);
-    let took = t.elapsed();
     assert!(
         p.doc.element_by_id("got0123").is_some(),
         "{}",
         p.body_html()
     );
     assert_eq!(p.engine.requests_in_flight(), 0);
-    // One after the other, the four responses take 1.6 s.
-    assert!(took < Duration::from_millis(1100), "{took:?}");
 }
 
 #[test]
 fn async_xhrs_sent_together_are_in_flight_together() {
-    let port = delay_server();
+    let server = HeldServer::start();
     let mut p = Page::new("<body></body>");
-    let t = Instant::now();
     p.run(&format!(
         r#"
         let text = '';
         for (let i = 0; i < 4; i++) {{
             const x = new XMLHttpRequest();
-            x.open('GET', 'http://127.0.0.1:{port}/400/' + i);
+            x.open('GET', 'http://127.0.0.1:{}/' + i);
             x.onload = () => {{
                 text += x.responseText;
                 if (text.length === 4) document.body.id = 'got' + [...text].sort().join('');
             }};
             x.send();
         }}
-        "#
+        "#,
+        server.port
     ))
     .unwrap();
-    assert!(
-        t.elapsed() < Duration::from_millis(300),
-        "{:?}",
-        t.elapsed()
-    );
+    // send() returned before the server answered anything.
+    assert_eq!(server.answered(), 0);
+    // All four reach the server while none is answered, so they are in
+    // flight together: one after the other, only the first would arrive.
+    assert_eq!(server.wait_for_requests(4), 4);
+    server.release();
     p.settle(0.0);
-    let took = t.elapsed();
     assert!(
         p.doc.element_by_id("got0123").is_some(),
         "{}",
         p.body_html()
     );
-    assert!(took < Duration::from_millis(1100), "{took:?}");
 }
 
 #[test]
