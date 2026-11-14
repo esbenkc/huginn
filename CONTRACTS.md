@@ -229,7 +229,7 @@ CSS initial values with 16px serif, `ComputedStyle::inherit_from(&parent)`,
 | flex/align | `flex_direction`, `flex_wrap`, `flex_grow`, `flex_shrink`, `flex_basis`, `order`, `justify_content`, `align_items`, `align_self`, `align_content`, `justify_items`, `justify_self` (`Alignment`), `row_gap`, `column_gap` |
 | grid | `grid_template_columns`, `grid_template_rows: Option<Arc<[GridTrack]>>` (`None` = `none`), `grid_template_areas: Option<Arc<[GridArea]>>`, `grid_auto_columns`, `grid_auto_rows: Option<Arc<[TrackSize]>>` (`None` = `auto`), `grid_auto_flow: GridAutoFlow`, `grid_column`, `grid_row: (GridLine, GridLine)` (start, end) |
 | tables | `border_collapse: BorderCollapse` (inherited), `border_spacing: (f32, f32)` (h, v px, inherited), `table_layout: TableLayout`, `caption_side: CaptionSide` (inherited) |
-| effects | `box_shadow: Option<Arc<[BoxShadow]>>`, `transform: Option<Arc<[TransformOp]>>` (2D, left to right), `transform_origin: (LengthPercentage, LengthPercentage)`, `outline_width`, `outline_style: BorderStyle`, `outline_color`, `outline_offset`, `object_fit: ObjectFit`, `text_overflow: TextOverflow`, `clip_path: Option<Arc<ClipPath>>` (border-box relative; `None` also for `url()`) |
+| effects | `box_shadow: Option<Arc<[BoxShadow]>>`, `transform: Option<Arc<[TransformOp]>>` (2D, left to right), `transform_origin: (LengthPercentage, LengthPercentage)`, `outline_width`, `outline_style: BorderStyle`, `outline_color`, `outline_offset`, `object_fit: ObjectFit`, `text_overflow: TextOverflow`, `clip_path: Option<Arc<ClipPath>>` (border-box relative; `None` also for `url()`), `filter`, `backdrop_filter: Option<Arc<[FilterFunction]>>` (`None` = `none`; left to right; identity lists such as `blur(0)` are kept; `url()` does not parse), `mix_blend_mode: BlendMode`, `isolation: Isolation` |
 | text (inherited) | `color`, `font_family: Arc<str>` (the list as written), `font_size`, `font_weight` (1..=1000), `font_style`, `line_height: LineHeight`, `text_align` (incl. `WebkitCenter/Left/Right`: also aligns block children), `text_indent`, `text_transform`, `white_space`, `text_wrap_balance` (`text-wrap-style: balance`), `letter_spacing`, `word_spacing`, `list_style_type`, `list_style_position`, `font_feature_settings: Option<Arc<[FontFeature]>>` (`None` = `normal`) |
 | SVG paint (inherited) | `fill: Option<Color>` (`None` = `none`, initial black), `stroke: Option<Color>` (initial `None`) |
 | decoration | `text_decoration_line: TextDecorationLine`, `text_decoration_color`, `vertical_align: VerticalAlign` |
@@ -264,7 +264,12 @@ lines, end exclusive), `GridLine { Auto, Line(i16), Span(u16), Named(Arc<str>)
 Corners<LP> }, Circle { radius: ShapeRadius, center }, Ellipse { radius_x,
 radius_y, center }, Polygon { even_odd, points: Arc<[(LP, LP)]> } }`,
 `ShapeRadius { Length(LP), ClosestSide, FarthestSide, ClosestCorner,
-FarthestCorner }`, `FontFeature { tag: [u8; 4], value: u32 }`.
+FarthestCorner }`, `FontFeature { tag: [u8; 4], value: u32 }`,
+`FilterFunction { Blur(std dev px), Brightness, Contrast, Saturate (factor),
+Grayscale, Invert, Sepia, Opacity (0..=1), HueRotate(deg), DropShadow {
+offset_x, offset_y, blur (std dev px), color } }` (`is_identity()`),
+`BlendMode { Normal, Multiply, .., Luminosity, PlusLighter }` (the
+`mix-blend-mode` keywords), `Isolation { Auto, Isolate }`.
 
 Selector queries for huginn-js (`src/query.rs`, on the same matcher as the cascade).
 The selector is matched against the whole document; results are in tree order;
@@ -449,6 +454,12 @@ pub enum DisplayItem<'a> {
     PushMask { clip: Rect, tile: Rect, repeat: BackgroundRepeat, source: MaskSource<'a> }, PopMask,
                                                             // alpha of an image or gradient tile, clipped to clip
     PushTransform([f32; 6]), PopTransform,                  // affine [a b c d e f], document coordinates
+    PushFilter(&'a [FilterFunction]), PopFilter,            // `filter`: the group, filtered left to right
+    PushBlend(BlendMode), PopBlend,                         // `mix-blend-mode`; Normal = an isolated group
+    BackdropFilter { rect: Rect, radii: [f32; 4], filters: &'a [FilterFunction], own_layers: u8 },
+                                                            // `backdrop-filter`: what is below, back to the
+                                                            // nearest enclosing layer that is not one of the
+                                                            // element's `own_layers`, clipped to rect
 }
 pub enum ResolvedGradient {
     Linear { start: (f32, f32), end: (f32, f32) },
@@ -460,7 +471,9 @@ pub struct DisplayList<'a> {
     pub page_size: Size,
 }
 /// Paint order: CSS 2.1 appendix E. A stacking context (the root; positioned
-/// or flex/grid items with a z-index; opacity < 1; transform; fixed/sticky)
+/// or flex/grid items with a z-index; opacity < 1; transform; mask;
+/// clip-path; filter; backdrop-filter; mix-blend-mode; isolation: isolate;
+/// fixed/sticky)
 /// paints its background and border, child contexts with negative z-index,
 /// in-flow block backgrounds, floats, inline content, then positioned
 /// descendants and child contexts with z-index >= 0 (by z-index, then tree
@@ -468,6 +481,10 @@ pub struct DisplayList<'a> {
 /// pseudo stacking contexts. Overflow clips follow the containing-block
 /// chain (abspos escapes clips of non-positioned ancestors, fixed escapes all).
 /// `cull` drops boxes outside the region (pass the viewport for screenshots).
+/// Around a stacking context's content, outside in: transform, clip-path,
+/// blend (or an isolation group, if a child context blends), opacity, mask,
+/// the backdrop filter, the filter. A filter list of identity functions
+/// (`blur(0)`) adds no item.
 pub fn build_display_list<'a>(tree: &'a LayoutTree, cull: Option<Rect>) -> DisplayList<'a>;
 
 pub struct RgbaImage { pub width: u32, pub height: u32, pub data: Vec<u8> }  // straight alpha, row-major

@@ -181,6 +181,62 @@ fn video_poster_is_drawn_at_its_size_and_contained() {
 }
 
 #[test]
+fn css_filters_blending_and_backdrop_filters_match_chrome() {
+    let dir = out_dir("filters");
+    let page = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/filters.html");
+    let png_path = dir.join("filters.png");
+    render(&page, &png_path, 800, 300);
+    let (w, _, rgba) = decode_png(&png_path);
+    let px = |x: u32, y: u32| {
+        let i = ((y * w + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2]]
+    };
+    // Expected values are Chrome's (headless, 800x300, sRGB), one channel
+    // step of tolerance for rounding.
+    let check = |x: u32, y: u32, want: [u8; 3], what: &str| {
+        let got = px(x, y);
+        let off = got
+            .iter()
+            .zip(want)
+            .map(|(&g, w)| g.abs_diff(w))
+            .max()
+            .unwrap_or(0);
+        assert!(off <= 3, "{what} at ({x}, {y}): {got:?}, Chrome {want:?}");
+    };
+    // White content of a mix-blend-mode: difference layer.
+    check(150, 50, [255, 255, 255], "difference over black");
+    check(260, 50, [5, 55, 215], "difference over the photo");
+    // A half-white ::after in its own difference layer inside that layer.
+    check(70, 128, [127, 127, 127], "nested difference");
+    // The blog's terminal theme filter chain on an image, and brightness().
+    check(
+        400,
+        40,
+        [96, 230, 84],
+        "sepia hue-rotate brightness contrast",
+    );
+    check(
+        370,
+        20,
+        [149, 94, 159],
+        "sepia hue-rotate brightness contrast",
+    );
+    check(510, 30, [43, 97, 216], "brightness(1.08)");
+    // blur(8px) reaches past the box.
+    check(70, 210, [0, 0, 0], "blur center");
+    check(40, 210, [121, 121, 121], "blur at the edge");
+    // drop-shadow() follows the alpha: a ring casts a ring.
+    check(185, 200, [255, 0, 0], "shadow of the ring");
+    check(200, 200, [255, 255, 255], "no shadow in the hole");
+    // backdrop-filter over the photo, inside the rounded border box only.
+    check(400, 200, [255, 212, 51], "frosted glass");
+    check(365, 175, [88, 144, 255], "frosted glass edge");
+    // An SVG feDropShadow on a path.
+    check(545, 175, [236, 236, 236], "svg drop shadow");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn avif_images_are_decoded_and_drawn() {
     let dir = out_dir("avif");
     let page = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/avif.html");

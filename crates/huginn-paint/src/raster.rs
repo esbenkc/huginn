@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use huginn_layout::Rect;
-use huginn_style::{BackgroundRepeat, BorderStyle, Color, Edges};
+use huginn_style::{BackgroundRepeat, BlendMode, BorderStyle, Color, Edges, FilterFunction};
 use vello_cpu::kurbo::{self, Affine, BezPath, RoundedRect, RoundedRectRadii, Shape};
 use vello_cpu::peniko::{self, Extend, Fill, ImageQuality, ImageSampler};
 use vello_cpu::{Image, ImageSource, Mask, Pixmap, RenderContext, Resources};
 
+use crate::filter;
 use crate::{DisplayItem, DisplayList, MaskSource, ResolvedGradient, RgbaImage};
 
 fn color(c: Color) -> peniko::Color {
@@ -64,7 +65,12 @@ fn snap(t: &Affine, r: Rect) -> Rect {
 /// What a Push item put on the render context, so Pop undoes the right thing.
 enum Pushed {
     Clip,
-    Layer,
+    /// A layer (opacity, mask, blend) pushed by the item at `start`, under
+    /// `transform`. It is a backdrop root for `backdrop-filter`.
+    Layer {
+        start: usize,
+        transform: Affine,
+    },
     /// The transform before the push.
     Transform(Affine),
 }
@@ -72,7 +78,7 @@ enum Pushed {
 fn pop(ctx: &mut RenderContext, stack: &mut Vec<Pushed>) {
     match stack.pop() {
         Some(Pushed::Clip) => ctx.pop_clip(),
-        Some(Pushed::Layer) => ctx.pop_layer(),
+        Some(Pushed::Layer { .. }) => ctx.pop_layer(),
         Some(Pushed::Transform(t)) => ctx.set_transform(t),
         None => {}
     }
@@ -102,271 +108,17 @@ pub(crate) fn rasterize(
         * Affine::translate((-f64::from(region.x), -f64::from(region.y)));
     ctx.set_transform(base);
 
-    let mut stack: Vec<Pushed> = Vec::new();
-    let mut mips = Mips::default();
-    for item in &list.items {
-        match item {
-            DisplayItem::Rect {
-                rect,
-                radii,
-                color: c,
-            } => {
-                let rect = snap(ctx.transform(), *rect);
-                ctx.set_paint(color(*c));
-                if has_radius(*radii) {
-                    ctx.set_fill_rule(Fill::NonZero);
-                    ctx.fill_path(&rounded(rect, *radii));
-                } else {
-                    ctx.fill_rect(&krect(rect));
-                }
-            }
-            DisplayItem::Border {
-                rect,
-                widths,
-                colors,
-                styles,
-                radii,
-            } => {
-                let rect = snap(ctx.transform(), *rect);
-                draw_border(&mut ctx, rect, *widths, *colors, *styles, *radii)
-            }
-            DisplayItem::Glyphs {
-                run,
-                glyphs,
-                coords,
-            } => {
-                // Like Skia (Chrome) for horizontal text: the baseline sits on a
-                // whole device pixel, x keeps its subpixel position. A baseline
-                // between pixels blurs every horizontal stem.
-                let [_, ky, kx, sy, _, ty] = ctx.transform().as_coeffs();
-                let snap_y = ky == 0.0 && kx == 0.0 && sy > 0.0;
-                ctx.set_paint(color(run.color));
-                let mut builder = ctx
-                    .glyph_run(resources, &run.font)
-                    .font_size(run.font_size)
-                    .normalized_coords(coords)
-                    .hint(false);
-                if let Some(deg) = run.skew {
-                    builder = builder
-                        .glyph_transform(Affine::skew(f64::from(deg).to_radians().tan(), 0.0));
-                }
-                if run.embolden {
-                    let a = f64::from(fake_bold_outset(run.font_size));
-                    builder = builder
-                        .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(a, a)));
-                }
-                // Glyph rendering errors (e.g. unsupported bitmap formats) skip the run.
-                let _ = builder.fill_glyphs(glyphs.iter().map(|g| vello_cpu::Glyph {
-                    id: g.id,
-                    x: g.x,
-                    y: if snap_y {
-                        (((f64::from(g.y) * sy + ty + 0.5).floor() - ty) / sy) as f32
-                    } else {
-                        g.y
-                    },
-                }));
-            }
-            DisplayItem::Image { rect, image } => {
-                let rect = &snap(ctx.transform(), *rect);
-                if rect.width <= 0.0 || rect.height <= 0.0 {
-                    continue;
-                }
-                let (pixmap, quality) =
-                    mips.get(image.pixmap(), rect.width * scale, rect.height * scale);
-                let sx = f64::from(rect.width) / f64::from(pixmap.width());
-                let sy = f64::from(rect.height) / f64::from(pixmap.height());
-                let mut paint = image_paint(&pixmap, Extend::Pad);
-                if let peniko::Brush::Image(img) = &mut paint {
-                    img.sampler.quality = quality;
-                }
-                ctx.set_paint(paint);
-                ctx.set_paint_transform(
-                    Affine::translate((f64::from(rect.x), f64::from(rect.y)))
-                        * Affine::scale_non_uniform(sx, sy),
-                );
-                ctx.fill_rect(&krect(*rect));
-                ctx.reset_paint_transform();
-            }
-            DisplayItem::TiledImage {
-                clip,
-                origin,
-                image,
-                repeat,
-            } => {
-                let (rx, ry) = match repeat {
-                    BackgroundRepeat::Repeat => (true, true),
-                    BackgroundRepeat::RepeatX => (true, false),
-                    BackgroundRepeat::RepeatY => (false, true),
-                    BackgroundRepeat::NoRepeat => (false, false),
-                };
-                let mut area = *clip;
-                if !rx {
-                    area.x = area.x.max(origin.x);
-                    area.width = (clip.right().min(origin.right()) - area.x).max(0.0);
-                }
-                if !ry {
-                    area.y = area.y.max(origin.y);
-                    area.height = (clip.bottom().min(origin.bottom()) - area.y).max(0.0);
-                }
-                if area.width <= 0.0 || area.height <= 0.0 {
-                    continue;
-                }
-                if origin.width <= 0.0 || origin.height <= 0.0 {
-                    continue;
-                }
-                // `origin` is one tile: its size scales the image (background-size).
-                let (pixmap, quality) =
-                    mips.get(image.pixmap(), origin.width * scale, origin.height * scale);
-                let mut paint = image_paint(&pixmap, Extend::Repeat);
-                if let peniko::Brush::Image(img) = &mut paint {
-                    img.sampler.x_extend = if rx { Extend::Repeat } else { Extend::Pad };
-                    img.sampler.y_extend = if ry { Extend::Repeat } else { Extend::Pad };
-                    img.sampler.quality = quality;
-                }
-                ctx.set_paint(paint);
-                ctx.set_paint_transform(
-                    Affine::translate((f64::from(origin.x), f64::from(origin.y)))
-                        * Affine::scale_non_uniform(
-                            f64::from(origin.width) / f64::from(pixmap.width()),
-                            f64::from(origin.height) / f64::from(pixmap.height()),
-                        ),
-                );
-                ctx.fill_rect(&krect(area));
-                ctx.reset_paint_transform();
-            }
-            DisplayItem::BoxShadow {
-                rect,
-                radii,
-                offset,
-                blur,
-                spread,
-                color: c,
-                inset,
-            } => draw_box_shadow(&mut ctx, *rect, *radii, *offset, *blur, *spread, *c, *inset),
-            DisplayItem::Gradient {
-                clip,
-                gradient,
-                stops,
-                repeating,
-            } => {
-                if clip.width <= 0.0 || clip.height <= 0.0 {
-                    continue;
-                }
-                let extend = if *repeating {
-                    Extend::Repeat
-                } else {
-                    Extend::Pad
-                };
-                let stops: Vec<peniko::ColorStop> =
-                    stops.iter().map(|&(o, c)| (o, color(c)).into()).collect();
-                let g = match *gradient {
-                    ResolvedGradient::Linear { start, end } => peniko::Gradient::new_linear(
-                        (f64::from(start.0), f64::from(start.1)),
-                        (f64::from(end.0), f64::from(end.1)),
-                    ),
-                    // A circle around the origin; the paint transform moves it to
-                    // the center and squashes it into an ellipse.
-                    ResolvedGradient::Radial {
-                        start_radius,
-                        end_radius,
-                        ..
-                    } => peniko::Gradient::new_two_point_radial(
-                        (0.0, 0.0),
-                        start_radius,
-                        (0.0, 0.0),
-                        end_radius,
-                    ),
-                }
-                .with_extend(extend)
-                .with_stops(stops.as_slice());
-                ctx.set_paint(g);
-                if let ResolvedGradient::Radial {
-                    center, y_scale, ..
-                } = *gradient
-                {
-                    ctx.set_paint_transform(
-                        Affine::translate((f64::from(center.0), f64::from(center.1)))
-                            * Affine::scale_non_uniform(1.0, f64::from(y_scale)),
-                    );
-                }
-                ctx.fill_rect(&krect(*clip));
-                ctx.reset_paint_transform();
-            }
-            DisplayItem::PushTransform(m) => {
-                let t = *ctx.transform();
-                ctx.set_transform(t * Affine::new(m.map(f64::from)));
-                stack.push(Pushed::Transform(t));
-            }
-            DisplayItem::PopTransform => pop(&mut ctx, &mut stack),
-            DisplayItem::PushClip { rect, radii } => {
-                // Non-isolated clip: no extra layer to composite.
-                if has_radius(*radii) {
-                    ctx.set_fill_rule(Fill::NonZero);
-                    ctx.push_clip_path(&rounded(*rect, *radii));
-                } else {
-                    ctx.push_clip_rect(&krect(*rect));
-                }
-                stack.push(Pushed::Clip);
-            }
-            DisplayItem::PushClipPath { path, even_odd } => {
-                ctx.set_fill_rule(if *even_odd {
-                    Fill::EvenOdd
-                } else {
-                    Fill::NonZero
-                });
-                ctx.push_clip_path(path);
-                ctx.set_fill_rule(Fill::NonZero);
-                stack.push(Pushed::Clip);
-            }
-            DisplayItem::PushOpacity(o) => {
-                ctx.push_opacity_layer(*o);
-                stack.push(Pushed::Layer);
-            }
-            DisplayItem::PushMask {
-                clip,
-                tile,
-                repeat,
-                source,
-            } => {
-                let t = *ctx.transform();
-                let mask = match source {
-                    MaskSource::Image(image) => {
-                        let (pixmap, _) =
-                            mips.get(image.pixmap(), tile.width * scale, tile.height * scale);
-                        build_mask(t, (w16, h16), *clip, *tile, *repeat, |u, v| {
-                            image_alpha(&pixmap, u, v)
-                        })
-                    }
-                    MaskSource::Gradient {
-                        gradient,
-                        stops,
-                        repeating,
-                    } => build_mask(t, (w16, h16), *clip, *tile, *repeat, |u, v| {
-                        let p = (tile.x + u * tile.width, tile.y + v * tile.height);
-                        gradient_alpha(gradient, stops, *repeating, p)
-                    }),
-                };
-                ctx.push_layer(
-                    Some(&krect(*clip).to_path(0.1)),
-                    None,
-                    None,
-                    Some(mask),
-                    None,
-                );
-                stack.push(Pushed::Layer);
-            }
-            DisplayItem::PopClip | DisplayItem::PopOpacity | DisplayItem::PopMask => {
-                pop(&mut ctx, &mut stack)
-            }
-        }
-    }
-    while !stack.is_empty() {
-        pop(&mut ctx, &mut stack);
-    }
+    let mut r = Raster {
+        resources,
+        mips: Mips::default(),
+        scale,
+        canvas: list.canvas,
+    };
+    r.paint(&mut ctx, (w16, h16), &list.items, true);
 
     let mut pixmap = Pixmap::new(w16, h16);
     ctx.flush();
-    ctx.render(&mut pixmap, resources);
+    ctx.render(&mut pixmap, r.resources);
     RgbaImage {
         width,
         height,
@@ -374,6 +126,663 @@ pub(crate) fn rasterize(
         // same bytes; skip the unpremultiply pass.
         data: pixmap.take_rgba8(peniko::ImageAlphaType::AlphaPremultiplied),
     }
+}
+
+/// State of one raster pass, shared by the page and its offscreen groups.
+struct Raster<'r> {
+    resources: &'r mut Resources,
+    mips: Mips,
+    /// Device px per CSS px.
+    scale: f32,
+    canvas: Color,
+}
+
+impl Raster<'_> {
+    /// Paint `items` (balanced) into `ctx`, which is `size` device px.
+    /// `on_canvas`: `ctx` starts with the canvas color, so it is part of
+    /// any backdrop read here.
+    fn paint(
+        &mut self,
+        ctx: &mut RenderContext,
+        size: (u16, u16),
+        items: &[DisplayItem<'_>],
+        on_canvas: bool,
+    ) {
+        let first_transform = *ctx.transform();
+        let scale = self.scale;
+        let mut stack: Vec<Pushed> = Vec::new();
+        let mut i = 0;
+        while i < items.len() {
+            match &items[i] {
+                DisplayItem::Rect {
+                    rect,
+                    radii,
+                    color: c,
+                } => {
+                    let rect = snap(ctx.transform(), *rect);
+                    ctx.set_paint(color(*c));
+                    if has_radius(*radii) {
+                        ctx.set_fill_rule(Fill::NonZero);
+                        ctx.fill_path(&rounded(rect, *radii));
+                    } else {
+                        ctx.fill_rect(&krect(rect));
+                    }
+                }
+                DisplayItem::Border {
+                    rect,
+                    widths,
+                    colors,
+                    styles,
+                    radii,
+                } => {
+                    let rect = snap(ctx.transform(), *rect);
+                    draw_border(ctx, rect, *widths, *colors, *styles, *radii)
+                }
+                DisplayItem::Glyphs {
+                    run,
+                    glyphs,
+                    coords,
+                } => {
+                    // Like Skia (Chrome) for horizontal text: the baseline sits on a
+                    // whole device pixel, x keeps its subpixel position. A baseline
+                    // between pixels blurs every horizontal stem.
+                    let [_, ky, kx, sy, _, ty] = ctx.transform().as_coeffs();
+                    let snap_y = ky == 0.0 && kx == 0.0 && sy > 0.0;
+                    ctx.set_paint(color(run.color));
+                    let mut builder = ctx
+                        .glyph_run(self.resources, &run.font)
+                        .font_size(run.font_size)
+                        .normalized_coords(coords)
+                        .hint(false);
+                    if let Some(deg) = run.skew {
+                        builder = builder
+                            .glyph_transform(Affine::skew(f64::from(deg).to_radians().tan(), 0.0));
+                    }
+                    if run.embolden {
+                        let a = f64::from(fake_bold_outset(run.font_size));
+                        builder = builder
+                            .font_embolden(glifo::FontEmbolden::new(kurbo::Diagonal2::new(a, a)));
+                    }
+                    // Glyph rendering errors (e.g. unsupported bitmap formats) skip the run.
+                    let _ = builder.fill_glyphs(glyphs.iter().map(|g| vello_cpu::Glyph {
+                        id: g.id,
+                        x: g.x,
+                        y: if snap_y {
+                            (((f64::from(g.y) * sy + ty + 0.5).floor() - ty) / sy) as f32
+                        } else {
+                            g.y
+                        },
+                    }));
+                }
+                DisplayItem::Image { rect, image } => {
+                    let rect = &snap(ctx.transform(), *rect);
+                    if rect.width > 0.0 && rect.height > 0.0 {
+                        let (pixmap, quality) =
+                            self.mips
+                                .get(image.pixmap(), rect.width * scale, rect.height * scale);
+                        let sx = f64::from(rect.width) / f64::from(pixmap.width());
+                        let sy = f64::from(rect.height) / f64::from(pixmap.height());
+                        let mut paint = image_paint(&pixmap, Extend::Pad);
+                        if let peniko::Brush::Image(img) = &mut paint {
+                            img.sampler.quality = quality;
+                        }
+                        ctx.set_paint(paint);
+                        ctx.set_paint_transform(
+                            Affine::translate((f64::from(rect.x), f64::from(rect.y)))
+                                * Affine::scale_non_uniform(sx, sy),
+                        );
+                        ctx.fill_rect(&krect(*rect));
+                        ctx.reset_paint_transform();
+                    }
+                }
+                DisplayItem::TiledImage {
+                    clip,
+                    origin,
+                    image,
+                    repeat,
+                } => self.tiled_image(ctx, *clip, *origin, image, *repeat),
+                DisplayItem::BoxShadow {
+                    rect,
+                    radii,
+                    offset,
+                    blur,
+                    spread,
+                    color: c,
+                    inset,
+                } => draw_box_shadow(ctx, *rect, *radii, *offset, *blur, *spread, *c, *inset),
+                DisplayItem::Gradient {
+                    clip,
+                    gradient,
+                    stops,
+                    repeating,
+                } => draw_gradient(ctx, *clip, gradient, stops, *repeating),
+                DisplayItem::PushTransform(m) => {
+                    let t = *ctx.transform();
+                    ctx.set_transform(t * Affine::new(m.map(f64::from)));
+                    stack.push(Pushed::Transform(t));
+                }
+                DisplayItem::PushClip { rect, radii } => {
+                    // Non-isolated clip: no extra layer to composite.
+                    if has_radius(*radii) {
+                        ctx.set_fill_rule(Fill::NonZero);
+                        ctx.push_clip_path(&rounded(*rect, *radii));
+                    } else {
+                        ctx.push_clip_rect(&krect(*rect));
+                    }
+                    stack.push(Pushed::Clip);
+                }
+                DisplayItem::PushClipPath { path, even_odd } => {
+                    ctx.set_fill_rule(if *even_odd {
+                        Fill::EvenOdd
+                    } else {
+                        Fill::NonZero
+                    });
+                    ctx.push_clip_path(path);
+                    ctx.set_fill_rule(Fill::NonZero);
+                    stack.push(Pushed::Clip);
+                }
+                DisplayItem::PushOpacity(o) => {
+                    ctx.push_opacity_layer(*o);
+                    stack.push(Pushed::Layer {
+                        start: i,
+                        transform: *ctx.transform(),
+                    });
+                }
+                DisplayItem::PushBlend(mode) => {
+                    ctx.push_layer(None, Some(blend_mode(*mode)), None, None, None);
+                    stack.push(Pushed::Layer {
+                        start: i,
+                        transform: *ctx.transform(),
+                    });
+                }
+                DisplayItem::PushMask {
+                    clip,
+                    tile,
+                    repeat,
+                    source,
+                } => {
+                    let t = *ctx.transform();
+                    let mask = match source {
+                        MaskSource::Image(image) => {
+                            let (pixmap, _) = self.mips.get(
+                                image.pixmap(),
+                                tile.width * scale,
+                                tile.height * scale,
+                            );
+                            build_mask(t, size, *clip, *tile, *repeat, |u, v| {
+                                image_alpha(&pixmap, u, v)
+                            })
+                        }
+                        MaskSource::Gradient {
+                            gradient,
+                            stops,
+                            repeating,
+                        } => build_mask(t, size, *clip, *tile, *repeat, |u, v| {
+                            let p = (tile.x + u * tile.width, tile.y + v * tile.height);
+                            gradient_alpha(gradient, stops, *repeating, p)
+                        }),
+                    };
+                    ctx.push_layer(
+                        Some(&krect(*clip).to_path(0.1)),
+                        None,
+                        None,
+                        Some(mask),
+                        None,
+                    );
+                    stack.push(Pushed::Layer {
+                        start: i,
+                        transform: t,
+                    });
+                }
+                DisplayItem::PushFilter(filters) => {
+                    let end = matching_pop_filter(items, i);
+                    self.filter_group(ctx, size, &items[i + 1..end], filters);
+                    i = end + 1;
+                    continue;
+                }
+                DisplayItem::BackdropFilter {
+                    rect,
+                    radii,
+                    filters,
+                    own_layers,
+                } => {
+                    // The backdrop root: the innermost layer that is not
+                    // the element's own, else the start of `items`.
+                    let root = stack
+                        .iter()
+                        .rev()
+                        .filter_map(|p| match p {
+                            Pushed::Layer { start, transform } => Some((*start, *transform)),
+                            _ => None,
+                        })
+                        .nth(usize::from(*own_layers));
+                    let (from, t0, canvas) = match root {
+                        Some((start, t)) => (start + 1, t, false),
+                        None => (0, first_transform, on_canvas),
+                    };
+                    let backdrop = &items[from..i];
+                    self.backdrop_filter(ctx, size, backdrop, t0, canvas, *rect, *radii, filters);
+                }
+                DisplayItem::PopClip
+                | DisplayItem::PopOpacity
+                | DisplayItem::PopMask
+                | DisplayItem::PopBlend
+                | DisplayItem::PopTransform
+                | DisplayItem::PopFilter => pop(ctx, &mut stack),
+            }
+            i += 1;
+        }
+        while !stack.is_empty() {
+            pop(ctx, &mut stack);
+        }
+    }
+
+    fn tiled_image(
+        &mut self,
+        ctx: &mut RenderContext,
+        clip: Rect,
+        origin: Rect,
+        image: &huginn_net::DecodedImage,
+        repeat: BackgroundRepeat,
+    ) {
+        let (rx, ry) = match repeat {
+            BackgroundRepeat::Repeat => (true, true),
+            BackgroundRepeat::RepeatX => (true, false),
+            BackgroundRepeat::RepeatY => (false, true),
+            BackgroundRepeat::NoRepeat => (false, false),
+        };
+        let mut area = clip;
+        if !rx {
+            area.x = area.x.max(origin.x);
+            area.width = (clip.right().min(origin.right()) - area.x).max(0.0);
+        }
+        if !ry {
+            area.y = area.y.max(origin.y);
+            area.height = (clip.bottom().min(origin.bottom()) - area.y).max(0.0);
+        }
+        if area.width <= 0.0 || area.height <= 0.0 {
+            return;
+        }
+        if origin.width <= 0.0 || origin.height <= 0.0 {
+            return;
+        }
+        // `origin` is one tile: its size scales the image (background-size).
+        let (pixmap, quality) = self.mips.get(
+            image.pixmap(),
+            origin.width * self.scale,
+            origin.height * self.scale,
+        );
+        let mut paint = image_paint(&pixmap, Extend::Repeat);
+        if let peniko::Brush::Image(img) = &mut paint {
+            img.sampler.x_extend = if rx { Extend::Repeat } else { Extend::Pad };
+            img.sampler.y_extend = if ry { Extend::Repeat } else { Extend::Pad };
+            img.sampler.quality = quality;
+        }
+        ctx.set_paint(paint);
+        ctx.set_paint_transform(
+            Affine::translate((f64::from(origin.x), f64::from(origin.y)))
+                * Affine::scale_non_uniform(
+                    f64::from(origin.width) / f64::from(pixmap.width()),
+                    f64::from(origin.height) / f64::from(pixmap.height()),
+                ),
+        );
+        ctx.fill_rect(&krect(area));
+        ctx.reset_paint_transform();
+    }
+
+    /// Paint `items` into an offscreen pixmap, run `filters` over it and
+    /// draw the result. The pixmap covers what the items paint, grown by
+    /// the filter's reach, within reach of what `ctx` shows.
+    fn filter_group(
+        &mut self,
+        ctx: &mut RenderContext,
+        size: (u16, u16),
+        items: &[DisplayItem<'_>],
+        filters: &[FilterFunction],
+    ) {
+        let t = *ctx.transform();
+        let Some(content) = content_bounds(items, t) else {
+            return;
+        };
+        let (rx, ry) = device_reach(&t, filter::reach(filters));
+        let target = device_rect(size);
+        let Some(area) = pixel_area(content.inflate(rx, ry).intersect(target.inflate(rx, ry)))
+        else {
+            return;
+        };
+        let mut sub = RenderContext::new(area.2, area.3);
+        sub.set_transform(Affine::translate((-f64::from(area.0), -f64::from(area.1))) * t);
+        self.paint(&mut sub, (area.2, area.3), items, false);
+        let mut pm = Pixmap::new(area.2, area.3);
+        sub.flush();
+        sub.render(&mut pm, self.resources);
+        drop(sub);
+        let [a, b, c, d, _, _] = t.as_coeffs();
+        filter::apply(&mut pm, filters, [a, b, c, d], filter::Edge::Transparent);
+        draw_device_pixmap(ctx, pm, area, target);
+    }
+
+    /// `backdrop-filter` (Filter Effects 2): paint `backdrop` (the items
+    /// since the backdrop root, under `t0`) again offscreen, clipped to the
+    /// element's border box, run `filters` over it with mirrored edges and
+    /// draw it inside the border box (with its radii).
+    #[allow(clippy::too_many_arguments)]
+    fn backdrop_filter(
+        &mut self,
+        ctx: &mut RenderContext,
+        size: (u16, u16),
+        backdrop: &[DisplayItem<'_>],
+        t0: Affine,
+        canvas: bool,
+        rect: Rect,
+        radii: [f32; 4],
+        filters: &[FilterFunction],
+    ) {
+        let t = *ctx.transform();
+        let target = device_rect(size);
+        let Some(area) = pixel_area(t.transform_rect_bbox(krect(rect)).intersect(target)) else {
+            return;
+        };
+        let mut sub = RenderContext::new(area.2, area.3);
+        if canvas {
+            sub.set_paint(color(self.canvas));
+            sub.fill_rect(&device_rect((area.2, area.3)));
+        }
+        sub.set_transform(Affine::translate((-f64::from(area.0), -f64::from(area.1))) * t0);
+        self.paint(&mut sub, (area.2, area.3), backdrop, canvas);
+        let mut pm = Pixmap::new(area.2, area.3);
+        sub.flush();
+        sub.render(&mut pm, self.resources);
+        drop(sub);
+        let [a, b, c, d, _, _] = t.as_coeffs();
+        filter::apply(&mut pm, filters, [a, b, c, d], filter::Edge::Mirror);
+        ctx.set_fill_rule(Fill::NonZero);
+        if has_radius(radii) {
+            ctx.push_clip_path(&rounded(rect, radii));
+        } else {
+            ctx.push_clip_path(&krect(rect).to_path(0.1));
+        }
+        draw_device_pixmap(ctx, pm, area, target);
+        ctx.pop_clip();
+    }
+}
+
+/// The index of the `PopFilter` that closes the `PushFilter` at `open`.
+fn matching_pop_filter(items: &[DisplayItem<'_>], open: usize) -> usize {
+    let mut depth = 0usize;
+    for (i, item) in items.iter().enumerate().skip(open) {
+        match item {
+            DisplayItem::PushFilter(_) => depth += 1,
+            DisplayItem::PopFilter => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    items.len()
+}
+
+fn device_rect((w, h): (u16, u16)) -> kurbo::Rect {
+    kurbo::Rect::new(0.0, 0.0, f64::from(w), f64::from(h))
+}
+
+/// `reach` CSS px in device px along x and y under `t`.
+fn device_reach(t: &Affine, reach: f32) -> (f64, f64) {
+    let [a, b, c, d, _, _] = t.as_coeffs();
+    let r = f64::from(reach);
+    ((r * a.hypot(b)).ceil(), (r * c.hypot(d)).ceil())
+}
+
+/// Whole device pixels covering `r`: (x, y, width, height), or `None` if
+/// empty. Offscreen groups are capped at 16384 px a side.
+fn pixel_area(r: kurbo::Rect) -> Option<(i32, i32, u16, u16)> {
+    if !(r.width() > 0.0 && r.height() > 0.0) {
+        return None;
+    }
+    let (x0, y0) = (r.x0.floor(), r.y0.floor());
+    let w = (r.x1.ceil() - x0).min(16384.0) as u16;
+    let h = (r.y1.ceil() - y0).min(16384.0) as u16;
+    (w > 0 && h > 0).then_some((x0 as i32, y0 as i32, w, h))
+}
+
+/// Draw `pm`, whose top-left pixel is at device `(area.0, area.1)`, into
+/// `ctx` within `visible`, pixel for pixel.
+fn draw_device_pixmap(
+    ctx: &mut RenderContext,
+    pm: Pixmap,
+    area: (i32, i32, u16, u16),
+    visible: kurbo::Rect,
+) {
+    let (x, y) = (f64::from(area.0), f64::from(area.1));
+    let shown =
+        kurbo::Rect::new(x, y, x + f64::from(area.2), y + f64::from(area.3)).intersect(visible);
+    if !(shown.width() > 0.0 && shown.height() > 0.0) {
+        return;
+    }
+    let saved = *ctx.transform();
+    ctx.set_transform(Affine::IDENTITY);
+    let mut paint = image_paint(&Arc::new(pm), Extend::Pad);
+    if let peniko::Brush::Image(img) = &mut paint {
+        img.sampler.quality = ImageQuality::Low;
+    }
+    ctx.set_paint(paint);
+    ctx.set_paint_transform(Affine::translate((x, y)));
+    ctx.fill_rect(&shown);
+    ctx.reset_paint_transform();
+    ctx.set_transform(saved);
+}
+
+/// Device-space bounds of what `items` paint, drawn under `t`, before any
+/// filter of the group itself; `None` if they paint nothing.
+fn content_bounds(items: &[DisplayItem<'_>], t: Affine) -> Option<kurbo::Rect> {
+    enum Frame {
+        Transform(Affine),
+        Clip(Option<kurbo::Rect>),
+        Filter,
+        Layer,
+    }
+    /// Clips inside one nested filter group, and how far that filter grows ink.
+    struct Level {
+        clip: Option<kurbo::Rect>,
+        grow: (f64, f64),
+    }
+    let mut t = t;
+    let mut levels = vec![Level {
+        clip: None,
+        grow: (0.0, 0.0),
+    }];
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut out: Option<kurbo::Rect> = None;
+    let narrow = |levels: &mut Vec<Level>, c: kurbo::Rect| {
+        if let Some(l) = levels.last_mut() {
+            l.clip = Some(l.clip.map_or(c, |old| old.intersect(c)));
+        }
+    };
+    for item in items {
+        let r = match item {
+            DisplayItem::Rect { rect, .. }
+            | DisplayItem::Border { rect, .. }
+            | DisplayItem::Image { rect, .. }
+            | DisplayItem::BackdropFilter { rect, .. } => Some(krect(*rect)),
+            DisplayItem::TiledImage { clip, .. } | DisplayItem::Gradient { clip, .. } => {
+                Some(krect(*clip))
+            }
+            DisplayItem::BoxShadow {
+                rect,
+                offset,
+                blur,
+                spread,
+                inset,
+                ..
+            } => {
+                let reach = if *inset {
+                    0.0
+                } else {
+                    blur * 1.5 + spread.max(0.0) + offset.0.abs().max(offset.1.abs())
+                };
+                Some(krect(*rect).inflate(f64::from(reach), f64::from(reach)))
+            }
+            DisplayItem::Glyphs { run, glyphs, .. } => {
+                let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for g in glyphs.iter() {
+                    x0 = x0.min(g.x);
+                    x1 = x1.max(g.x);
+                    y0 = y0.min(g.y);
+                    y1 = y1.max(g.y);
+                }
+                // Glyph boxes are not known here: allow an em before the
+                // origin, two after, 1.5 above the baseline and one below.
+                let em = run.font_size;
+                (x0 <= x1).then(|| {
+                    kurbo::Rect::new(
+                        f64::from(x0 - em),
+                        f64::from(y0 - 1.5 * em),
+                        f64::from(x1 + 2.0 * em),
+                        f64::from(y1 + em),
+                    )
+                })
+            }
+            DisplayItem::PushTransform(m) => {
+                stack.push(Frame::Transform(t));
+                t *= Affine::new(m.map(f64::from));
+                None
+            }
+            DisplayItem::PushClip { rect, .. } | DisplayItem::PushMask { clip: rect, .. } => {
+                stack.push(Frame::Clip(levels.last().and_then(|l| l.clip)));
+                narrow(&mut levels, t.transform_rect_bbox(krect(*rect)));
+                None
+            }
+            DisplayItem::PushClipPath { path, .. } => {
+                stack.push(Frame::Clip(levels.last().and_then(|l| l.clip)));
+                narrow(&mut levels, t.transform_rect_bbox(path.bounding_box()));
+                None
+            }
+            DisplayItem::PushFilter(filters) => {
+                stack.push(Frame::Filter);
+                levels.push(Level {
+                    clip: None,
+                    grow: device_reach(&t, filter::reach(filters)),
+                });
+                None
+            }
+            DisplayItem::PushOpacity(_) | DisplayItem::PushBlend(_) => {
+                stack.push(Frame::Layer);
+                None
+            }
+            DisplayItem::PopTransform
+            | DisplayItem::PopClip
+            | DisplayItem::PopMask
+            | DisplayItem::PopFilter
+            | DisplayItem::PopOpacity
+            | DisplayItem::PopBlend => {
+                match stack.pop() {
+                    Some(Frame::Transform(old)) => t = old,
+                    Some(Frame::Clip(old)) => {
+                        if let Some(l) = levels.last_mut() {
+                            l.clip = old;
+                        }
+                    }
+                    Some(Frame::Filter) => {
+                        levels.pop();
+                    }
+                    Some(Frame::Layer) | None => {}
+                }
+                None
+            }
+        };
+        let Some(r) = r else { continue };
+        // Innermost group first: its clips, then its filter's growth.
+        let mut d = Some(t.transform_rect_bbox(r));
+        for l in levels.iter().rev() {
+            d = d
+                .map(|d| l.clip.map_or(d, |c| d.intersect(c)))
+                .filter(|d| d.width() > 0.0 && d.height() > 0.0)
+                .map(|d| d.inflate(l.grow.0, l.grow.1));
+        }
+        if let Some(d) = d {
+            out = Some(out.map_or(d, |o| o.union(d)));
+        }
+    }
+    out
+}
+
+fn blend_mode(m: BlendMode) -> peniko::BlendMode {
+    use peniko::{Compose, Mix};
+    let mix = match m {
+        BlendMode::Normal | BlendMode::PlusLighter => Mix::Normal,
+        BlendMode::Multiply => Mix::Multiply,
+        BlendMode::Screen => Mix::Screen,
+        BlendMode::Overlay => Mix::Overlay,
+        BlendMode::Darken => Mix::Darken,
+        BlendMode::Lighten => Mix::Lighten,
+        BlendMode::ColorDodge => Mix::ColorDodge,
+        BlendMode::ColorBurn => Mix::ColorBurn,
+        BlendMode::HardLight => Mix::HardLight,
+        BlendMode::SoftLight => Mix::SoftLight,
+        BlendMode::Difference => Mix::Difference,
+        BlendMode::Exclusion => Mix::Exclusion,
+        BlendMode::Hue => Mix::Hue,
+        BlendMode::Saturation => Mix::Saturation,
+        BlendMode::Color => Mix::Color,
+        BlendMode::Luminosity => Mix::Luminosity,
+    };
+    // plus-lighter is the Porter-Duff "plus" operator, not a mix.
+    let compose = if m == BlendMode::PlusLighter {
+        Compose::Plus
+    } else {
+        Compose::SrcOver
+    };
+    peniko::BlendMode::new(mix, compose)
+}
+
+fn draw_gradient(
+    ctx: &mut RenderContext,
+    clip: Rect,
+    gradient: &ResolvedGradient,
+    stops: &[(f32, Color)],
+    repeating: bool,
+) {
+    if clip.width <= 0.0 || clip.height <= 0.0 {
+        return;
+    }
+    let extend = if repeating {
+        Extend::Repeat
+    } else {
+        Extend::Pad
+    };
+    let stops: Vec<peniko::ColorStop> = stops.iter().map(|&(o, c)| (o, color(c)).into()).collect();
+    let g = match *gradient {
+        ResolvedGradient::Linear { start, end } => peniko::Gradient::new_linear(
+            (f64::from(start.0), f64::from(start.1)),
+            (f64::from(end.0), f64::from(end.1)),
+        ),
+        // A circle around the origin; the paint transform moves it to
+        // the center and squashes it into an ellipse.
+        ResolvedGradient::Radial {
+            start_radius,
+            end_radius,
+            ..
+        } => {
+            peniko::Gradient::new_two_point_radial((0.0, 0.0), start_radius, (0.0, 0.0), end_radius)
+        }
+    }
+    .with_extend(extend)
+    .with_stops(stops.as_slice());
+    ctx.set_paint(g);
+    if let ResolvedGradient::Radial {
+        center, y_scale, ..
+    } = *gradient
+    {
+        ctx.set_paint_transform(
+            Affine::translate((f64::from(center.0), f64::from(center.1)))
+                * Affine::scale_non_uniform(1.0, f64::from(y_scale)),
+        );
+    }
+    ctx.fill_rect(&krect(clip));
+    ctx.reset_paint_transform();
 }
 
 /// The alpha mask of a `PushMask` item. vello masks cover the whole render
