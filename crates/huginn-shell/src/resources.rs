@@ -578,6 +578,7 @@ pub fn load_lazy(
 }
 
 /// Load every `loading=lazy` image now (the window, which scrolls).
+/// Returns true if any was added.
 pub fn load_all_lazy(
     loader: &Loader,
     doc: &Document,
@@ -585,9 +586,11 @@ pub fn load_all_lazy(
     plan: &ImagePlan,
     screen: &Screen,
     images: &mut ImageStore,
-) {
+) -> bool {
     let choices: Vec<&ImgChoice> = plan.lazy.iter().collect();
-    load_choices(loader, doc, styles, &choices, screen, images);
+    load_choices(loader, doc, styles, &choices, screen, images)
+        .iter()
+        .any(Option::is_some)
 }
 
 /// After scripts changed the DOM or a state changed styles (the live window):

@@ -21,6 +21,8 @@ parking_lot.workspace = true
 image.workspace = true
 vello_common.workspace = true
 encoding_rs.workspace = true
+flate2.workspace = true
+brotli-decompressor.workspace = true
 wuff.workspace = true
 resvg.workspace = true
 avif-parse = { workspace = true, optional = true }

@@ -552,28 +552,56 @@ pub struct ScriptRequest { pub url: Url, pub method: String, pub headers: Vec<(S
                            pub body: Option<Vec<u8>>, pub mode: Mode, pub credentials: Credentials,
                            pub redirect: RedirectMode }
 
+/// What a profile's tabs share (Chrome's network context): idle connections
+/// (6 per host, 5 min, TLS sessions), resolved hosts (1 min), HTTP cache, cookie jar.
+pub struct Network { .. }                    // Sync; one per profile, in an Arc
+impl Network {
+    pub fn new(cookies: Arc<CookieJar>, cache: HttpCache) -> Arc<Network>;  // HUGINN_NET_LOOPBACK_ONLY=1 -> loopback only
+    pub fn cookies(&self) -> &Arc<CookieJar>;
+    pub fn cache(&self) -> &HttpCache;
+}
+/// RFC 9111 private cache: fresh entries answer, stale ones are revalidated (ETag,
+/// Last-Modified, 304), no-store and Vary honoured, keyed by top-level site + URL.
+pub struct HttpCache { .. }
+impl HttpCache {
+    pub fn off() -> HttpCache;                               // huginn render: always the network
+    pub fn in_memory(max_bytes: u64) -> HttpCache;           // private windows
+    pub fn on_disk(dir: impl Into<PathBuf>, max_bytes: u64) -> HttpCache;  // one file per entry, LRU, safe across tabs and processes
+    pub fn clear(&self);
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+/// How a load uses the HTTP cache (Chrome's load types): Normal; Reload (document
+/// revalidated, subresources as usual); HardReload (nothing from the cache);
+/// History (back/forward, discarded tabs: the document even when stale).
+pub enum LoadKind { Normal, Reload, HardReload, History }
+
 pub struct Loader { .. }                     // Sync; one per page
 impl Loader {
-    pub fn new() -> Loader;                  // own in-memory cookie jar; 30 s global timeout, 64 MiB body limit; HUGINN_NET_LOOPBACK_ONLY=1 -> loopback_only()
-    pub fn with_cookies(jar: Arc<CookieJar>) -> Loader;  // the profile's jar, shared by its tabs
+    pub fn new() -> Loader;                  // own Network: in-memory cookie jar, no HTTP cache; 30 s global timeout, 64 MiB body limit; HUGINN_NET_LOOPBACK_ONLY=1 -> loopback_only()
+    pub fn with_network(net: Arc<Network>) -> Loader;  // the profile's network, shared by its tabs
     pub fn loopback_only() -> Loader;        // hosts other than 127.0.0.1/localhost/::1 fail as host-not-found (bench: offline like Chrome/Ladybird)
+    pub fn network(&self) -> &Arc<Network>;
     pub fn cookies(&self) -> &Arc<CookieJar>;
+    pub fn set_load_kind(&self, kind: LoadKind);       // for the next navigation and its subresources; Normal again when done
     pub fn set_client(&self, client: Option<Client>);   // the document, once its final URL is known
     pub fn client(&self) -> Option<Client>;
-    pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // no-cors subresource, cached by URL
+    pub fn fetch(&self, url: &Url, kind: ResourceKind) -> Result<Arc<Resource>, NetError>;  // no-cors subresource, kept in the loader by URL
     pub fn fetch_with(&self, url: &Url, kind: ResourceKind, cors: CorsSettings) -> Result<Arc<Resource>, NetError>;  // modules, <script crossorigin>
-    /// No cache: for bodies decoded once and dropped (images, fonts). Document = a browser-started navigation.
+    /// Not kept in the loader (the HTTP cache still answers): for bodies decoded once and
+    /// dropped (images, fonts). Document = a browser-started navigation.
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError>;
     /// Top-level GET or form POST (content type, body); initiator = the page that started it.
-    /// Returns the document and its referrer (document.referrer). Never cached.
+    /// Returns the document and its referrer (document.referrer).
     pub fn navigate(&self, url: &Url, post: Option<(&str, &[u8])>, initiator: Option<&Client>)
         -> Result<(Resource, Option<String>), NetError>;
     /// fetch()/XHR: any method, CORS (preflight, Access-Control-* checks) for other origins,
     /// any status; opaque responses come back empty, CORS ones with exposed headers only.
+    /// A conditional header (If-None-Match, ...) bypasses the HTTP cache (Fetch).
     pub fn fetch_for_script(&self, req: ScriptRequest) -> Result<Resource, NetError>;
     pub fn fetch_all(&self, requests: &[(Url, ResourceKind)]) -> Vec<Result<Arc<Resource>, NetError>>;  // <= 6 parallel, input order
     pub fn map_parallel<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R>;
-    pub fn clear_cache(&self);               // drop cached bodies (after CSS parsing)
+    pub fn clear_cache(&self);               // drop the bodies kept in the loader (after CSS parsing); the HTTP cache stays
 }
 
 /// RFC 6265bis cookies: Domain (no public suffixes), Path, Expires/Max-Age

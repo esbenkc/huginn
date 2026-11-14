@@ -106,8 +106,9 @@ impl Page {
     }
 
     /// Load every `loading=lazy` image now (the window scrolls, so all of
-    /// them can come into view).
-    pub fn load_all_lazy(&mut self, loader: &Loader) {
+    /// them can come into view). Returns true if any was added: lay out
+    /// again.
+    pub fn load_all_lazy(&mut self, loader: &Loader) -> bool {
         resources::load_all_lazy(
             loader,
             &self.doc,
@@ -115,7 +116,7 @@ impl Page {
             &self.img_plan,
             &self.screen,
             &mut self.images,
-        );
+        )
     }
 
     /// Lay out for `viewport` (the styles must be computed for the same viewport).

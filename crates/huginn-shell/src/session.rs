@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use huginn_net::{CookieJar, DecodedImage, Url};
+use huginn_net::{CookieJar, DecodedImage, HttpCache, Network, Url};
 
 use crate::browser::{Browser, WindowOp};
 use crate::engine::{self, Command, EngineEvent};
@@ -28,6 +28,12 @@ const LIVE_BACKGROUND_TABS: usize = 8;
 /// which background tabs are discarded one per event, least recently used
 /// first, whatever `LIVE_BACKGROUND_TABS` allows. `HUGINN_MEMORY_BUDGET_MB` overrides.
 const MEMORY_BUDGET_MB: u64 = 1536;
+
+/// Size cap of the HTTP cache on disk (normal windows).
+const DISK_CACHE_BYTES: u64 = 256 << 20;
+/// Size cap of an HTTP cache in memory (private windows, and headless runs
+/// without `HUGINN_PROFILE_DIR`).
+const MEMORY_CACHE_BYTES: u64 = 32 << 20;
 
 /// Chrome's zoom steps.
 pub const ZOOM_LEVELS: [f32; 15] = [
@@ -68,12 +74,13 @@ pub struct Shared {
     pub closed: Vec<ClosedTab>,
     /// Activation clock for discarding.
     clock: u64,
-    /// Cookies of normal windows, saved in the profile (in memory for
-    /// headless runs without `HUGINN_PROFILE_DIR`).
-    cookies: Arc<CookieJar>,
-    /// Cookies of private windows: in memory only, shared by all private
-    /// windows and dropped when the last one closes.
-    private_cookies: Option<Arc<CookieJar>>,
+    /// The network of normal windows: cookies saved in the profile, the
+    /// HTTP cache on disk (both in memory for headless runs without
+    /// `HUGINN_PROFILE_DIR`), and the idle connections.
+    net: Arc<Network>,
+    /// The network of private windows: cookies and cache in memory only,
+    /// shared by all private windows and dropped when the last one closes.
+    private_net: Option<Arc<Network>>,
 }
 
 impl Shared {
@@ -83,17 +90,22 @@ impl Shared {
     }
 
     /// Start the engine thread of a tab; `private`: it uses the private
-    /// windows' cookie jar.
+    /// windows' network.
     pub(crate) fn spawn_engine(&mut self, tab: TabId, private: bool) -> Sender<Command> {
         let notify = self.notify.clone();
-        let cookies = if private {
-            self.private_cookies
-                .get_or_insert_with(|| Arc::new(CookieJar::in_memory()))
+        let net = if private {
+            self.private_net
+                .get_or_insert_with(|| {
+                    Network::new(
+                        Arc::new(CookieJar::in_memory()),
+                        HttpCache::in_memory(MEMORY_CACHE_BYTES),
+                    )
+                })
                 .clone()
         } else {
-            self.cookies.clone()
+            self.net.clone()
         };
-        engine::spawn(self.js, cookies, Arc::new(move |ev| notify(tab, ev)))
+        engine::spawn(self.js, net, Arc::new(move |ev| notify(tab, ev)))
     }
 
     pub(crate) fn tick(&mut self) -> u64 {
@@ -141,17 +153,19 @@ impl Shared {
         });
     }
 
-    /// Clear browsing data: history, recently closed tabs and cookies (of
-    /// normal and private windows).
+    /// Clear browsing data: history, recently closed tabs, cookies and the
+    /// HTTP cache (of normal and private windows).
     pub fn clear_history(&mut self) {
         self.visits.clear();
         self.closed.clear();
-        self.cookies.clear();
-        if let Err(e) = self.cookies.save() {
+        self.net.cookies().clear();
+        if let Err(e) = self.net.cookies().save() {
             eprintln!("huginn: cannot save cookies: {e}");
         }
-        if let Some(c) = &self.private_cookies {
-            c.clear();
+        self.net.cache().clear();
+        if let Some(n) = &self.private_net {
+            n.cookies().clear();
+            n.cache().clear();
         }
     }
 
@@ -213,8 +227,8 @@ pub struct Session {
 }
 
 impl Session {
-    /// `headless`: bookmarks and cookies are saved only with
-    /// `HUGINN_PROFILE_DIR` set.
+    /// `headless`: bookmarks, cookies and the HTTP cache are saved only
+    /// with `HUGINN_PROFILE_DIR` set.
     pub fn new(js: bool, notify: Notify, size: (f32, f32), scale: f32, headless: bool) -> Session {
         let profile = if headless && std::env::var_os("HUGINN_PROFILE_DIR").is_none() {
             None
@@ -230,6 +244,10 @@ impl Session {
             Some(d) => CookieJar::persistent(d.join("cookies.tsv")),
             None => CookieJar::in_memory(),
         });
+        let cache = match profile.as_ref().and(internal_pages::cache_dir()) {
+            Some(d) => HttpCache::on_disk(d, DISK_CACHE_BYTES),
+            None => HttpCache::in_memory(MEMORY_CACHE_BYTES),
+        };
         let live_background = std::env::var("HUGINN_LIVE_TABS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -253,8 +271,8 @@ impl Session {
                 favicons: HashMap::new(),
                 closed: Vec::new(),
                 clock: 0,
-                cookies,
-                private_cookies: None,
+                net: Network::new(cookies, cache),
+                private_net: None,
             })),
             next_window: 0,
             size,
@@ -363,10 +381,10 @@ impl Session {
         if self.windows.is_empty() {
             self.quit = true;
         }
-        // The last private window closed: its cookies go (engine threads of
-        // its tabs drop their reference as they end).
+        // The last private window closed: its cookies and cache go (engine
+        // threads of its tabs drop their reference as they end).
         if !self.windows.iter().any(|w| w.private) {
-            self.shared.borrow_mut().private_cookies = None;
+            self.shared.borrow_mut().private_net = None;
         }
         if zoom {
             for w in &mut self.windows {
@@ -426,13 +444,14 @@ impl Session {
             .map(|w| w.tabs().iter().filter(|t| t.has_engine()).count())
             .sum();
         out.insert("engines".into(), engines.into());
-        out.insert("cookies".into(), shared.cookies.len().into());
+        out.insert("cookies".into(), shared.net.cookies().len().into());
+        out.insert("cached".into(), shared.net.cache().len().into());
         out.insert(
             "private_cookies".into(),
             shared
-                .private_cookies
+                .private_net
                 .as_ref()
-                .map_or(serde_json::Value::Null, |c| c.len().into()),
+                .map_or(serde_json::Value::Null, |n| n.cookies().len().into()),
         );
         serde_json::Value::Object(out)
     }
@@ -441,7 +460,7 @@ impl Session {
 impl Drop for Session {
     /// Write the cookies changed since the last periodic save.
     fn drop(&mut self) {
-        if let Err(e) = self.shared.borrow().cookies.save() {
+        if let Err(e) = self.shared.borrow().net.cookies().save() {
             eprintln!("huginn: cannot save cookies: {e}");
         }
     }

@@ -435,7 +435,7 @@ impl Browser {
                 }),
                 Request::Back => self.tabs[i].back(),
                 Request::Forward => self.tabs[i].forward(),
-                Request::Reload => self.tabs[i].reload(),
+                Request::Reload => self.tabs[i].reload(false),
                 Request::ViewSource => {
                     if let Some(u) = self.tabs[i]
                         .url()
@@ -517,10 +517,9 @@ impl Browser {
             Action::Back => self.tab_mut_active().back(),
             Action::Forward => self.tab_mut_active().forward(),
             Action::Reload | Action::HardReload => {
-                // Pages are never cached (each load has a fresh loader), so a
-                // hard reload is a reload.
                 self.toolbar.blur();
-                self.tab_mut_active().reload();
+                self.tab_mut_active()
+                    .reload(matches!(a, Action::HardReload));
             }
             Action::Home => {
                 self.tab_mut_active()
@@ -867,7 +866,7 @@ impl Browser {
             Some(ToolbarHit::Reload) => {
                 let t = self.tab_mut_active();
                 if !t.stop() {
-                    t.reload();
+                    t.reload(false);
                 }
             }
             Some(ToolbarHit::Star) => self.act(Action::Bookmark),
