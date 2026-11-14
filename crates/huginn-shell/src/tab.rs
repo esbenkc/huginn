@@ -17,7 +17,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
 use std::time::Instant;
 
 use huginn_dom::NodeId;
@@ -26,7 +25,7 @@ use huginn_net::{Client, DecodedImage, LoadKind, ReferrerPolicy, Url};
 use huginn_paint::{CpuRasterizer, Rasterizer};
 use huginn_style::Viewport;
 
-use crate::engine::{Command, EngineEvent, Job, Links, Loaded, PostData};
+use crate::engine::{Command, EngineEvent, EngineTx, Job, Links, Loaded, PostData};
 use crate::input::{CursorKind, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind};
 use crate::session::Shared;
 use crate::ui::{Canvas, Pixels, copy_row};
@@ -190,7 +189,7 @@ pub struct Tab {
     /// Private windows record no visits.
     pub private: bool,
     /// `None` when discarded (or never started).
-    engine: Option<Sender<Command>>,
+    engine: Option<EngineTx>,
     /// Last command sent and last command the engine finished.
     seq: u64,
     done_seq: u64,

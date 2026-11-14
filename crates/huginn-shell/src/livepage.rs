@@ -217,7 +217,6 @@ impl LivePage {
     pub fn load_start(&self) -> Instant {
         self.start
     }
-
     pub fn new(loader: Arc<Loader>, start: Instant, page: &mut Page) -> LivePage {
         let inline_handlers = has_inline_handlers(&page.doc);
         let scripted = inline_handlers
@@ -241,7 +240,8 @@ impl LivePage {
         }
     }
 
-    /// When the engine thread must wake up for timers.
+    /// When the engine thread must wake up for timers (an arrived response
+    /// to a script's request is due at once).
     pub fn next_wakeup(&self, page: &Page) -> Option<Instant> {
         let due = page.js.as_ref()?.next_timer_due()?;
         let at = self.start + Duration::from_secs_f64(due.max(0.0) / 1000.0);

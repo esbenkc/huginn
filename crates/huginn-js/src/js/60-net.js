@@ -282,10 +282,11 @@ class FormData {
 expose(FormData);
 
 // ---------------------------------------------------------- fetch and XHR --
-// Requests are served synchronously by the shell's loader with the Fetch
-// standard's rules: another origin must allow a `cors` request (a failed
-// CORS check is a network error) and answers `no-cors` with an opaque
-// response. The result is delivered in a later task, like a fast network.
+// Requests follow the Fetch standard's rules in the shell's loader: another
+// origin must allow a `cors` request (a failed CORS check is a network
+// error) and answers `no-cors` with an opaque response. fetch() and async
+// XHR run on other threads, several at once; each response comes back in a
+// task of its own, in arrival order. Sync XHR waits on this thread.
 
 // A request body as [string or Uint8Array, its default Content-Type].
 function requestBody(b) {
@@ -310,14 +311,15 @@ function requestBody(b) {
   return [String(b), 'text/plain;charset=UTF-8'];
 }
 
-// Send a request; `headers` iterates [name, value] pairs. Returns
-// { status, url, headers: [[name, value]...], body, type, redirected }, or
-// null for a network error.
-function nativeFetch(url, method, headers, body, mode, credentials, redirect) {
+function flatHeaders(headers) {
   let flat = '';
   if (headers) for (const [k, v] of headers) flat += String(k).replace(/\n/g, '') + '\n' + String(v).replace(/[\r\n]/g, ' ') + '\n';
-  const r = N.fetch(String(url), String(method || 'GET'), flat, body === undefined ? null : body,
-    mode || 'cors', credentials || 'same-origin', redirect || 'follow');
+  return flat;
+}
+// The engine's [status, url, "name: value\r\n"..., body, type, redirected]
+// as { status, url, headers: [[name, value]...], body, type, redirected },
+// or null for a network error.
+function responseOf(r) {
   if (!r) return null;
   const list = [];
   for (const line of r[2].split('\r\n')) {
@@ -325,6 +327,35 @@ function nativeFetch(url, method, headers, body, mode, credentials, redirect) {
     if (i > 0) list.push([line.slice(0, i), line.slice(i + 2)]);
   }
   return { status: +r[0], url: r[1], headers: list, body: r[3], type: r[4], redirected: r[5] === '1' };
+}
+// Send a request and wait for it (sync XHR); `headers` iterates [name,
+// value] pairs. Returns the response (see responseOf).
+function nativeFetch(url, method, headers, body, mode, credentials, redirect) {
+  return responseOf(N.fetch(String(url), String(method || 'GET'), flatHeaders(headers), body === undefined ? null : body,
+    mode || 'cors', credentials || 'same-origin', redirect || 'follow'));
+}
+// Requests in flight: id -> callback that takes the response.
+const netPending = new Map();
+// Start a request on another thread; `done(response)` runs in a later task.
+// Returns its id for cancelRequest.
+function startRequest(url, method, headers, body, mode, credentials, redirect, done) {
+  const id = N.fetchStart(String(url), String(method || 'GET'), flatHeaders(headers), body === undefined ? null : body,
+    mode || 'cors', credentials || 'same-origin', redirect || 'follow');
+  if (id) netPending.set(id, done);
+  else queueTask(() => done(null));
+  return id;
+}
+// The script gave up on request `id`: its response is dropped.
+function cancelRequest(id) {
+  if (netPending.delete(id)) N.fetchCancel(id);
+}
+// Engine hook: the response to request `id` arrived. Its callback runs in
+// a task of its own, after the tasks already due.
+function netDone(id, r) {
+  const done = netPending.get(id);
+  if (!done) return;
+  netPending.delete(id);
+  queueTask(() => done(responseOf(r)));
 }
 const STATUS_TEXT = { 200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved Permanently', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error' };
 
@@ -490,10 +521,13 @@ function fetch(input, init) {
   let req;
   try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
   return new Promise((resolve, reject) => {
-    if (req.signal.aborted) { reject(req.signal.reason); return; }
-    queueTask(() => {
-      if (req.signal.aborted) { reject(req.signal.reason); return; }
-      const r = nativeFetch(req.url, req.method, req.headers, req._payload, req.mode, req.credentials, req.redirect);
+    const signal = req.signal;
+    if (signal.aborted) { reject(signal.reason); return; }
+    let id = 0;
+    // Aborting rejects at once; the response, if it comes, is dropped.
+    const abort = () => { cancelRequest(id); reject(signal.reason); };
+    id = startRequest(req.url, req.method, req.headers, req._payload, req.mode, req.credentials, req.redirect, r => {
+      removeAbortStep(signal, abort);
       if (!r) { reject(new TypeError('Failed to fetch')); return; }
       const empty = req.method === 'HEAD' || r.type === 'opaque' || r.type === 'opaqueredirect';
       const res = new Response(empty ? null : r.body, { status: r.status, headers: r.headers });
@@ -502,6 +536,7 @@ function fetch(input, init) {
       res.redirected = r.redirected;
       resolve(res);
     });
+    addAbortStep(signal, abort);
   });
 }
 
@@ -524,13 +559,17 @@ class XMLHttpRequest extends EventTarget {
     const upper = m.toUpperCase();
     if (['CONNECT', 'TRACE', 'TRACK'].includes(upper)) throw domErr('SecurityError', "'" + m + "' HTTP method is unsupported.");
     if (['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT'].includes(upper)) m = upper;
-    this._req = { method: m, url: new URL(String(url), N.baseUrl()).href, async: async !== false, aborted: false, headers: [], body: null };
+    const href = new URL(String(url), N.baseUrl()).href;
+    // A request still in flight ends without events.
+    if (this._req) this._stop(this._req);
+    // `active`: the send() flag, kept until the request is done or aborted.
+    this._req = { method: m, url: href, async: async !== false, active: false, id: 0, timer: 0, headers: [] };
     this._res = null;
     this.status = 0;
     this._state(1);
   }
   setRequestHeader(name, value) {
-    if (!this._req || this.readyState !== 1) throw domErr('InvalidStateError', "The object's state must be OPENED.");
+    if (!this._req || this.readyState !== 1 || this._req.active) throw domErr('InvalidStateError', "The object's state must be OPENED.");
     this._req.headers.push([String(name), String(value)]);
   }
   overrideMimeType() {}
@@ -563,18 +602,29 @@ class XMLHttpRequest extends EventTarget {
     }
   }
   _state(s) { this.readyState = s; dispatch(this, new Event('readystatechange')); }
-  _finish() {
-    const req = this._req;
-    if (!req || req.aborted) return;
-    const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
-    const [payload, type] = hasBody ? requestBody(req.body) : [null, null];
-    const headers = req.headers.slice();
-    if (type && !headers.some(h => h[0].toLowerCase() === 'content-type')) headers.push(['Content-Type', type]);
-    const r = nativeFetch(req.url, req.method, headers, payload, 'cors', this.withCredentials ? 'include' : 'same-origin', 'follow');
+  // End the request: no more events from the network or the timeout.
+  _stop(req) {
+    req.active = false;
+    if (req.timer) { clearTimer(req.timer); req.timer = 0; }
+    cancelRequest(req.id);
+  }
+  // XHR's request error steps: `type` is error, abort or timeout.
+  _fail(type) {
+    this._res = null;
+    this.status = 0;
+    this.statusText = '';
+    this._state(4);
+    dispatch(this, new ProgressEvent(type));
+    dispatch(this, new ProgressEvent('loadend'));
+  }
+  // The response `r` (null: a network error) to request `req` arrived.
+  // Listeners may abort or open again between the events.
+  _done(req, r) {
+    if (this._req !== req || !req.active) return;
+    if (req.timer) { clearTimer(req.timer); req.timer = 0; }
     if (!r) {
-      this._state(4);
-      dispatch(this, new ProgressEvent('error'));
-      dispatch(this, new ProgressEvent('loadend'));
+      req.active = false;
+      this._fail('error');
       return;
     }
     this._res = r;
@@ -582,26 +632,57 @@ class XMLHttpRequest extends EventTarget {
     this.statusText = STATUS_TEXT[r.status] || '';
     this.responseURL = r.url;
     this._state(2);
+    if (!req.active) return;
     this._state(3);
-    this._state(4);
+    if (!req.active) return;
     const n = r.body.length;
-    dispatch(this, new ProgressEvent('load', { lengthComputable: true, loaded: n, total: n }));
-    dispatch(this, new ProgressEvent('loadend', { lengthComputable: true, loaded: n, total: n }));
+    const size = { lengthComputable: true, loaded: n, total: n };
+    if (req.async) {
+      dispatch(this, new ProgressEvent('progress', size));
+      if (!req.active) return;
+    }
+    req.active = false;
+    this._state(4);
+    dispatch(this, new ProgressEvent('load', size));
+    dispatch(this, new ProgressEvent('loadend', size));
   }
   send(body) {
-    if (!this._req || this.readyState !== 1) throw domErr('InvalidStateError', "The object's state must be OPENED.");
-    this._req.body = body === undefined ? null : body;
+    const req = this._req;
+    if (!req || this.readyState !== 1 || req.active) throw domErr('InvalidStateError', "The object's state must be OPENED.");
+    const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+    const [payload, type] = hasBody ? requestBody(body) : [null, null];
+    const headers = req.headers.slice();
+    if (type && !headers.some(h => h[0].toLowerCase() === 'content-type')) headers.push(['Content-Type', type]);
+    const credentials = this.withCredentials ? 'include' : 'same-origin';
+    req.active = true;
     dispatch(this, new ProgressEvent('loadstart'));
-    if (this._req.async) queueTask(() => this._finish());
-    else this._finish();
+    // A loadstart listener may have aborted or opened again.
+    if (this._req !== req || !req.active) return;
+    if (!req.async) {
+      this._done(req, nativeFetch(req.url, req.method, headers, payload, 'cors', credentials, 'follow'));
+      return;
+    }
+    req.id = startRequest(req.url, req.method, headers, payload, 'cors', credentials, 'follow', r => this._done(req, r));
+    if (this.timeout > 0) {
+      req.timer = setTimeout(() => {
+        if (this._req !== req || !req.active) return;
+        this._stop(req);
+        this._fail('timeout');
+      }, this.timeout);
+    }
   }
   abort() {
-    if (this._req) this._req.aborted = true;
-    if (this.readyState > 0 && this.readyState < 4) {
-      this._state(4);
-      dispatch(this, new ProgressEvent('abort'));
+    const req = this._req;
+    if (req && req.active) {
+      this._stop(req);
+      this._fail('abort');
     }
-    this.readyState = 0;
+    if (this.readyState === 4) {
+      this.readyState = 0;
+      this._res = null;
+      this.status = 0;
+      this.statusText = '';
+    }
   }
 }
 for (const [k, v] of [['UNSENT', 0], ['OPENED', 1], ['HEADERS_RECEIVED', 2], ['LOADING', 3], ['DONE', 4]]) {

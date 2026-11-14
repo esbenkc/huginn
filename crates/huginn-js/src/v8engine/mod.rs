@@ -7,6 +7,7 @@
 //! document. A watchdog thread terminates calls that run past the budget.
 
 mod codec;
+mod fetches;
 mod modules;
 mod ops;
 
@@ -20,7 +21,7 @@ use huginn_dom::{NodeId, local_name};
 
 use crate::{
     EngineOptions, Event, EventTarget, EventValue, HostContext, HostRequest, ScriptEngine,
-    ScriptError, ScriptKind,
+    ScriptError, ScriptKind, Waker,
 };
 
 /// The JavaScript DOM layer, one function scope across the files.
@@ -106,6 +107,8 @@ pub(crate) struct State {
     /// The watchdog's clock; native operations stop it while they wait for
     /// the network.
     clock: WatchClock,
+    /// Requests of `fetch()` and async XHR on other threads.
+    fetches: fetches::Fetches,
 }
 
 struct Hooks {
@@ -113,6 +116,7 @@ struct Hooks {
     dispatch: v8::Global<v8::Function>,
     run_one: v8::Global<v8::Function>,
     next_due: v8::Global<v8::Function>,
+    net_done: v8::Global<v8::Function>,
 }
 
 impl State {
@@ -137,6 +141,7 @@ impl State {
             codecs: HashMap::new(),
             next_codec: 0,
             clock,
+            fetches: fetches::Fetches::new(),
         }
     }
 
@@ -191,10 +196,10 @@ impl WatchClock {
         }
     }
 
-    /// Run `wait` with the clock stopped. Fetches are synchronous, and time
-    /// the thread waits for the network is not script time: a task that
-    /// makes several requests must not be terminated in the middle of its
-    /// script.
+    /// Run `wait` with the clock stopped. Sync XHR, inserted scripts and
+    /// modules wait for the network inside a call, and that time is not
+    /// script time: a task that makes several requests must not be
+    /// terminated in the middle of its script.
     fn paused<R>(&self, wait: impl FnOnce() -> R) -> R {
         let left = {
             let (lock, cv) = &*self.0;
@@ -307,16 +312,24 @@ impl Drop for Runtime {
 pub struct V8Engine {
     options: EngineOptions,
     rt: Option<Runtime>,
+    /// See [`ScriptEngine::set_waker`]; kept for an isolate made later.
+    waker: Option<Waker>,
 }
 
 impl V8Engine {
     pub fn new(options: EngineOptions) -> V8Engine {
-        V8Engine { options, rt: None }
+        V8Engine {
+            options,
+            rt: None,
+            waker: None,
+        }
     }
 
     fn runtime(&mut self, cx: &mut HostContext<'_>) -> Result<&mut Runtime, ScriptError> {
         if self.rt.is_none() {
-            self.rt = Some(Runtime::new(self.options.clone(), cx)?);
+            let rt = Runtime::new(self.options.clone(), cx)?;
+            rt.state.borrow().fetches.set_waker(self.waker.clone());
+            self.rt = Some(rt);
         }
         Ok(self.rt.as_mut().expect("runtime was just created"))
     }
@@ -449,9 +462,12 @@ impl Runtime {
             let f = v8::Local::<v8::Function>::try_from(f).ok()?;
             Some(v8::Global::new(tc, f))
         };
-        let (Some(dispatch), Some(run_one), Some(next_due)) =
-            (get(tc, "dispatch"), get(tc, "runOne"), get(tc, "nextDue"))
-        else {
+        let (Some(dispatch), Some(run_one), Some(next_due), Some(net_done)) = (
+            get(tc, "dispatch"),
+            get(tc, "runOne"),
+            get(tc, "nextDue"),
+            get(tc, "netDone"),
+        ) else {
             return Err(ScriptError::Runtime {
                 url: "huginn:prelude".into(),
                 message: "prelude hooks missing".into(),
@@ -463,6 +479,7 @@ impl Runtime {
             dispatch,
             run_one,
             next_due,
+            net_done,
         });
         Ok(())
     }
@@ -626,9 +643,9 @@ impl ScriptEngine for V8Engine {
         let Some(rt) = self.rt.as_mut() else {
             return Ok(0);
         };
-        let at = cx.now_ms;
         with_context(rt, cx, |scope, state| {
             let mut ran = run_pending(scope, state);
+            deliver_responses(scope, state);
             let (f, recv) = {
                 let st = state.borrow();
                 let Some(hooks) = st.hooks.as_ref() else {
@@ -639,6 +656,10 @@ impl ScriptEngine for V8Engine {
                     v8::Local::new(scope, &hooks.object),
                 )
             };
+            // The call's task time (`cx.now_ms`, or later if a script
+            // already saw a later `performance.now()`): tasks queued for
+            // "now", like the responses above, run in this round.
+            let at = state.borrow().call_base;
             let at = v8::Number::new(scope, at).into();
             // Each task gets the whole budget, so a task is not terminated
             // because earlier ones in the round were slow. A round starts no
@@ -676,11 +697,35 @@ impl ScriptEngine for V8Engine {
     fn next_timer_due(&self) -> Option<f64> {
         let rt = self.rt.as_ref()?;
         let st = rt.state.borrow();
-        if !st.pending_scripts.is_empty() || !st.pending_imports.is_empty() {
+        if !st.pending_scripts.is_empty()
+            || !st.pending_imports.is_empty()
+            || st.fetches.has_arrived()
+        {
             // Due now: the shell runs them in the next `run_timers`.
             return Some(st.last_now);
         }
         st.next_due
+    }
+
+    fn requests_in_flight(&self) -> usize {
+        self.rt
+            .as_ref()
+            .map_or(0, |rt| rt.state.borrow().fetches.in_flight())
+    }
+
+    fn wait_for_response(&self, timeout: Duration) -> bool {
+        let Some(rt) = self.rt.as_ref() else {
+            return false;
+        };
+        let st = rt.state.borrow();
+        st.fetches.in_flight() > 0 && st.fetches.wait(timeout)
+    }
+
+    fn set_waker(&mut self, wake: Waker) {
+        if let Some(rt) = &self.rt {
+            rt.state.borrow().fetches.set_waker(Some(wake.clone()));
+        }
+        self.waker = Some(wake);
     }
 
     fn take_requests(&mut self) -> Vec<HostRequest> {
@@ -844,4 +889,33 @@ fn run_pending(scope: &mut v8::PinScope<'_, '_>, state: &SharedState) -> usize {
         ran += 1;
     }
     ran + modules::run_pending_imports(scope, state, deadline)
+}
+
+/// Hand the responses that arrived to the prelude (`netDone`), which queues
+/// one task per response for now, in arrival order: after the tasks that
+/// are already due, before later ones.
+fn deliver_responses(scope: &mut v8::PinScope<'_, '_>, state: &SharedState) {
+    let arrived = state.borrow_mut().fetches.take_arrived();
+    if arrived.is_empty() {
+        return;
+    }
+    let (f, recv) = {
+        let st = state.borrow();
+        let Some(hooks) = st.hooks.as_ref() else {
+            return;
+        };
+        (
+            v8::Local::new(scope, &hooks.net_done),
+            v8::Local::new(scope, &hooks.object),
+        )
+    };
+    for (id, response) in arrived {
+        let id = v8::Integer::new_from_unsigned(scope, id).into();
+        let response = ops::response_value(scope, response.as_ref());
+        v8::tc_scope!(let tc, scope);
+        if f.call(tc, recv.into(), &[id, response]).is_none() {
+            let msg = exception_message(tc);
+            state.borrow_mut().log_error(&msg);
+        }
+    }
 }

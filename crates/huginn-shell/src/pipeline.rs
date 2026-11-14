@@ -525,7 +525,7 @@ pub fn load_document(
         js_report = scripts::run(
             js,
             &mut doc,
-            &loader,
+            loader,
             &doc_url,
             referrer.as_deref().unwrap_or(""),
             &base,
@@ -563,7 +563,9 @@ pub fn load_document(
         }
         _ => None,
     };
-    let script_time = t.elapsed();
+    // Time the settle loop waited for scripts' requests is network time.
+    let script_time = t.elapsed().saturating_sub(js_report.net_wait);
+    fetch += js_report.net_wait;
 
     // 5. Style.
     let t = Instant::now();

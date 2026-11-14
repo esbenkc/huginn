@@ -10,7 +10,7 @@ publish.workspace = true
 [features]
 # Link V8 (the `v8` crate). Its build downloads a prebuilt static library
 # (~40 MB); without the feature Huginn runs no scripts.
-v8 = ["dep:v8", "dep:encoding_rs", "dep:flate2"]
+v8 = ["dep:v8", "dep:encoding_rs", "dep:flate2", "dep:parking_lot"]
 
 [dependencies]
 huginn-dom.workspace = true
@@ -20,3 +20,4 @@ url.workspace = true
 v8 = { workspace = true, optional = true }
 encoding_rs = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
