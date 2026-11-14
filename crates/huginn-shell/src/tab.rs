@@ -26,6 +26,7 @@ use huginn_paint::{CpuRasterizer, Rasterizer};
 use huginn_style::Viewport;
 
 use crate::engine::{Command, EngineEvent, EngineTx, Job, Links, Loaded, PostData};
+use crate::history::Transition;
 use crate::input::{CursorKind, Key, KeyEvent, Modifiers, MouseButton, MouseEvent, MouseKind};
 use crate::session::Shared;
 use crate::ui::{Canvas, Pixels, copy_row};
@@ -69,13 +70,15 @@ pub enum Request {
     ViewSource,
 }
 
-/// Where a new tab or window's first load comes from: the page that opened
-/// it (`Referer`, `SameSite`, `Sec-Fetch-Site`) and a form body. The
-/// default is the user (the address bar, a menu of the browser itself).
+/// Where a load comes from: the page that opened it (`Referer`,
+/// `SameSite`, `Sec-Fetch-Site`) and a form body. The default is the user
+/// (the address bar, a menu of the browser itself).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Opener {
     pub initiator: Option<Client>,
     pub post: Option<PostData>,
+    /// Typed or picked in the address bar: history counts a typed visit.
+    pub typed: bool,
 }
 
 /// The page on screen.
@@ -217,6 +220,8 @@ pub struct Tab {
     pub scroll: f32,
     /// Scroll position to apply when the loading page arrives.
     restore: Option<f32>,
+    /// How the load in progress came about, for history; `None`: a reload.
+    visit: Option<Transition>,
     /// A restored scroll position the page was too short for: lazy images
     /// laid out later may make room for it. Any other scroll drops it.
     pending_scroll: Option<f32>,
@@ -286,6 +291,7 @@ impl Tab {
             favicon: None,
             scroll: 0.0,
             restore: None,
+            visit: None,
             pending_scroll: None,
             width,
             height,
@@ -488,6 +494,10 @@ impl Tab {
                         v.links = l;
                     }
                     if let Some(t) = title {
+                        if t != self.title && !self.private && self.error.is_none() {
+                            let url = self.history[self.index].url.clone();
+                            self.shared.borrow_mut().title_changed(&url, &t);
+                        }
                         self.title = t;
                     }
                     self.strips.clear();
@@ -564,9 +574,10 @@ impl Tab {
             self.pending_scroll = Some(y);
         }
         self.dirty = true;
+        let how = self.visit.take().unwrap_or(Transition::Reload);
         if !self.private && self.error.is_none() {
             let url = self.history[self.index].url.clone();
-            self.shared.borrow_mut().visit(&url, &self.title);
+            self.shared.borrow_mut().visit(&url, &self.title, how);
         }
         interact::on_load(self);
         live::on_load(self);
@@ -585,15 +596,16 @@ impl Tab {
 
     /// Open `url` as a new history entry, as the user (address bar, bookmark).
     pub fn navigate(&mut self, url: Url) {
-        self.navigate_with(url, None, None);
+        self.navigate_with(url, Opener::default());
     }
 
-    pub(crate) fn navigate_with(
-        &mut self,
-        url: Url,
-        post: Option<PostData>,
-        initiator: Option<Client>,
-    ) {
+    /// Open `url` as a new history entry, coming from `from`.
+    pub(crate) fn navigate_with(&mut self, url: Url, from: Opener) {
+        let Opener {
+            initiator,
+            post,
+            typed,
+        } = from;
         if let Some(cur) = self.history.get_mut(self.index) {
             cur.scroll = self.scroll;
         }
@@ -627,7 +639,12 @@ impl Tab {
             });
             self.dirty = true;
         } else {
-            self.start_load(None, LoadKind::Normal);
+            let how = if typed {
+                Transition::Typed
+            } else {
+                Transition::Link
+            };
+            self.start_load(None, LoadKind::Normal, Some(how));
         }
     }
 
@@ -651,7 +668,7 @@ impl Tab {
         } else {
             LoadKind::Reload
         };
-        self.start_load(Some(self.scroll), kind);
+        self.start_load(Some(self.scroll), kind, None);
     }
 
     /// Stop the load in progress: keep showing the previous page.
@@ -694,15 +711,26 @@ impl Tab {
             self.set_scroll(scroll);
             self.dirty = true;
         } else {
-            self.start_load(Some(scroll), LoadKind::History);
+            self.start_load(
+                Some(scroll),
+                LoadKind::History,
+                Some(Transition::BackForward),
+            );
         }
     }
 
-    /// Load the current history entry; `kind`: how it uses the HTTP cache.
-    pub(crate) fn start_load(&mut self, restore: Option<f32>, kind: LoadKind) {
+    /// Load the current history entry; `kind`: how it uses the HTTP cache;
+    /// `visit`: what the load adds to history (`None`: a reload).
+    pub(crate) fn start_load(
+        &mut self,
+        restore: Option<f32>,
+        kind: LoadKind,
+        visit: Option<Transition>,
+    ) {
         self.generation += 1;
         self.loading = Some(Instant::now());
         self.restore = restore;
+        self.visit = visit;
         self.discarded = false;
         self.needs_layout = false;
         self.zoom = self.shared.borrow().zoom_for(&self.history[self.index].url);
@@ -743,16 +771,31 @@ impl Tab {
             self.request(Request::OpenTab {
                 url,
                 background: !mods.shift,
-                opener: Box::new(Opener { initiator, post }),
+                opener: Box::new(Opener {
+                    initiator,
+                    post,
+                    typed: false,
+                }),
             });
         } else if mods.shift {
             self.request(Request::OpenWindow {
                 url,
                 private: self.private,
-                opener: Box::new(Opener { initiator, post }),
+                opener: Box::new(Opener {
+                    initiator,
+                    post,
+                    typed: false,
+                }),
             });
         } else {
-            self.navigate_with(url, post, initiator);
+            self.navigate_with(
+                url,
+                Opener {
+                    initiator,
+                    post,
+                    typed: false,
+                },
+            );
         }
     }
 
@@ -788,7 +831,7 @@ impl Tab {
         if visible {
             if self.discarded {
                 let scroll = self.history[self.index].scroll;
-                self.start_load(Some(scroll), LoadKind::History);
+                self.start_load(Some(scroll), LoadKind::History, None);
             } else if self.needs_layout {
                 self.relayout();
             }
@@ -862,7 +905,7 @@ impl Tab {
         self.needs_layout = false;
         if self.stale {
             // The engine holds another page: load this one again.
-            self.start_load(Some(self.scroll), LoadKind::History);
+            self.start_load(Some(self.scroll), LoadKind::History, None);
         } else {
             let (generation, viewport) = (self.generation, self.viewport());
             self.send(|seq| Command::Resize {

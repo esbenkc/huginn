@@ -222,10 +222,20 @@ pub fn parse_input(input: &str) -> Option<Url> {
     if s.is_empty() {
         return None;
     }
-    parse_url(s).or_else(|| {
-        let q: String = url::form_urlencoded::byte_serialize(s.as_bytes()).collect();
-        Url::parse(&format!("{SEARCH}{q}")).ok()
-    })
+    parse_url(s).or_else(|| search_url(s))
+}
+
+/// The address bar's search for `query`.
+pub fn search_url(query: &str) -> Option<Url> {
+    let q: String = url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect();
+    Url::parse(&format!("{SEARCH}{q}")).ok()
+}
+
+/// A result page of the address bar's search (never suggested from
+/// history, like Chrome leaves out its default search engine's pages).
+/// DuckDuckGo answers `SEARCH` with a redirect to `html.duckduckgo.com`.
+pub fn is_search(url: &str) -> bool {
+    url.starts_with(SEARCH) || url.starts_with("https://html.duckduckgo.com/html/?")
 }
 
 /// Like [`parse_input`] without the search fallback.

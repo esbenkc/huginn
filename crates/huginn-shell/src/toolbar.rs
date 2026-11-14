@@ -37,12 +37,19 @@ pub enum ToolbarHit {
 }
 
 /// Result of a key in the focused address field.
+#[derive(Debug, PartialEq, Eq)]
 pub enum Edit {
     /// Enter: go to the text (modifiers pick the target).
     Go,
     /// Escape: put the URL back and leave the field.
     Cancel,
-    Changed,
+    /// The text changed. `inline`: it may be completed inline (typing at
+    /// the end; not a deletion, a cut or a paste, as in Chrome).
+    Text {
+        inline: bool,
+    },
+    /// Only the caret or the selection changed.
+    Caret,
     Ignored,
 }
 
@@ -52,7 +59,11 @@ pub struct Toolbar {
     pub text: String,
     /// Caret position in chars.
     pub caret: usize,
-    pub select_all: bool,
+    /// The other end of the selection, in chars; `caret` when nothing is
+    /// selected.
+    pub anchor: usize,
+    /// The selection is an inline completion (`set_completion`).
+    autofilled: bool,
     /// The button under the pointer.
     hover: Option<ToolbarHit>,
     /// Rendered toolbar and what it showed; `None` when it must be redrawn.
@@ -69,20 +80,61 @@ impl Toolbar {
         self.pixels = None;
     }
 
+    /// Focus the field with `text`, all of it selected.
     pub fn focus(&mut self, text: String) {
         self.focused = true;
         self.caret = text.chars().count();
+        self.anchor = 0;
         self.text = text;
-        self.select_all = true;
+        self.autofilled = false;
         self.invalidate();
     }
 
     pub fn blur(&mut self) {
         if self.focused {
             self.focused = false;
-            self.select_all = false;
+            self.anchor = self.caret;
+            self.autofilled = false;
             self.invalidate();
         }
+    }
+
+    /// The selection as (start, end) in chars, if any.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        (self.anchor != self.caret)
+            .then(|| (self.anchor.min(self.caret), self.anchor.max(self.caret)))
+    }
+
+    /// Replace the text (a suggestion picked with the arrow keys), caret at the end.
+    pub fn set_text(&mut self, text: String) {
+        self.caret = text.chars().count();
+        self.anchor = self.caret;
+        self.text = text;
+        self.autofilled = false;
+        self.invalidate();
+    }
+
+    /// Complete the text inline with `rest`, selected, so that typing on
+    /// replaces it and Backspace removes it.
+    pub fn set_completion(&mut self, rest: &str) {
+        self.anchor = self.len();
+        self.text.push_str(rest);
+        self.caret = self.len();
+        self.autofilled = !rest.is_empty();
+        self.invalidate();
+    }
+
+    /// An inline completion is shown (selected).
+    pub fn has_completion(&self) -> bool {
+        self.autofilled && self.selection().is_some()
+    }
+
+    /// Put the caret at the end and select nothing (a click in the focused field).
+    pub fn caret_to_end(&mut self) {
+        self.caret = self.len();
+        self.anchor = self.caret;
+        self.autofilled = false;
+        self.invalidate();
     }
 
     /// Track the pointer over the buttons (their hover box).
@@ -92,6 +144,11 @@ impl Toolbar {
             self.hover = hit;
             self.invalidate();
         }
+    }
+
+    /// The address field in toolbar CSS px (as last rendered).
+    pub fn field(&self) -> Rect {
+        self.field
     }
 
     pub fn hit(&self, x: f32, y: f32) -> Option<ToolbarHit> {
@@ -119,15 +176,21 @@ impl Toolbar {
         self.text.chars().count()
     }
 
+    /// Delete the selection. Returns whether there was one.
+    fn delete_selection(&mut self) -> bool {
+        let Some((a, b)) = self.selection() else {
+            return false;
+        };
+        self.delete_range(a, b);
+        true
+    }
+
     pub fn insert(&mut self, s: &str) {
-        if self.select_all {
-            self.text.clear();
-            self.caret = 0;
-            self.select_all = false;
-        }
+        self.delete_selection();
         let at = self.byte(self.caret);
         self.text.insert_str(at, s);
         self.caret += s.chars().count();
+        self.anchor = self.caret;
         self.invalidate();
     }
 
@@ -160,63 +223,110 @@ impl Toolbar {
         let (a, b) = (self.byte(from.min(to)), self.byte(from.max(to)));
         self.text.replace_range(a..b, "");
         self.caret = from.min(to);
+        self.anchor = self.caret;
+    }
+
+    /// The selected text, else all of it (Cmd+C, Cmd+X).
+    fn selected_text(&self) -> String {
+        match self.selection() {
+            Some((a, b)) => self.text[self.byte(a)..self.byte(b)].to_owned(),
+            None => self.text.clone(),
+        }
     }
 
     /// A key while the field has focus.
     pub fn edit(&mut self, ev: &KeyEvent) -> Edit {
         let m = ev.mods;
         let len = self.len();
-        match &ev.key {
+        let before = self.text.clone();
+        let r = match &ev.key {
             Key::Enter => return Edit::Go,
             Key::Escape => return Edit::Cancel,
             Key::Char(c) if m.cmd => match c.to_ascii_lowercase().as_str() {
-                "a" => self.select_all = true,
-                "c" => crate::clipboard::set(&self.text),
+                "a" => {
+                    self.anchor = 0;
+                    self.caret = len;
+                    Edit::Caret
+                }
+                "c" => {
+                    crate::clipboard::set(&self.selected_text());
+                    return Edit::Caret;
+                }
                 "x" => {
-                    crate::clipboard::set(&self.text);
-                    self.text.clear();
-                    self.caret = 0;
-                    self.select_all = false;
-                }
-                "v" => {
-                    if let Some(t) = crate::clipboard::get() {
-                        self.insert(&t.replace(['\n', '\r'], ""));
+                    crate::clipboard::set(&self.selected_text());
+                    if !self.delete_selection() {
+                        self.text.clear();
+                        self.caret = 0;
+                        self.anchor = 0;
                     }
+                    Edit::Text { inline: false }
                 }
+                "v" => match crate::clipboard::get() {
+                    Some(t) => {
+                        self.insert(&t.replace(['\n', '\r'], ""));
+                        Edit::Text { inline: false }
+                    }
+                    None => return Edit::Caret,
+                },
                 _ => return Edit::Ignored,
             },
             Key::Char(_) if m.ctrl => return Edit::Ignored,
-            Key::Char(s) => self.insert(s),
-            Key::Space => self.insert(" "),
-            Key::Backspace | Key::Delete if self.select_all => {
-                self.text.clear();
-                self.caret = 0;
-                self.select_all = false;
+            Key::Char(_) | Key::Space => {
+                self.insert(match &ev.key {
+                    Key::Char(s) => s,
+                    _ => " ",
+                });
+                Edit::Text {
+                    inline: self.caret == self.len(),
+                }
             }
-            Key::Backspace if m.cmd => self.delete_range(0, self.caret),
-            Key::Backspace if m.alt => self.delete_range(self.word_left(), self.caret),
-            Key::Backspace if self.caret > 0 => self.delete_range(self.caret - 1, self.caret),
-            Key::Delete if self.caret < len => self.delete_range(self.caret, self.caret + 1),
+            Key::Backspace | Key::Delete => {
+                if !self.delete_selection() {
+                    match &ev.key {
+                        Key::Backspace if m.cmd => self.delete_range(0, self.caret),
+                        Key::Backspace if m.alt => self.delete_range(self.word_left(), self.caret),
+                        Key::Backspace if self.caret > 0 => {
+                            self.delete_range(self.caret - 1, self.caret)
+                        }
+                        Key::Delete if self.caret < len => {
+                            self.delete_range(self.caret, self.caret + 1)
+                        }
+                        _ => {}
+                    }
+                }
+                Edit::Text { inline: false }
+            }
+            // Tab takes an inline completion, like Right at the end.
+            Key::Tab if self.has_completion() => {
+                self.caret = len;
+                self.anchor = len;
+                Edit::Caret
+            }
             Key::Left | Key::Right | Key::Home | Key::End | Key::Up | Key::Down => {
-                let all = std::mem::take(&mut self.select_all);
-                self.caret = match &ev.key {
-                    Key::Home | Key::Up => 0,
-                    Key::End | Key::Down => len,
-                    Key::Left if m.cmd => 0,
-                    Key::Right if m.cmd => len,
-                    Key::Left if all => 0,
-                    Key::Right if all => len,
-                    Key::Left if m.alt => self.word_left(),
-                    Key::Right if m.alt => self.word_right(),
-                    Key::Left => self.caret.saturating_sub(1),
+                let sel = self.selection();
+                self.caret = match (&ev.key, sel) {
+                    (Key::Home | Key::Up, _) => 0,
+                    (Key::End | Key::Down, _) => len,
+                    (Key::Left, _) if m.cmd => 0,
+                    (Key::Right, _) if m.cmd => len,
+                    (Key::Left, Some((a, _))) => a,
+                    (Key::Right, Some((_, b))) => b,
+                    (Key::Left, _) if m.alt => self.word_left(),
+                    (Key::Right, _) if m.alt => self.word_right(),
+                    (Key::Left, _) => self.caret.saturating_sub(1),
                     _ => (self.caret + 1).min(len),
                 };
+                self.anchor = self.caret;
+                Edit::Caret
             }
-            Key::Backspace | Key::Delete => {}
             _ => return Edit::Ignored,
-        }
+        };
+        self.autofilled = false;
         self.invalidate();
-        Edit::Changed
+        match r {
+            Edit::Text { .. } if self.text == before => Edit::Caret,
+            r => r,
+        }
     }
 
     /// The rendered toolbar for `info` at `width` window CSS px, rendering it if needed.
@@ -383,13 +493,12 @@ fn toolbar_html(
 ) -> String {
     let url = info.url.as_ref();
     let accent = theme::accent(info.private);
-    let (before, after, placeholder) = if t.focused {
-        let at = t.byte(t.caret);
-        (t.text[..at].to_owned(), t.text[at..].to_owned(), false)
+    let (before, placeholder) = if t.focused {
+        (String::new(), false)
     } else {
         let shown = url.map(display_url).unwrap_or_default();
         let empty = shown.is_empty();
-        (shown, String::new(), empty)
+        (shown, empty)
     };
     let (muted, line) = (theme::MUTED, theme::HAIRLINE);
     let security = match url.map(Url::scheme) {
@@ -403,7 +512,7 @@ fn toolbar_html(
         Some("huginn") if !placeholder => chip("Huginn", muted, line),
         _ => String::new(),
     };
-    let caret = if t.focused && !t.select_all {
+    let caret = if t.focused && t.selection().is_none() {
         format!(
             "<div id=caret style=\"width:1.5px;height:16px;background:{accent};flex-shrink:0\"></div>"
         )
@@ -413,15 +522,33 @@ fn toolbar_html(
     let text = if placeholder {
         format!("<div style=\"flex-shrink:0;color:{muted}\">Search DuckDuckGo or type a URL</div>")
     } else if t.focused {
-        format!(
-            "<div style=\"flex-shrink:0;{}\">{}</div>{caret}<div style=\"flex-shrink:0\">{}</div>",
-            if t.select_all {
-                format!("background:{}", theme::selection(info.private))
-            } else {
+        // Text before, in and after the selection; the caret at its end
+        // (where an inline completion keeps it) or its start.
+        let (a, b) = t.selection().unwrap_or((t.caret, t.caret));
+        let (a, b) = (t.byte(a), t.byte(b));
+        let part = |s: &str, style: &str| {
+            if s.is_empty() {
                 String::new()
-            },
-            escape_html(&before),
-            escape_html(&after),
+            } else {
+                format!(
+                    "<div style=\"flex-shrink:0;{style}\">{}</div>",
+                    escape_html(s)
+                )
+            }
+        };
+        let selected = part(
+            &t.text[a..b],
+            &format!("background:{}", theme::selection(info.private)),
+        );
+        let (first, second) = if t.byte(t.caret) == a && a != b {
+            (caret, selected)
+        } else {
+            (selected, caret)
+        };
+        format!(
+            "{}{first}{second}{}",
+            part(&t.text[..a], ""),
+            part(&t.text[b..], "")
         )
     } else {
         // Like Chrome: the host stands out, scheme and path are quieter.
@@ -512,8 +639,8 @@ mod tests {
     use super::*;
     use crate::input::Modifiers;
 
-    fn key(t: &mut Toolbar, key: Key, mods: Modifiers) {
-        t.edit(&KeyEvent { key, mods });
+    fn key(t: &mut Toolbar, key: Key, mods: Modifiers) -> Edit {
+        t.edit(&KeyEvent { key, mods })
     }
 
     #[test]
@@ -521,7 +648,7 @@ mod tests {
         let mut t = Toolbar::default();
         t.focus("example.com".into());
         key(&mut t, Key::Left, Modifiers::default());
-        assert_eq!((t.caret, t.select_all), (0, false));
+        assert_eq!((t.caret, t.selection()), (0, None));
         key(&mut t, Key::Char("x".into()), Modifiers::default());
         assert_eq!(t.text, "xexample.com");
         key(
@@ -546,6 +673,57 @@ mod tests {
         key(&mut t, Key::Home, Modifiers::default());
         key(&mut t, Key::Delete, Modifiers::default());
         assert_eq!(t.text, "example");
+    }
+
+    #[test]
+    fn an_inline_completion_is_selected_typed_over_deleted_or_taken() {
+        let none = Modifiers::default;
+        let mut t = Toolbar::default();
+        t.focus(String::new());
+        let typed = key(&mut t, Key::Char("k".into()), none());
+        assert_eq!(typed, Edit::Text { inline: true });
+        t.set_completion("ran.ai");
+        assert_eq!((t.text.as_str(), t.selection()), ("kran.ai", Some((1, 7))));
+        assert!(t.has_completion());
+        // Typing replaces the completion.
+        let typed = key(&mut t, Key::Char("r".into()), none());
+        assert_eq!(
+            (typed, t.text.as_str()),
+            (Edit::Text { inline: true }, "kr")
+        );
+        // Backspace and Delete remove only the completion, and ask for no new one.
+        t.set_completion("an.ai");
+        let deleted = key(&mut t, Key::Backspace, none());
+        assert_eq!(
+            (deleted, t.text.as_str()),
+            (Edit::Text { inline: false }, "kr")
+        );
+        t.set_completion("an.ai");
+        let deleted = key(&mut t, Key::Delete, none());
+        assert_eq!(
+            (deleted, t.text.as_str()),
+            (Edit::Text { inline: false }, "kr")
+        );
+        // Tab and Right take it: the caret goes to the end.
+        for k in [Key::Tab, Key::Right] {
+            t.set_text("kr".into());
+            t.set_completion("an.ai");
+            assert_eq!(key(&mut t, k, none()), Edit::Caret);
+            assert_eq!(
+                (t.text.as_str(), t.selection(), t.caret),
+                ("kran.ai", None, 7)
+            );
+            assert!(!t.has_completion());
+        }
+        // Without a completion Tab is not the field's.
+        assert_eq!(key(&mut t, Key::Tab, none()), Edit::Ignored);
+        // Typing away from the end does not ask for a completion.
+        key(&mut t, Key::Left, none());
+        let typed = key(&mut t, Key::Char("x".into()), none());
+        assert_eq!(
+            (typed, t.text.as_str()),
+            (Edit::Text { inline: false }, "kran.axi")
+        );
     }
 
     #[test]
