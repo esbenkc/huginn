@@ -131,6 +131,11 @@ pub struct LayoutBox {
     /// Scrolling area size from the padding box origin, at least the padding
     /// box (CSSOM View `scrollWidth`/`scrollHeight`).
     pub scroll_size: Size,
+    /// Scroll offset (left, top) of a scroll container, clamped to the
+    /// scrolling area: its content is drawn moved up and left by it. `None`
+    /// for other boxes, and for the root or body whose overflow applies to
+    /// the viewport.
+    pub scroll_offset: Option<(f32, f32)>,
     /// Decoded `background-image`, if the style has one and it loaded.
     pub background_image: Option<DecodedImage>,
     /// Decoded `mask-image` URL, if the style has one and it loaded.

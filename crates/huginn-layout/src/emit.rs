@@ -130,16 +130,17 @@ impl Emitter<'_, '_> {
         };
         let scroller = is_scroll_container(&n.style)
             && (n.node.is_none() || !self.viewport_overflow.contains(&n.node));
-        let (sx, sy) = match n.node {
+        let scroll_offset = match n.node {
             Some(node) if scroller => {
                 let (sx, sy) = self.input.document.scroll_offset(node);
-                (
+                Some((
                     sx.clamp(0.0, scroll_size.width - pad.width),
                     sy.clamp(0.0, scroll_size.height - pad.height),
-                )
+                ))
             }
-            _ => (0.0, 0.0),
+            _ => None,
         };
+        let (sx, sy) = scroll_offset.unwrap_or_default();
         out.boxes.push(LayoutBox {
             node: n.node,
             style: n.style.clone(),
@@ -148,6 +149,7 @@ impl Emitter<'_, '_> {
             border,
             padding,
             scroll_size,
+            scroll_offset,
             background_image,
             mask_image,
             parent,

@@ -1,0 +1,14 @@
+<!doctype html>
+<title>start</title>
+<style>
+  body { margin: 0; height: 2000px }
+  #box { position: absolute; top: 0; left: 0; width: 300px; height: 200px; overflow: auto }
+  /* A full-window layer that lets pointer events through (overlay containers). */
+  #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none }
+</style>
+<div id="box"><div style="height: 1000px">tall</div></div>
+<div id="overlay"></div>
+<script>
+  const box = document.getElementById('box');
+  box.addEventListener('scroll', () => { document.title = 'scrolled ' + box.scrollTop; });
+</script>

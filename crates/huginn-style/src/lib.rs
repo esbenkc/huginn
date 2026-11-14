@@ -111,6 +111,8 @@ pub struct ComputedStyle {
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
     pub visibility: Visibility,
+    /// Inherited, like `visibility`.
+    pub pointer_events: PointerEvents,
     pub opacity: f32,
 
     // Sizing
@@ -253,6 +255,7 @@ impl Default for ComputedStyle {
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
             visibility: Visibility::Visible,
+            pointer_events: PointerEvents::Auto,
             opacity: 1.0,
             width: LengthPercentageAuto::Auto,
             height: LengthPercentageAuto::Auto,
@@ -347,6 +350,7 @@ impl ComputedStyle {
     pub fn inherit_from(parent: &ComputedStyle) -> ComputedStyle {
         ComputedStyle {
             visibility: parent.visibility,
+            pointer_events: parent.pointer_events,
             color: parent.color,
             font_family: parent.font_family.clone(),
             font_size: parent.font_size,

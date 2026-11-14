@@ -443,8 +443,10 @@ pub(super) fn prefetch_pending_scripts(scope: &v8::PinScope<'_, '_>, st: &Shared
         .collect();
     if urls.len() > 1 {
         let loader = cx.loader;
-        let _ = loader.map_parallel(&urls, |(u, cors)| {
-            loader.fetch_with(u, ResourceKind::Script, *cors)
+        let _ = super::network_wait(st, || {
+            loader.map_parallel(&urls, |(u, cors)| {
+                loader.fetch_with(u, ResourceKind::Script, *cors)
+            })
         });
     }
 }
@@ -472,7 +474,9 @@ pub(super) fn run_external_script(
                 let cors = doc
                     .element(node)
                     .map_or(CorsSettings::NoCors, |e| crate::script_cors(e, kind));
-                match cx.loader.fetch_with(&url, ResourceKind::Script, cors) {
+                match super::network_wait(st, || {
+                    cx.loader.fetch_with(&url, ResourceKind::Script, cors)
+                }) {
                     Ok(r) => (r.text().into_owned(), r.url.to_string(), kind),
                     Err(_) => return false,
                 }
@@ -824,7 +828,7 @@ op!(op_fetch(scope, args, rv) {
         }
     }
     let req = ScriptRequest { url, method, headers, body, mode, credentials, redirect };
-    let r = match cx.loader.fetch_for_script(req) {
+    let r = match super::network_wait(&state(scope), || cx.loader.fetch_for_script(req)) {
         Ok(r) => r,
         Err(e) => {
             if state(scope).borrow().options.console {

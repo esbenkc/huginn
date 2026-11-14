@@ -64,6 +64,8 @@ for (const n of HANDLER_NAMES.concat(['beforeunload', 'hashchange', 'message', '
 }
 try { Object.setPrototypeOf(G, Window.prototype); } catch (e) { /* keep Object.prototype */ }
 defProp(G, Symbol.toStringTag, { value: 'Window', configurable: true });
+// Last, when every interface has all its members.
+for (const C of interfaces) idlEnumerable(C);
 
 // ----------------------------------------------------------- engine hooks --
 

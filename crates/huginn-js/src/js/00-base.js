@@ -41,12 +41,32 @@ function tag(C, name) {
   return C;
 }
 
+// Every exposed interface, for `idlEnumerable` at the end of the prelude.
+const interfaces = [];
+
 // Make an interface object visible on the global object.
 function expose(C, name) {
   name = name || C.name;
   tag(C, name);
   defProp(G, name, { value: C, writable: true, configurable: true });
+  interfaces.push(C);
   return C;
+}
+
+// WebIDL makes the attributes, operations and constants of an interface
+// enumerable, on its prototype and on the interface object. Class syntax
+// makes them non-enumerable. Some libraries copy an API with `for...in`
+// (Zone.js wraps MutationObserver and IntersectionObserver that way), so
+// they would miss every method. Names that start with `_` are Huginn
+// internals and stay hidden.
+function idlEnumerable(C) {
+  for (const [obj, skip] of [[C.prototype, ['constructor']], [C, ['length', 'name', 'prototype']]]) {
+    for (const k of Object.getOwnPropertyNames(obj)) {
+      if (k[0] === '_' || skip.includes(k)) continue;
+      const d = Object.getOwnPropertyDescriptor(obj, k);
+      if (!d.enumerable && d.configurable) { d.enumerable = true; defProp(obj, k, d); }
+    }
+  }
 }
 
 function str(v) { return v == null ? '' : String(v); }
@@ -165,8 +185,8 @@ class Event {
   }
 }
 for (const [k, v] of [['NONE', 0], ['CAPTURING_PHASE', 1], ['AT_TARGET', 2], ['BUBBLING_PHASE', 3]]) {
-  defProp(Event, k, { value: v });
-  defProp(Event.prototype, k, { value: v });
+  defProp(Event, k, { value: v, enumerable: true });
+  defProp(Event.prototype, k, { value: v, enumerable: true });
 }
 expose(Event);
 

@@ -100,7 +100,10 @@ network; Linux only, `null` elsewhere). `--no-js` (or `HUGINN_NO_JS=1`) turns sc
   compiler or GC threads) and `--lite-mode` (interpreter only: no JIT code,
   lazy feedback vectors; about half the V8 heap on script-heavy pages at the
   same wall time). It gets the document through `HostContext` for each
-  call. A small watchdog thread terminates a call that runs past 2 s.
+  call. A small watchdog thread terminates a call that runs past 2 s. Each
+  timer task gets the whole budget (a round starts no new task after it),
+  and time the thread waits for the network (sync `fetch`/XHR, inserted
+  scripts, modules) does not count.
 - `huginn open` has two threads of its own; see the next section.
 
 ## The window (`huginn open`)
@@ -336,6 +339,13 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   still runs on the whole tree: Taffy's caches are cleared each pass,
   because what they return depends on earlier measurements.
   `HUGINN_KEEP_TREE=0` turns it off.
+- **Scrolling.** A wheel turn scrolls the innermost `overflow-y: auto` or
+  `scroll` container under the pointer that can still move that way, else
+  the page (scroll chaining). The engine sets the offset, fires `scroll` at
+  the element and lays out again; layout draws content at the offset
+  (`LayoutBox::scroll_offset`). Offsets that scripts set (`scrollTop`) show
+  the same way. Hit testing skips `pointer-events: none` boxes (overlay
+  containers that cover the window).
 - **Requests from scripts.** `location.href/assign/replace/reload`,
   `form.submit()`, `requestSubmit()`, `a.click()` become
   `HostRequest::Navigate`; `javascript:` URLs run in the page.
@@ -348,7 +358,10 @@ with `keep_js`; `huginn render` still drops the isolate before style).
   `change` in React 18's event system, `hashchange` routing). Form named
   access (`form.q`), `form.reset()` restoring defaults, IME, multi-line
   caret by clicks in wrapped textareas, `<select multiple>`, drag and drop,
-  `contenteditable`. XHR/fetch after load block the tab's engine thread.
+  `contenteditable`. XHR/fetch after load block the tab's engine thread,
+  one request at a time. No `wheel` events, and keys scroll only the page.
+  Web fonts and inline `<svg>` that scripts add after load are not loaded
+  (`resources::load_added` loads images only).
 
 ## Timing (`perf.rs`)
 

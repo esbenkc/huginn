@@ -591,6 +591,10 @@ pub(crate) fn convert(cx: &Cx, s: &ComputedValues) -> ComputedStyle {
             c::Visibility::Hidden => Visibility::Hidden,
             c::Visibility::Collapse => Visibility::Collapse,
         },
+        pointer_events: match s.get_inherited_ui().pointer_events {
+            c::PointerEvents::None => PointerEvents::None,
+            _ => PointerEvents::Auto,
+        },
         opacity: effects.opacity,
         width: cx.size(&pos.width),
         height: cx.size(&pos.height),

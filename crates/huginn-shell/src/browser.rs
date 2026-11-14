@@ -657,8 +657,10 @@ impl Browser {
         }
     }
 
-    pub fn scroll_by(&mut self, dy: f32) {
-        self.tab_mut_active().scroll_by(dy);
+    /// A wheel turn of `dy` CSS px at the pointer ([`Tab::wheel`]).
+    pub fn wheel(&mut self, dy: f32) {
+        let (x, y) = self.pointer;
+        self.tab_mut_active().wheel(x, y, dy);
     }
 
     /// A finished two-finger trackpad swipe with total movement (`dx`, `dy`)

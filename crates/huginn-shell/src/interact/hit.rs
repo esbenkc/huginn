@@ -2,7 +2,7 @@
 
 use huginn_dom::NodeId;
 use huginn_layout::{BoxId, BoxKind, LayoutTree, Rect};
-use huginn_style::{Position, Visibility};
+use huginn_style::{PointerEvents, Position, Visibility};
 
 /// The innermost DOM node at document point (`x`, `y`), in CSS px: the box
 /// painted on top there ([`topmost_box`]), then the innermost inline element
@@ -32,12 +32,13 @@ pub fn node_at(tree: &LayoutTree, x: f32, y: f32) -> Option<NodeId> {
     None
 }
 
-/// The visible box painted on top at the point, in an approximation of CSS
+/// The visible box painted on top at the point that takes pointer events
+/// (`pointer-events: none` boxes let them through), in an approximation of CSS
 /// paint order: a descendant over its ancestor; between two branches,
 /// below their common ancestor, a higher `z-index` (of the outermost
 /// positioned box on the branch that sets one) wins, then a branch with a
 /// positioned box over an in-flow one, then the later branch in tree order.
-fn topmost_box(tree: &LayoutTree, x: f32, y: f32) -> Option<BoxId> {
+pub fn topmost_box(tree: &LayoutTree, x: f32, y: f32) -> Option<BoxId> {
     let chain = |id: BoxId| {
         let mut out = vec![id];
         while let Some(p) = tree.get(*out.last().expect("not empty")).parent {
@@ -77,7 +78,11 @@ fn topmost_box(tree: &LayoutTree, x: f32, y: f32) -> Option<BoxId> {
     tree.boxes
         .iter()
         .enumerate()
-        .filter(|(_, b)| contains(b.rect, x, y) && b.style.visibility == Visibility::Visible)
+        .filter(|(_, b)| {
+            contains(b.rect, x, y)
+                && b.style.visibility == Visibility::Visible
+                && b.style.pointer_events == PointerEvents::Auto
+        })
         .map(|(i, _)| BoxId(i as u32))
         .reduce(|best, c| if above(c, best) { c } else { best })
 }

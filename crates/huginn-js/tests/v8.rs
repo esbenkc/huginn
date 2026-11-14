@@ -321,6 +321,95 @@ fn errors_are_reported_and_runaway_scripts_stopped() {
 }
 
 #[test]
+fn interface_members_are_enumerable_like_webidl() {
+    // Zone.js (Angular) wraps MutationObserver this way: it copies the
+    // members it finds with `for...in` on an instance.
+    let mut p = Page::new("<body></body>");
+    p.run(
+        r#"
+        const Orig = MutationObserver;
+        window.MutationObserver = function (cb) { this.inner = new Orig(cb); };
+        for (const k in new Orig(function () {})) {
+            if (typeof Orig.prototype[k] === 'function') {
+                MutationObserver.prototype[k] = function () { return this.inner[k].apply(this.inner, arguments); };
+            }
+        }
+        new MutationObserver(() => { document.body.id = 'seen'; }).observe(document.body, { childList: true });
+        document.body.appendChild(document.createElement('p'));
+        const d = (o, k) => Object.getOwnPropertyDescriptor(o, k).enumerable;
+        if (!d(Node.prototype, 'appendChild') || !d(Node, 'ELEMENT_NODE') || !d(Element.prototype, 'id'))
+            throw new Error('members are not enumerable');
+        if (d(Node.prototype, 'constructor')) throw new Error('constructor is enumerable');
+        for (const k in new XMLHttpRequest()) if (k[0] === '_') throw new Error('internal member ' + k);
+        "#,
+    )
+    .unwrap();
+    assert!(p.doc.element_by_id("seen").is_some());
+}
+
+#[test]
+fn network_waits_and_earlier_tasks_do_not_use_up_the_script_budget() {
+    // Every response takes 150 ms; four sync requests wait 600 ms, three
+    // times the 200 ms budget, but the script runs for far less.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        for stream in listener.incoming().flatten() {
+            let mut r = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while r.read_line(&mut line).is_ok_and(|n| n > 2) {
+                line.clear();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let mut s = stream;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            );
+        }
+    });
+    let mut p = Page::with_options(
+        "<body></body>",
+        EngineOptions {
+            call_budget_ms: 200,
+            console: false,
+        },
+    );
+    p.run(&format!(
+        r#"
+        let text = '';
+        for (let i = 0; i < 4; i++) {{
+            const x = new XMLHttpRequest();
+            x.open('GET', 'http://127.0.0.1:{port}/' + i, false);
+            x.send();
+            text += x.responseText;
+        }}
+        document.body.id = text;
+        // Three timer tasks of 80 ms each: together past the budget, each
+        // one within it.
+        for (let i = 0; i < 3; i++) setTimeout(() => {{
+            const end = performance.now() + 80;
+            while (performance.now() < end) {{}}
+            document.body.dataset['t' + i] = '1';
+        }}, 0);
+        "#
+    ))
+    .unwrap();
+    assert!(p.doc.element_by_id("okokokok").is_some());
+    // Timers count from the time in the call, after the requests.
+    p.load(2000.0);
+    let body = p.doc.body().unwrap();
+    for k in ["data-t0", "data-t1", "data-t2"] {
+        assert_eq!(
+            p.doc.attribute(body, &huginn_dom::LocalName::from(k)),
+            Some("1"),
+            "{k}"
+        );
+    }
+}
+
+#[test]
 fn location_url_and_storage() {
     let mut p = Page::new("<body></body>");
     p.run(

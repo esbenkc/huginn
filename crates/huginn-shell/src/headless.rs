@@ -6,7 +6,8 @@
 //!
 //! - `wait`: until every engine has answered everything (loads, relayouts)
 //! - `sleep <ms>`: handle engine events for `ms` real milliseconds (timers)
-//! - `scroll <dy>`: scroll by CSS px (like the wheel)
+//! - `scroll <dy>`: a wheel turn of `dy` CSS px at the pointer (`move`
+//!   first to scroll a scroll container in the page)
 //! - `swipe <dx> <dy>`: a finished two-finger trackpad swipe (CSS px)
 //! - `key <chord>`: e.g. `space`, `shift+space`, `cmd+t`, `cmd+alt+right`,
 //!   `ctrl+shift+tab`, `cmd+shift+backspace`, `alt+enter` (`opt` = `alt`)
@@ -172,7 +173,7 @@ pub fn apply(s: &mut Session, cmd: &str, scale: f32) -> Result<Step, String> {
         return Err("no window".into());
     };
     match verb {
-        "scroll" => w.scroll_by(rest.parse().map_err(|_| bad())?),
+        "scroll" => w.wheel(rest.parse().map_err(|_| bad())?),
         "swipe" => {
             let v = nums(2)?;
             w.swipe(v[0], v[1]);
