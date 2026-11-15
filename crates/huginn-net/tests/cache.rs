@@ -385,6 +385,40 @@ fn reload_revalidates_the_document_and_hard_reload_skips_the_cache() {
 }
 
 #[test]
+fn a_document_from_the_cache_is_not_streamed() {
+    let s = serve(|r| {
+        if r.header("if-none-match") == Some("\"d\"") {
+            return Reply {
+                status: "304 Not Modified",
+                ..Reply::default()
+            };
+        }
+        ok(
+            &[("Cache-Control", "no-cache"), ("ETag", "\"d\"")],
+            b"<p>doc",
+        )
+    });
+    let net = network(HttpCache::in_memory(1 << 20));
+    let doc = s.url("/doc");
+    // What the preload scanner would see: the pieces of the body.
+    let streamed = || {
+        let l = Loader::with_network(net.clone());
+        let mut pieces: Vec<Vec<u8>> = Vec::new();
+        let (r, _) = l
+            .navigate_streaming(&doc, None, None, &mut |_, b| pieces.push(b.to_vec()))
+            .unwrap();
+        assert_eq!(r.body, b"<p>doc");
+        pieces.concat()
+    };
+    // From the network, the body arrives piece by piece.
+    assert_eq!(streamed(), b"<p>doc");
+    // After a 304 it comes from the cache, all at once: the parser reads it
+    // right away, and a scan before it would only add a tokenizer pass.
+    assert!(streamed().is_empty());
+    assert_eq!(s.requests("/doc").len(), 2);
+}
+
+#[test]
 fn a_script_with_a_validator_gets_the_server_answer() {
     let s = serve(|r| {
         if r.header("if-none-match").is_some() {

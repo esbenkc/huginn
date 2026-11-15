@@ -435,8 +435,8 @@ pub fn load_document(
     };
     // The window's first paint goes first: requests that scripts send from
     // threads of their own (`fetch()`, async XHR), and low-priority preloads
-    // (images, async and module scripts, other media), wait until it has its
-    // stylesheets, images and fonts (the guard drops when this returns).
+    // (images, async and module scripts), wait until it has its stylesheets,
+    // images and fonts (the guard drops when this returns).
     // `render` waits for scripts' requests before style (scripts.rs), so it
     // holds none.
     let _first_paint = live.then(|| loader.hold_script_requests());

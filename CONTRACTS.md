@@ -635,8 +635,8 @@ impl Loader {
     /// `anonymous` requests (CSS Fonts); the rest no-cors. Document = a browser-started navigation.
     pub fn fetch_uncached(&self, url: &Url, kind: ResourceKind) -> Result<Resource, NetError>;
     /// fetch_uncached only if nothing has to be sent: data:/file: URLs, preloads that are in
-    /// and fresh HTTP cache entries (a hard reload has none); None otherwise. The window loads
-    /// these before its first paint.
+    /// and fresh HTTP cache entries (a hard reload has none); None otherwise. A cache hit drops
+    /// a queued preload of the same request. The window loads these before its first paint.
     pub fn fetch_cached(&self, url: &Url, kind: ResourceKind) -> Option<Resource>;
     /// Top-level GET or form POST (content type, body); initiator = the page that started it.
     /// Returns the document and its referrer (document.referrer).
@@ -644,7 +644,8 @@ impl Loader {
         -> Result<(Resource, Option<String>), NetError>;
     /// navigate, and on_body sees the document while it arrives (http(s), 2xx, after redirects):
     /// the head (body empty) with no bytes, then each piece with Content-Encoding undone. Runs on
-    /// the calling thread between reads; must not block.
+    /// the calling thread between reads; must not block. Not called for a body from the HTTP
+    /// cache (fresh, or after a 304).
     pub fn navigate_streaming<'a>(&self, url: &Url, post: Option<(&str, &'a [u8])>,
         initiator: Option<&Client>, on_body: &'a mut (dyn FnMut(&Resource, &[u8]) + 'a))
         -> Result<(Resource, Option<String>), NetError>;

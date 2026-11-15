@@ -722,7 +722,8 @@ impl Loader {
     /// hit is logged like any other), and preloads that are in. `None`
     /// otherwise, without sending anything. A hard reload takes nothing
     /// from the cache. The window loads these before its first paint and
-    /// the rest after it.
+    /// the rest after it. A preload of the same request that has not gone
+    /// yet is dropped when the cache answers, so the entry is read once.
     pub fn fetch_cached(&self, url: &Url, kind: ResourceKind) -> Option<Resource> {
         if !matches!(url.scheme(), "http" | "https") {
             return self.fetch_uncached(url, kind).ok();
@@ -730,33 +731,36 @@ impl Loader {
         if kind == ResourceKind::Document {
             return None;
         }
-        let cors = request_cors(url, kind);
-        if let Some(r) = self.take_finished(&preload::Key {
+        let key = preload::Key {
             url: url.clone(),
             kind,
-            cors,
-        }) {
+            cors: request_cors(url, kind),
+        };
+        if let Some(r) = self.take_finished(&key) {
             return r.map(Resource::unshare).ok();
         }
         if self.load.lock().subresources() != CacheMode::Default {
             return None;
         }
-        let (mode, credentials) = cors.mode();
-        self.send(Request {
-            url: url.clone(),
-            method: "GET".into(),
-            headers: Vec::new(),
-            body: None,
-            kind,
-            mode,
-            credentials,
-            redirect: RedirectMode::Follow,
-            client: self.client(),
-            any_status: false,
-            cache: CacheMode::OnlyFresh,
-            on_body: None,
-        })
-        .ok()
+        let (mode, credentials) = key.cors.mode();
+        let hit = self
+            .send(Request {
+                url: url.clone(),
+                method: "GET".into(),
+                headers: Vec::new(),
+                body: None,
+                kind,
+                mode,
+                credentials,
+                redirect: RedirectMode::Follow,
+                client: self.client(),
+                any_status: false,
+                cache: CacheMode::OnlyFresh,
+                on_body: None,
+            })
+            .ok()?;
+        self.cancel_queued(&key);
+        Some(hit)
     }
 
     /// A document from the web may not load `file:` subresources (scripts,
@@ -829,7 +833,9 @@ impl Loader {
     /// the response head (`Resource::body` is always empty) with no bytes,
     /// then each piece of the body with `Content-Encoding` undone, in
     /// order. It runs on the calling thread between reads, so it must not
-    /// block; the preload scanner starts requests from it.
+    /// block; the preload scanner starts requests from it. A body from the
+    /// HTTP cache (fresh, or after a 304) does not arrive: `on_body` is not
+    /// called, and the parser has it all at once.
     pub fn navigate_streaming<'a>(
         &self,
         url: &Url,
@@ -1435,30 +1441,28 @@ impl Loader {
                     .to_ascii_lowercase()
             });
             let charset = header.as_deref().and_then(charset_param).map(str::to_owned);
-            // The head the observer of a streamed body sees with each piece.
-            let head = req.on_body.as_ref().map(|_| Resource {
-                url: url.clone(),
-                status,
-                content_type: content_type.clone(),
-                charset: charset.clone(),
-                headers: headers.clone(),
-                response_type: tainting,
-                redirected,
-                body: Vec::new(),
-            });
             let body = match (response.as_mut(), cached_body) {
-                (_, Some(body)) => {
-                    if let (Some(f), Some(head)) = (req.on_body.as_mut(), &head) {
-                        f(head, &[]);
-                        f(head, &body);
-                    }
-                    body
-                }
+                // A body from the HTTP cache is not streamed: it is all
+                // here, and the parser reads it at once.
+                (_, Some(body)) => body,
                 (Some(_), None) if req.method == "HEAD" => Vec::new(),
                 (Some(resp), None) => {
-                    let body = match (req.on_body.as_mut(), &head) {
-                        (Some(f), Some(head)) => read_body_streaming(resp, &url, head, &mut **f)?,
-                        _ => read_body(resp, &headers, &url)?,
+                    let body = match req.on_body.as_mut() {
+                        Some(f) => {
+                            // The head the observer sees with each piece.
+                            let head = Resource {
+                                url: url.clone(),
+                                status,
+                                content_type: content_type.clone(),
+                                charset: charset.clone(),
+                                headers: headers.clone(),
+                                response_type: tainting,
+                                redirected,
+                                body: Vec::new(),
+                            };
+                            read_body_streaming(resp, &url, &head, &mut **f)?
+                        }
+                        None => read_body(resp, &headers, &url)?,
                     };
                     let (h, body) = store(status, headers, body);
                     headers = h;

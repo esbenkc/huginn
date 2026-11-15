@@ -379,7 +379,7 @@ fn run(
                     huginn_net::log_phase("complete");
                     // The load is done: from now on the page's requests use
                     // the cache as usual, also after a hard reload. Preloads
-                    // nothing took (other media, unused images) are dropped.
+                    // nothing took (unused images, preload links) are dropped.
                     cur.live.loader().set_load_kind(LoadKind::Normal);
                     cur.live.loader().clear_preloads();
                     current = Some(cur);

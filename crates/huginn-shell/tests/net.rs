@@ -96,6 +96,11 @@ fn html(head: &str, body: &str) -> (String, String) {
 
 /// Run `script` on `target` in an 800x600 window; return the `state` lines.
 fn run(target: &str, script: &str, env: &[(&str, &str)]) -> Vec<Value> {
+    run_logged(target, script, env).0
+}
+
+/// [`run`], also returning what the binary wrote to stderr.
+fn run_logged(target: &str, script: &str, env: &[(&str, &str)]) -> (Vec<Value>, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_huginn"));
     cmd.args([
         "open",
@@ -113,16 +118,14 @@ fn run(target: &str, script: &str, env: &[(&str, &str)]) -> Vec<Value> {
         cmd.env(k, v);
     }
     let out = cmd.output().expect("run huginn");
-    assert!(
-        out.status.success(),
-        "huginn open failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "huginn open failed: {stderr}");
+    let states = String::from_utf8(out.stdout)
         .expect("UTF-8 stdout")
         .lines()
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSON line {l:?}: {e}")))
-        .collect()
+        .collect();
+    (states, stderr)
 }
 
 fn title(s: &Value) -> &str {
@@ -465,6 +468,75 @@ fn revisits_use_the_http_cache_and_a_hard_reload_skips_it() {
     assert_eq!(doc[2].header("if-none-match"), "\"p1\"");
     assert_eq!(doc[2].header("cache-control"), "max-age=0");
     assert_eq!(doc[3].header("if-none-match"), "");
+}
+
+#[test]
+fn a_revisit_reads_each_cached_file_once_and_in_time_for_the_first_paint() {
+    // A document revalidated on the revisit (it comes from the cache, all
+    // at once) and one fetched again (`no-store`: it arrives from the
+    // network and the preload scanner reads it); both use a cached
+    // stylesheet and image.
+    for doc in [
+        "Cache-Control: no-cache\nETag: \"p1\"",
+        "Cache-Control: no-store",
+    ] {
+        let (port, log) = serve(move |r| match r.path.as_str() {
+            "/" if r.header("if-none-match") == "\"p1\"" => {
+                ("304 Not Modified".into(), String::new())
+            }
+            "/" => html(
+                doc,
+                "<link rel=stylesheet href=/s.css><title>Cached</title><p>hi<img src=/i.svg>",
+            ),
+            "/s.css" => (
+                "200 OK\nContent-Type: text/css\nCache-Control: max-age=600".into(),
+                "p { color: red }".into(),
+            ),
+            "/i.svg" => (
+                "200 OK\nContent-Type: image/svg+xml\nCache-Control: max-age=600".into(),
+                "<svg xmlns='http://www.w3.org/2000/svg' width='40' height='40'/>".into(),
+            ),
+            _ => ("404 Not Found".into(), String::new()),
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        let blank = "key cmd+l; type about:blank; key enter; wait";
+        // The revisit stays open a while, so a late second read would show.
+        let (s, stderr) = run_logged(
+            &url,
+            &format!("wait; {blank}; key cmd+l; type {url}; key enter; wait; state; sleep 300"),
+            &[("HUGINN_NET_LOG", "1")],
+        );
+        assert_eq!(title(&s[0]), "Cached");
+        // The net log from the revisit's start. The window holds the
+        // image's preload while it loads its first paint, which takes the
+        // image from the cache.
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("huginn: net:") || l.starts_with("huginn: load:"))
+            .collect();
+        let start = lines
+            .iter()
+            .rposition(|l| l.starts_with("huginn: load:") && l.ends_with(" load"))
+            .expect("load mark");
+        let revisit = &lines[start..];
+        let paint = revisit
+            .iter()
+            .position(|l| l.ends_with(" first paint (laid out)"))
+            .expect("first paint mark");
+        for path in ["/s.css", "/i.svg"] {
+            let reads: Vec<usize> = (0..revisit.len())
+                .filter(|&i| revisit[i].ends_with(&format!(":{port}{path}")))
+                .collect();
+            // One read each, from the cache, in time for the first paint.
+            assert_eq!(reads.len(), 1, "{doc} {path}: {revisit:#?}");
+            assert!(revisit[reads[0]].contains(" hit "), "{revisit:#?}");
+            assert!(reads[0] < paint, "{doc} {path}: {revisit:#?}");
+        }
+        let log = log.lock().unwrap();
+        for path in ["/s.css", "/i.svg"] {
+            assert_eq!(log.iter().filter(|r| r.path == path).count(), 1);
+        }
+    }
 }
 
 #[test]
@@ -910,9 +982,9 @@ type Arrivals = Arc<Mutex<Vec<(String, u128)>>>;
 type Start = Arc<Mutex<std::time::Instant>>;
 
 /// Serve a document whose `<head>` comes at once and whose body comes
-/// `BODY_MS` later (chunked), plus `/a.css` (300 ms) and `/print.css`
-/// (3 s). `head` and `body` get the port of the second server for `{other}`.
-/// Logs every request, and `doc end` when the body ended.
+/// `BODY_MS` later (chunked), plus `/a.css` (300 ms). `head` and `body` get
+/// the port of the second server for `{other}`. Logs every request, and
+/// `doc end` when the body ended.
 fn serve_streamed(head: &'static str, body: &'static str, other: u16) -> (u16, Arrivals, Start) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -958,7 +1030,6 @@ fn serve_streamed(head: &'static str, body: &'static str, other: u16) -> (u16, A
                 }
                 let (delay, body) = match path.as_str() {
                     "/a.css" => (300, "p { color: rgb(0, 128, 0) }"),
-                    "/print.css" => (3000, "p { color: red }"),
                     _ => (0, ""),
                 };
                 std::thread::sleep(Duration::from_millis(delay));
@@ -1016,10 +1087,11 @@ fn the_preload_scanner_starts_requests_while_the_document_arrives() {
         "<p>More</p><link rel=stylesheet href=/a.css></body>",
         other,
     );
-    // The print stylesheet goes after the first paint; give it time.
-    let s = run(
+    // A request for the print stylesheet would come after the first paint;
+    // give it time.
+    run(
         &format!("http://127.0.0.1:{port}/"),
-        "wait; state; sleep 1000",
+        "wait; sleep 1000",
         &[],
     );
     let log = log.lock().unwrap().clone();
@@ -1035,13 +1107,9 @@ fn the_preload_scanner_starts_requests_while_the_document_arrives() {
     let css = at("/a.css");
     assert_eq!(css.len(), 1, "{log:?}");
     assert!(css[0] < doc_end, "{log:?}");
-    // The stylesheet for print went too, after the one for the screen (low
-    // priority), and the first paint did not wait for its 3 s.
-    let print = at("/print.css");
-    assert_eq!(print.len(), 1, "{log:?}");
-    assert!(print[0] >= css[0] + 300, "{log:?}");
-    let first_paint = s[0]["load_ms"].as_f64().unwrap();
-    assert!(first_paint < 2500.0, "{}", s[0]);
+    // The stylesheet for print never went: Chrome's scanner skips it, and
+    // the parser never fetches it.
+    assert!(at("/print.css").is_empty(), "{log:?}");
     // The preconnect hint opened a connection before the body came, and
     // nothing was sent on it.
     let opened = conns.lock().unwrap().clone();

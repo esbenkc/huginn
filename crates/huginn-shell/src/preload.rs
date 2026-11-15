@@ -7,9 +7,9 @@
 //! CORS settings, so this file asks for exactly what `pipeline.rs`,
 //! `resources.rs` and huginn-js will ask for.
 //!
-//! - `<link rel=stylesheet>` (not `alternate` or `disabled`): blocking,
-//!   low when its `media` does not match the screen (fetched, never
-//!   render-blocking, as in Chrome).
+//! - `<link rel=stylesheet>` (not `alternate` or `disabled`): blocking. Not
+//!   when its `media` does not match the screen: Chrome's scanner skips
+//!   those, and the parser here never fetches them.
 //! - `<script src>` (only with scripts on): parser-blocking classic scripts
 //!   blocking, `async`, `defer` and module scripts low; `nomodule` and data
 //!   blocks skipped (`huginn_js::script_kind`).
@@ -310,22 +310,22 @@ impl Sink {
         let href = el.attr(&local_name!("href"));
         let cors = CorsSettings::from_attr(el.attr(&local_name!("crossorigin")));
         if has("stylesheet") {
-            if has("alternate") || el.attr(&local_name!("disabled")).is_some() {
+            // Not for another medium: Chrome's scanner skips those, and the
+            // parser here never fetches them (`collect_stylesheets`).
+            if has("alternate")
+                || el.attr(&local_name!("disabled")).is_some()
+                || !self.media_matches(el)
+            {
                 return;
             }
             let Some(url) = self.resolve(href) else {
                 return;
             };
-            let priority = if self.media_matches(el) {
-                Priority::Blocking
-            } else {
-                Priority::Low
-            };
             self.found(Found {
                 url,
                 kind: ResourceKind::Stylesheet,
                 cors,
-                priority,
+                priority: Priority::Blocking,
             });
         } else if has("modulepreload") {
             let as_script = el
@@ -658,6 +658,8 @@ mod tests {
             <link rel=modulepreload href=/m.js>
             <link rel=stylesheet href=a.css>
             <link rel=stylesheet href=/print.css media=print>
+            <link rel=stylesheet href=/narrow.css media='(max-width: 600px)'>
+            <link rel=stylesheet href=/wide.css media='screen and (min-width: 1000px)'>
             <link rel='alternate stylesheet' href=/alt.css>
             <link rel=stylesheet href=/off.css disabled>
             <link rel=stylesheet href=//127.0.0.1:1/x.css crossorigin>
@@ -678,12 +680,14 @@ mod tests {
         let (got, _) = scan(html, 4096, true);
         let want: Started = vec![
             (url("/dir/a.css"), Stylesheet, NoCors, Blocking),
+            // Not the ones for print or a narrower screen: the parser never
+            // fetches those.
+            (url("/wide.css"), Stylesheet, NoCors, Blocking),
             (url("/x.css"), Stylesheet, Anonymous, Blocking),
             (url("/block.js"), Script, NoCors, Blocking),
             (url("/cred.js"), Script, UseCredentials, Blocking),
             // The others found in the head wait for the body, in order.
             (url("/m.js"), Script, Anonymous, Low),
-            (url("/print.css"), Stylesheet, NoCors, Low),
             (url("/f.woff2"), Font, Anonymous, High),
             (url("/hero.png"), Image, NoCors, Low),
             (url("/async.js"), Script, NoCors, Low),

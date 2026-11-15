@@ -181,9 +181,10 @@ in, first paint, first contentful paint, images and fonts in, complete.
   parser-blocking scripts start wait in the queue until the first paint's
   stylesheets are in and its images and fonts have started. Then they all
   go, up to 16 at once, while the page is laid out. Low-priority preloads
-  (images, async, defer and module scripts, stylesheets for other media)
-  wait for the same guard, which is taken before the document is
-  requested. Chrome gives stylesheets and fonts the
+  (images, async, defer and module scripts) wait for the same guard, which
+  is taken before the document is requested; an image the first paint
+  takes from the HTTP cache drops its preload, so the entry is read once.
+  Chrome gives stylesheets and fonts the
   highest priority and `fetch()` and XHR the next one, and servers that
   use HTTP/2 or HTTP/3 priorities send the higher ones first. Huginn's
   requests carry no priority, so it holds the lower ones back instead. It
@@ -779,9 +780,13 @@ run loads from the network.
   `Loader::preload`. Before, the stylesheets of github.com went out after
   its 526 KB document had arrived and was parsed (82 ms after the first
   byte of the document, median of 5 cold loads); now 3 ms after it
-  (Chrome: 4 ms). The loader keeps requests in flight in one table, keyed
-  like Chrome's preload matching (URL, destination, CORS mode and
-  credentials): the parser's `fetch_with`, `fetch_uncached` and
+  (Chrome: 4 ms). A document from the HTTP cache (fresh, or after a 304)
+  is not scanned: it is all there at once, and the tokenizer pass costs
+  about as much as the parse right after it (3 ms for that document, on a
+  local copy), so it would only delay a revisit. The loader keeps
+  requests in flight in one table, keyed like Chrome's preload matching
+  (URL, destination, CORS mode and credentials): the parser's
+  `fetch_with`, `fetch_uncached` and
   `fetch_cached` take a preload of the same request, and identical
   `fetch_with` calls at the same time share one exchange (github.com links
   one stylesheet seven times; it was fetched seven times at once). A
@@ -792,6 +797,8 @@ run loads from the network.
   `<link rel=preload as=font crossorigin>` is used. Stylesheets for the
   screen, parser-blocking scripts and fonts are high priority and go at
   once; the rest waits (see "Threading") and, in the head, for the body.
+  Stylesheets for other media are not preloaded: Chrome's scanner skips
+  them, and the parser here never fetches them.
   After a `<meta http-equiv=Content-Security-Policy>` the scanner starts
   nothing more (Huginn applies no CSP; Chrome waits for the parser to
   apply it). When the load is complete, responses of preloads nothing

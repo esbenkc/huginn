@@ -1,7 +1,8 @@
 //! Preloads and requests in flight (`Loader::preload`): the parser's request
 //! takes a preload of the same request, one in another CORS mode does not,
-//! identical requests share one exchange, and low-priority preloads wait.
-//! Against a threaded HTTP/1.1 test server on 127.0.0.1.
+//! identical requests share one exchange, low-priority preloads wait, and a
+//! cache hit drops a preload that has not gone. Against a threaded HTTP/1.1
+//! test server on 127.0.0.1 (every response may be cached for a minute).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -10,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use huginn_net::{Client, CorsSettings, Loader, Priority, ResourceKind, Url};
+use huginn_net::{
+    Client, CookieJar, CorsSettings, HttpCache, Loader, Network, Priority, ResourceKind, Url,
+};
 
 /// A request the server got: path, headers, and when (since the server started).
 #[derive(Clone, Debug)]
@@ -105,7 +108,7 @@ fn serve(delay: fn(&str) -> u64) -> Server {
                 let mut s = stream;
                 let _ = write!(
                     s,
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{cors}Content-Length: {}\r\nConnection: close\r\n\r\n{path}",
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: max-age=60\r\n{cors}Content-Length: {}\r\nConnection: close\r\n\r\n{path}",
                     path.len()
                 );
             });
@@ -331,4 +334,57 @@ fn a_preload_found_while_others_are_on_the_network_goes_at_once() {
         last < first + Duration::from_millis(250),
         "{first:?} {last:?}"
     );
+}
+
+#[test]
+fn a_cache_hit_for_the_first_paint_drops_the_preload_that_waits() {
+    let s = serve(|_| 0);
+    let net = Network::new(
+        Arc::new(CookieJar::in_memory()),
+        HttpCache::in_memory(1 << 20),
+    );
+    let page = |net: &Arc<Network>| {
+        let l = Loader::with_network(net.clone());
+        l.set_client(Some(Client::new(s.url("/page"))));
+        Arc::new(l)
+    };
+    let img = s.url("/i.png");
+    // The first visit puts the image in the HTTP cache.
+    page(&net)
+        .fetch_uncached(&img, ResourceKind::Image)
+        .unwrap();
+    // The revisit: the scanner finds the image while the window holds
+    // low-priority preloads for its first paint, which then takes the
+    // image from the cache.
+    let l = page(&net);
+    let hold = l.hold_script_requests();
+    l.preload(
+        &img,
+        ResourceKind::Image,
+        CorsSettings::NoCors,
+        Priority::Low,
+    );
+    let r = l.fetch_cached(&img, ResourceKind::Image).unwrap();
+    assert_eq!(r.body, b"/i.png");
+    // Had the preload gone after the hold, it would have read the entry
+    // again; with the cache emptied, it would reach the server.
+    net.cache().clear();
+    drop(hold);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(s.requests("/i.png").len(), 1);
+    // A preload the cache cannot answer still goes after the hold.
+    let png = s.url("/j.png");
+    let hold = l.hold_script_requests();
+    l.preload(
+        &png,
+        ResourceKind::Image,
+        CorsSettings::NoCors,
+        Priority::Low,
+    );
+    assert!(l.fetch_cached(&png, ResourceKind::Image).is_none());
+    drop(hold);
+    s.first("/j.png");
+    let r = l.fetch_uncached(&png, ResourceKind::Image).unwrap();
+    assert_eq!(r.body, b"/j.png");
+    assert_eq!(s.requests("/j.png").len(), 1);
 }
