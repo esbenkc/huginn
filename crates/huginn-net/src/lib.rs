@@ -385,8 +385,9 @@ impl Network {
     /// TCP, TLS and the HTTP/2 handshake; nothing is sent), as Chrome does
     /// for the address bar's top suggestion. Returns at once; the work runs
     /// on a short thread. Does nothing when the origin has a connection or
-    /// one is being opened, and for URLs other than http and https. A
-    /// request that comes while it connects waits for the connection.
+    /// one is being opened, and for URLs other than http and https. The
+    /// first request that comes while it connects waits for the connection
+    /// and takes it.
     pub fn preconnect(&self, url: &Url) {
         self.preconnect_from(url, false);
     }

@@ -745,8 +745,11 @@ run loads from the network.
   10 s (Chrome's hung-connection check); idle ones send nothing.
   `Network::preconnect` (the address bar's top suggestion) and
   `Loader::preconnect` open a connection ahead of a request; unused
-  HTTP/1.1 ones are kept 10 s. Connecting races the other address family
-  after 300 ms (Happy Eyeballs, Chrome's delay).
+  HTTP/1.1 ones are kept 10 s. The first request that comes while such a
+  connection is being opened waits for it and takes it, as in Chrome
+  (before, an HTTP/1.1 request opened a second connection, and the
+  preconnected one sent nothing until it was closed). Connecting races
+  the other address family after 300 ms (Happy Eyeballs, Chrome's delay).
 - **Content-Encoding.** Huginn asks for `gzip, deflate, br` and decodes a
   body after reading all of it (`compression.rs`), so the connection goes
   back to the pool. (ureq, the client before hyper, stopped reading a
