@@ -582,7 +582,8 @@ impl Network {
     pub fn cache(&self) -> &HttpCache;
     /// Warm DNS + TCP + TLS (+ HTTP/2 handshake) to url's origin, nothing sent (Chrome's
     /// omnibox preconnect). Returns at once (short thread); no-op if the origin has a
-    /// connection or one is opening, and for non-http(s) URLs. Unused HTTP/1.1 ones live 10 s.
+    /// connection or one is opening, and for non-http(s) URLs. The first request that comes
+    /// while it opens waits for it and takes it. Unused HTTP/1.1 ones live 10 s.
     pub fn preconnect(&self, url: &Url);
 }
 /// RFC 9111 private cache: fresh entries answer, stale ones are revalidated (ETag,

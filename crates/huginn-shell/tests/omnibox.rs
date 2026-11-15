@@ -3,45 +3,50 @@
 //! has its own profile directory, so history is saved like in a window.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 
 use serde_json::Value;
 
 /// Serve two pages on 127.0.0.1: `/` ("Local home") and `/docs/guide`
-/// ("Guide"); the rest is 404. Returns the port.
+/// ("Guide"); the rest is 404. Returns the port. Each connection gets a
+/// thread, as on a real server: a connection that sends nothing (the
+/// address bar preconnects) must not hold up the others.
 fn serve() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let mut r = BufReader::new(stream.try_clone().unwrap());
-            let mut first = String::new();
-            if r.read_line(&mut first).is_err() {
-                continue;
-            }
-            loop {
-                let mut h = String::new();
-                if r.read_line(&mut h).is_err() || h.trim().is_empty() {
-                    break;
-                }
-            }
-            let path = first.split_whitespace().nth(1).unwrap_or("/");
-            let (status, body) = match path {
-                "/" => ("200 OK", "<title>Local home</title><p>home"),
-                "/docs/guide" => ("200 OK", "<title>Guide</title><p>guide"),
-                _ => ("404 Not Found", "<title>404</title>"),
-            };
-            let mut s = stream;
-            let _ = write!(
-                s,
-                "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            std::thread::spawn(move || answer(stream));
         }
     });
     port
+}
+
+fn answer(stream: TcpStream) {
+    let mut r = BufReader::new(&stream);
+    let mut first = String::new();
+    if r.read_line(&mut first).is_err() {
+        return;
+    }
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h).is_err() || h.trim().is_empty() {
+            break;
+        }
+    }
+    let path = first.split_whitespace().nth(1).unwrap_or("/");
+    let (status, body) = match path {
+        "/" => ("200 OK", "<title>Local home</title><p>home"),
+        "/docs/guide" => ("200 OK", "<title>Guide</title><p>guide"),
+        _ => ("404 Not Found", "<title>404</title>"),
+    };
+    let _ = write!(
+        &stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
 }
 
 /// A fresh profile directory for one test.

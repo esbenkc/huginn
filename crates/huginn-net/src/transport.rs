@@ -14,7 +14,10 @@
 //!   risk of loss). Idle connections send nothing.
 //! - **HTTP/1.1.** At most 6 connections per host (Chrome's limit), used one
 //!   request at a time. A connection whose response was read to the end goes
-//!   back to the pool. At most 32 idle connections are kept in all.
+//!   back to the pool. At most 32 idle connections are kept in all. The
+//!   first request that comes while a connection is being opened ahead of
+//!   a request ([`Transport::preconnect`]) waits for it and takes it, as in
+//!   Chrome; it does not open a second one.
 //! - Idle connections of both kinds are kept for 5 minutes, with their TLS
 //!   sessions for resumption (one rustls config per network); HTTP/1.1
 //!   connections that were opened ahead of a request
@@ -126,6 +129,11 @@ struct Host {
     busy: usize,
     /// Connections being opened.
     connecting: usize,
+    /// Of those, the ones opened ahead of a request
+    /// ([`Transport::preconnect`]).
+    preconnecting: usize,
+    /// Requests that wait for one of those instead of opening their own.
+    claimed: usize,
 }
 
 struct H2 {
@@ -233,6 +241,8 @@ struct Opening<'a> {
     key: &'a Key,
     /// Became an HTTP/1.1 lease: `busy` stays counted.
     leased: bool,
+    /// Opened ahead of a request: counted in `preconnecting` too.
+    preconnect: bool,
 }
 
 impl Drop for Opening<'_> {
@@ -242,8 +252,54 @@ impl Drop for Opening<'_> {
             if !self.leased {
                 h.busy = h.busy.saturating_sub(1);
             }
+            if self.preconnect {
+                h.preconnecting = h.preconnecting.saturating_sub(1);
+            }
         }
         self.pool.changed.notify_waiters();
+    }
+}
+
+/// A request that waits for a connection opened ahead of it, counted in
+/// `claimed`; undone when it is dropped (the timeout dropped the future).
+struct Claim<'a> {
+    pool: &'a Pool,
+    key: &'a Key,
+    on: bool,
+}
+
+impl Claim<'_> {
+    /// Whether the request waits for a connection being opened ahead of a
+    /// request: one it waits for already, or one no other request waits
+    /// for. Chrome gives such a connection to the first request that comes
+    /// (`TryToUseNeverAssignedConnectJob`), so the server gets no second
+    /// one that sends nothing.
+    fn wait(&mut self, h: &mut Host) -> bool {
+        if h.preconnecting == 0 {
+            self.release(h);
+        } else if !self.on && h.claimed < h.preconnecting {
+            h.claimed += 1;
+            self.on = true;
+        }
+        self.on
+    }
+
+    /// Stop waiting (with the pool locked).
+    fn release(&mut self, h: &mut Host) {
+        if self.on {
+            h.claimed = h.claimed.saturating_sub(1);
+            self.on = false;
+        }
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if self.on
+            && let Some(h) = self.pool.hosts.lock().get_mut(self.key)
+        {
+            h.claimed = h.claimed.saturating_sub(1);
+        }
     }
 }
 
@@ -326,9 +382,10 @@ impl Transport {
     /// Open a connection to `uri`'s host ahead of a request, if it has no
     /// usable one and none is being opened: name lookup, TCP, TLS and the
     /// HTTP/2 handshake, nothing sent beyond that (Chrome's preconnect).
-    /// Returns at once; the work runs on a thread of its own, and requests
-    /// that come meanwhile wait for the connection like for any other one
-    /// being opened. With `HUGINN_NET_LOG=1` it prints a `preconnect` line.
+    /// Returns at once; the work runs on a thread of its own. The first
+    /// request that comes meanwhile waits for the connection and takes it,
+    /// as in Chrome; while a TLS connection may still become HTTP/2, all of
+    /// them wait. With `HUGINN_NET_LOG=1` it prints a `preconnect` line.
     pub(crate) fn preconnect(&self, uri: &http::Uri, public_only: bool) {
         let Some(key) = key_for(uri) else {
             return;
@@ -348,6 +405,7 @@ impl Transport {
             }
             h.busy += 1;
             h.connecting += 1;
+            h.preconnecting += 1;
             sweep(&mut hosts);
         }
         let (dial, handle, k) = (self.dial.clone(), self.handle().clone(), key.clone());
@@ -364,6 +422,7 @@ impl Transport {
                 pool: &self.dial.pool,
                 key: &key,
                 leased: false,
+                preconnect: true,
             });
         }
     }
@@ -422,9 +481,10 @@ impl Dial {
     }
 
     /// A connection for `key`: the host's HTTP/2 connection, an idle
-    /// HTTP/1.1 one, or a new one. `fresh`: only a new one. `public_only`:
-    /// only one to a public address. Returns whether it was kept alive from
-    /// before.
+    /// HTTP/1.1 one, one being opened ahead of a request
+    /// ([`Transport::preconnect`]) once it is made, or a new one. `fresh`:
+    /// only a new one. `public_only`: only one to a public address. Returns
+    /// whether it was kept alive from before.
     async fn connection(
         &self,
         key: &Key,
@@ -433,6 +493,11 @@ impl Dial {
         exchange: &mut Exchange,
     ) -> Result<(Conn, bool), String> {
         let usable = |local: bool| !public_only || !local;
+        let mut claim = Claim {
+            pool: &self.pool,
+            key,
+            on: false,
+        };
         loop {
             let mut notified = pin!(self.pool.changed.notified());
             {
@@ -444,7 +509,9 @@ impl Dial {
                         h.h2 = None;
                     } else if !fresh && usable(c.local) {
                         c.used = Instant::now();
-                        return Ok((Conn::H2(c.sender.clone()), true));
+                        let sender = c.sender.clone();
+                        claim.release(h);
+                        return Ok((Conn::H2(sender), true));
                     }
                 }
                 // A TLS connection is being opened and may become an
@@ -455,9 +522,12 @@ impl Dial {
                     if !fresh && let Some(i) = h.idle.iter().rposition(|i| usable(i.local)) {
                         let idle = h.idle.remove(i);
                         h.busy += 1;
+                        claim.release(h);
                         return Ok((Conn::H1(self.lease(key, idle.sender, idle.local)), true));
                     }
-                    if h.busy < MAX_PER_HOST {
+                    // Else take a connection being opened ahead of a request,
+                    // or open one.
+                    if (fresh || !claim.wait(h)) && h.busy < MAX_PER_HOST {
                         h.busy += 1;
                         h.connecting += 1;
                         sweep(&mut hosts);
@@ -472,6 +542,7 @@ impl Dial {
             pool: &self.pool,
             key,
             leased: false,
+            preconnect: false,
         };
         let t = Instant::now();
         let made = self.connect(key, public_only, exchange).await;
@@ -510,6 +581,7 @@ impl Dial {
             pool: &self.pool,
             key,
             leased: false,
+            preconnect: true,
         };
         let mut exchange = Exchange::begin();
         let t = Instant::now();
@@ -926,7 +998,7 @@ impl Drop for Response {
 #[cfg(test)]
 pub(crate) mod test_server {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // A test CA and a certificate for 127.0.0.1 and localhost signed by it
     // (ECDSA P-256, valid until 2126), made with openssl for these tests.
@@ -938,11 +1010,13 @@ pub(crate) mod test_server {
     /// after `delay` with its HTTP version and path (and the authority it
     /// got in `x-authority`), closes a connection after
     /// `requests_per_connection` requests, and counts connections and
-    /// requests in flight.
+    /// requests in flight. While `hold_handshakes` is set, new connections
+    /// are accepted but their TLS handshakes wait.
     pub(crate) struct Server {
         pub(crate) port: u16,
         pub(crate) connections: Arc<AtomicUsize>,
         pub(crate) max_in_flight: Arc<AtomicUsize>,
+        pub(crate) hold_handshakes: Arc<AtomicBool>,
         _rt: tokio::runtime::Runtime,
     }
 
@@ -977,15 +1051,20 @@ pub(crate) mod test_server {
         let connections = Arc::new(AtomicUsize::new(0));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let hold_handshakes = Arc::new(AtomicBool::new(false));
         let (c, i, m) = (connections.clone(), in_flight, max_in_flight.clone());
+        let hold = hold_handshakes.clone();
         rt.spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else {
                     return;
                 };
                 c.fetch_add(1, Ordering::SeqCst);
-                let (acceptor, i, m) = (acceptor.clone(), i.clone(), m.clone());
+                let (acceptor, i, m, hold) = (acceptor.clone(), i.clone(), m.clone(), hold.clone());
                 tokio::spawn(async move {
+                    while hold.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
                     };
@@ -1056,6 +1135,7 @@ pub(crate) mod test_server {
             port,
             connections,
             max_in_flight,
+            hold_handshakes,
             _rt: rt,
         }
     }
@@ -1230,6 +1310,46 @@ mod tests {
             );
             assert_eq!(s.connections.load(Ordering::SeqCst), 1);
         }
+    }
+
+    /// Wait until `done` holds, for at most 5 s.
+    fn wait_until(done: impl Fn() -> bool) {
+        let t = Instant::now();
+        while !done() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_request_takes_the_http1_connection_being_opened_ahead_of_it() {
+        // Each connection carries one request, so none stays idle.
+        let s = server(&[b"http/1.1"], Duration::ZERO, 1);
+        let t = client();
+        let uri: http::Uri = format!("https://127.0.0.1:{}/", s.port).parse().unwrap();
+        let key = key_for(&uri).unwrap();
+        let host = |f: fn(&Host) -> bool| t.dial.pool.hosts.lock().get(&key).is_some_and(f);
+        // Now the client knows that the host speaks HTTP/1.1: its requests
+        // no longer wait for a TLS handshake to learn whether a connection
+        // is HTTP/2 (as for `http:` URLs).
+        get(&t, s.port, "/first");
+        // That connection was closed (`Connection: close`); the pool may see
+        // it a moment later.
+        wait_until(|| !host(|h| h.idle.iter().any(Idle::alive)));
+        s.hold_handshakes.store(true, Ordering::SeqCst);
+        t.preconnect(&uri, false);
+        assert!(host(|h| h.preconnecting == 1), "the preconnect started");
+        std::thread::scope(|scope| {
+            wait_until(|| s.connections.load(Ordering::SeqCst) == 2);
+            // A request while the preconnected connection's handshake waits:
+            // it waits for that connection, or it opens a second one.
+            let request = scope.spawn(|| get(&t, s.port, "/a"));
+            wait_until(|| host(|h| h.claimed == 1) || s.connections.load(Ordering::SeqCst) > 2);
+            s.hold_handshakes.store(false, Ordering::SeqCst);
+            let (body, _, connected) = request.join().unwrap();
+            assert_eq!(body, "HTTP/1.1 /a");
+            assert!(!connected, "the request took the preconnected connection");
+        });
+        assert_eq!(s.connections.load(Ordering::SeqCst), 2);
     }
 
     #[test]
