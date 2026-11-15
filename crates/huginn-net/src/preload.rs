@@ -41,9 +41,9 @@ pub enum Priority {
     /// fonts and stylesheets): when no blocking preload is queued or in
     /// flight.
     High,
-    /// The rest (images, async, defer and module scripts, stylesheets for
-    /// other media): when no more urgent preload is queued or in flight and
-    /// the loader holds no requests.
+    /// The rest (images, async, defer and module scripts): when no more
+    /// urgent preload is queued or in flight and the loader holds no
+    /// requests.
     Low,
 }
 
@@ -77,7 +77,8 @@ enum State {
     Queued,
     Running,
     Done(Fetched),
-    /// A consumer took the response ([`Loader::fetch_uncached`]).
+    /// A consumer took the response ([`Loader::fetch_uncached`]), or got it
+    /// from the HTTP cache before the preload went.
     Taken,
 }
 
@@ -101,6 +102,18 @@ impl Slot {
         let mut s = self.state.lock();
         if matches!(*s, State::Queued) {
             *s = State::Running;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Drop it if it is still queued (nobody waits for a queued one). True:
+    /// it will not be sent.
+    fn cancel(&self) -> bool {
+        let mut s = self.state.lock();
+        if matches!(*s, State::Queued) {
+            *s = State::Taken;
             true
         } else {
             false
@@ -329,6 +342,17 @@ impl Loader {
         let r = slot.wait(true);
         self.forget(key, &slot);
         r
+    }
+
+    /// The consumer of `key` got its response elsewhere (a fresh HTTP cache
+    /// entry, [`Loader::fetch_cached`]): a preload of it that has not gone
+    /// yet never goes, so the response is not read twice.
+    pub(crate) fn cancel_queued(&self, key: &Key) {
+        let mut p = self.preloads.lock();
+        if p.slots.get(key).is_some_and(|s| s.preload && s.cancel()) {
+            p.slots.remove(key);
+            self.pump(&mut p);
+        }
     }
 
     /// Fetch `key` unless an identical fetch is in flight (then wait for
