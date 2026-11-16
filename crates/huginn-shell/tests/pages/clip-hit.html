@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<title>clip-hit</title>
+<style>
+  body { margin: 0; font: 16px/20px sans-serif }
+  p { margin: 0; height: 100px }
+  /* A tile whose link covers the whole page from its top-left corner, as a
+     click target that the tile's overflow clip cuts to the tile. */
+  .tile { position: relative; overflow: hidden; width: 100px; height: 100px }
+  .tile a { position: absolute; left: 0; top: 0; width: 800px; height: 500px }
+  /* A clip that is not the link's containing block: the link escapes it. */
+  .loose { overflow: hidden; width: 100px; height: 100px }
+  .loose a { position: absolute; left: 0; top: 300px; width: 800px; height: 100px }
+</style>
+<div class="tile"><a href="#tile"></a></div>
+<p><a href="#below">below the tile</a></p>
+<div class="loose"><a href="#escaped"></a></div>

@@ -298,3 +298,22 @@ fn right_click_on_a_word_selects_it_and_offers_copy() {
     );
     assert_eq!(s[1]["clipboard"], "quick");
 }
+
+#[test]
+fn clicks_reach_what_an_overflow_clip_shows() {
+    // A positioned link inside an `overflow: hidden` tile covers the page
+    // from the tile's corner, but only the tile shows it. A click below the
+    // tile reaches the link there, not the hidden part of the tile's link.
+    // A link whose containing block is outside a clip is not cut by it.
+    let at = |x: u32, y: u32| {
+        let s = run(
+            &page("clip-hit.html"),
+            &format!("wait; click {x} {y}; wait; state"),
+        );
+        let url = str_of(&s[0], "url");
+        url[url.rfind('#').map_or(url.len(), |i| i)..].to_owned()
+    };
+    assert_eq!(at(50, 130), "#tile");
+    assert_eq!(at(10, 190), "#below");
+    assert_eq!(at(400, 420), "#escaped");
+}
