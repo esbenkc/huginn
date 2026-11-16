@@ -456,3 +456,69 @@ fn line_clamp_ends_the_box_after_n_lines() {
     );
     assert_eq!(rect(&doc, &tree, "p").height, 40.0);
 }
+
+#[test]
+fn percentage_heights_of_atomic_inlines_resolve_against_a_definite_block_height() {
+    // A tile grid: `img { width: 100%; height: 100% }` in fixed-size boxes
+    // fills each box, whatever the picture's own ratio. Without a basis the
+    // height acted as `auto` and the ratio set it (50px here, not 100px).
+    let size = |body: &str, tag: &str| {
+        let (doc, tree) = layout(&format!(
+            "<!DOCTYPE html><style>body{{margin:0}} p{{margin:0}}</style>{body}"
+        ));
+        let r = rect(&doc, &tree, tag);
+        (r.width, r.height)
+    };
+    let fill = "<img width=200 height=100 style='width:100%;height:100%'>";
+    assert_eq!(
+        size(
+            &format!("<div style='width:100px;height:100px'>{fill}</div>"),
+            "img"
+        ),
+        (100.0, 100.0)
+    );
+    // ... also inside an inline element, whose own height does not count.
+    assert_eq!(
+        size(
+            &format!("<div style='width:100px;height:100px'><label>{fill}</label></div>"),
+            "img"
+        ),
+        (100.0, 100.0)
+    );
+    // The basis is the content box: border-box padding comes off.
+    assert_eq!(
+        size(
+            &format!(
+                "<div style='box-sizing:border-box;width:100px;height:100px;padding:10px'>{fill}</div>"
+            ),
+            "img"
+        ),
+        (80.0, 80.0)
+    );
+    // An inline-block too.
+    assert_eq!(
+        size(
+            "<div style='height:200px'><i style='display:inline-block;width:10px;height:50%'></i></div>",
+            "i"
+        ),
+        (10.0, 100.0)
+    );
+    // After a block sibling the image sits in an anonymous block; as in
+    // Chrome, the percentage resolves against the div, not that block. (The
+    // `width` attribute keeps the width at 40px.)
+    assert_eq!(
+        size(
+            "<div style='height:120px'><p>x</p><img width=40 height=10 style='height:50%'></div>",
+            "img"
+        ),
+        (40.0, 60.0)
+    );
+    // An auto-height block gives no basis: the percentage acts as `auto`.
+    assert_eq!(
+        size(
+            "<div><img width=40 height=10 style='height:50%'></div>",
+            "img"
+        ),
+        (40.0, 10.0)
+    );
+}

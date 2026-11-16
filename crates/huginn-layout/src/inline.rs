@@ -183,18 +183,16 @@ pub(crate) fn child_border_padding(
 }
 
 /// Size of an atomic inline: border box, margins, baseline from the top of
-/// the margin box. `mode` is the IFC's available width.
+/// the margin box. `cb` is the content box of the containing block (the
+/// percentage basis; `None`: indefinite), `mode` the IFC's available width.
 fn atomic_size(
     tree: &mut LTree,
     child: tf::NodeId,
-    cb: Option<f32>,
+    cb: tf::Size<Option<f32>>,
     mode: AvailableSpace,
 ) -> (tf::Size<f32>, taffy::Rect<f32>, Option<f32>) {
-    let margin = child_margins(tree, child, cb);
-    let parent = tf::Size {
-        width: cb,
-        height: None,
-    };
+    let margin = child_margins(tree, child, cb.width);
+    let parent = cb;
     let (auto_width, clips, container) = {
         let n = tree.node(child);
         let replaced = matches!(n.kind, crate::tree::Kind::Replaced { .. });
@@ -324,6 +322,46 @@ pub(crate) fn compute(
     };
     let inset_left = border.left + padding.left;
     let inset_top = border.top + padding.top;
+    // What the height percentages of atomic inlines resolve against (CSS
+    // 2.1, section 10.5): this box's content height when it is definite,
+    // because the parent fixed it or the style sets it. Otherwise they act
+    // as `auto`. An anonymous block with an auto height is skipped, as in
+    // Blink: its percentages resolve against its parent's.
+    let percent_height = if tree.node(id).node.is_none() && ts.size.height.is_auto() {
+        inputs.parent_size.height
+    } else {
+        let calc = crate::convert::resolve_calc;
+        let inset_y = inset_top + border.bottom + padding.bottom;
+        let content = |v: f32| {
+            if ts.box_sizing == taffy::BoxSizing::BorderBox {
+                v - inset_y
+            } else {
+                v
+            }
+        };
+        let styled = || {
+            let h = ts
+                .size
+                .height
+                .maybe_resolve(inputs.parent_size.height, calc)?;
+            let min = ts
+                .min_size
+                .height
+                .maybe_resolve(inputs.parent_size.height, calc);
+            Some(content(min.map_or(h, |m| h.max(m))))
+        };
+        inputs
+            .known_dimensions
+            .height
+            .filter(|_| inputs.known_dimensions_are_definite.height)
+            .map(|h| h - inset_y)
+            .or_else(|| {
+                (inputs.sizing_mode == taffy::SizingMode::InherentSize)
+                    .then(styled)
+                    .flatten()
+            })
+            .map(|h| h.max(0.0))
+    };
     let run_mode = inputs.run_mode;
     // The final pass breaks lines at the available width only when that width
     // is the box's own: the parent fixed it (block flow, stretched grid and
@@ -375,6 +413,10 @@ pub(crate) fn compute(
             for item in &ifc.items {
                 let (w, h, base, size, margin, dy) = match item {
                     Item::Atomic { child, strut, .. } => {
+                        let cb = tf::Size {
+                            width: cb,
+                            height: percent_height,
+                        };
                         let (size, margin, base) = atomic_size(tree, *child, cb, mode);
                         let w = size.width + margin.left + margin.right;
                         let h = size.height + margin.top + margin.bottom;
@@ -527,7 +569,7 @@ pub(crate) fn compute(
                                 },
                                 tf::Size {
                                     width: cb,
-                                    height: None,
+                                    height: percent_height,
                                 },
                                 tf::Size {
                                     width: AvailableSpace::Definite(size.width),
