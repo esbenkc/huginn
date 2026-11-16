@@ -2,7 +2,7 @@
 
 use huginn_dom::NodeId;
 use huginn_layout::{BoxId, BoxKind, LayoutTree, Rect};
-use huginn_style::{PointerEvents, Position, Visibility};
+use huginn_style::{Overflow, PointerEvents, Position, Visibility};
 
 /// The innermost DOM node at document point (`x`, `y`), in CSS px: the box
 /// painted on top there ([`topmost_box`]), then the innermost inline element
@@ -33,7 +33,8 @@ pub fn node_at(tree: &LayoutTree, x: f32, y: f32) -> Option<NodeId> {
 }
 
 /// The visible box painted on top at the point that takes pointer events
-/// (`pointer-events: none` boxes let them through), in an approximation of CSS
+/// (`pointer-events: none` boxes let them through, and so do the parts of a
+/// box an `overflow` clip hides), in an approximation of CSS
 /// paint order: a descendant over its ancestor; between two branches,
 /// below their common ancestor, a higher `z-index` (of the outermost
 /// positioned box on the branch that sets one) wins, then a branch with a
@@ -82,9 +83,46 @@ pub fn topmost_box(tree: &LayoutTree, x: f32, y: f32) -> Option<BoxId> {
             contains(b.rect, x, y)
                 && b.style.visibility == Visibility::Visible
                 && b.style.pointer_events == PointerEvents::Auto
+                && !clipped_at(tree, b, x, y)
         })
         .map(|(i, _)| BoxId(i as u32))
         .reduce(|best, c| if above(c, best) { c } else { best })
+}
+
+/// Whether an `overflow` clip of an ancestor hides box `b` at the point.
+/// As in painting, clips follow the containing-block chain: an absolutely
+/// positioned box escapes the clips of the boxes up to its containing block
+/// (the nearest positioned, transformed or filtered ancestor), a fixed box
+/// escapes every clip. The root and `<body>` do not clip: their overflow
+/// goes to the viewport.
+fn clipped_at(tree: &LayoutTree, b: &huginn_layout::LayoutBox, x: f32, y: f32) -> bool {
+    // The position of the box whose containing block is looked for next.
+    let mut position = b.style.position;
+    let mut cur = b.parent;
+    while let Some(id) = cur {
+        let a = tree.get(id);
+        let s = &a.style;
+        if position == Position::Fixed {
+            return false;
+        }
+        let is_cb = s.position != Position::Static
+            || s.transform.is_some()
+            || s.filter.is_some()
+            || s.backdrop_filter.is_some();
+        if position != Position::Absolute || is_cb {
+            let root_or_body = a.parent.is_none_or(|p| tree.get(p).parent.is_none());
+            let r = a.padding_rect();
+            if !root_or_body
+                && ((s.overflow_x != Overflow::Visible && (x < r.x || x >= r.right()))
+                    || (s.overflow_y != Overflow::Visible && (y < r.y || y >= r.bottom())))
+            {
+                return true;
+            }
+            position = s.position;
+        }
+        cur = a.parent;
+    }
+    false
 }
 
 /// The innermost inline fragment of `id`'s IFC that contains the point.
