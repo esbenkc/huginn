@@ -797,13 +797,14 @@ fn location_url_and_storage() {
 }
 
 #[test]
-fn navigator_reports_the_user_agent_and_brands_the_network_sends() {
+fn navigator_reports_the_user_agent_brands_and_languages_the_network_sends() {
     let mut p = Page::new("<body></body>");
     p.run(
         r#"
         const b = document.body, d = navigator.userAgentData;
         b.setAttribute('data-ua', navigator.userAgent);
         b.setAttribute('data-brands', d.brands.map(x => `"${x.brand}";v="${x.version}"`).join(', '));
+        b.setAttribute('data-langs', navigator.language + '|' + navigator.languages.join(','));
         d.getHighEntropyValues(['fullVersionList', 'uaFullVersion']).then(v => {
           b.setAttribute('data-full', v.uaFullVersion + '|' +
             v.fullVersionList.map(x => x.brand + ' ' + x.version).join(', '));
@@ -822,6 +823,8 @@ fn navigator_reports_the_user_agent_and_brands_the_network_sends() {
         attr("data-brands").as_deref(),
         Some(huginn_net::ua::SEC_CH_UA)
     );
+    // `Accept-Language` "en-US,en;q=0.9": the tags, most preferred first.
+    assert_eq!(attr("data-langs").as_deref(), Some("en-US|en-US,en"));
     let chrome = huginn_net::ua::CHROME_MAJOR;
     assert_eq!(
         attr("data-full").as_deref(),

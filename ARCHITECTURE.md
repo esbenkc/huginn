@@ -670,6 +670,15 @@ Why:
   settings and header order are not Chrome's. Checked on 2026-11-13: 20 of
   the sites above (this string, no cookies) give the same status over
   HTTP/2 as over HTTP/1.1.
+- Every request carries `Accept-Language: en-US,en;q=0.9`
+  (`ua::ACCEPT_LANGUAGE`), as in Chrome, and `navigator.language` and
+  `navigator.languages` are made from it. A script may set its own (it is
+  CORS-safelisted). Without it, html.duckduckgo.com (the address bar
+  search) answered every search with a 202 bot challenge. On 2026-11-16,
+  curl with Huginn's request headers got 202 on 3 of 3 tries; the same
+  headers plus `Accept-Language` got 200 on 3 of 3. Huginn got the
+  challenge on 3 of 3 address bar searches before and results on 5 of 5
+  after.
 
 The image `Accept` header lists only formats `decode_image` decodes:
 `image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.8`. Image servers and
