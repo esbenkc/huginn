@@ -1154,8 +1154,9 @@ pub(super) fn install_ops(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<'_, v
         "focused" => op_focused, "disabled" => op_disabled,
     }
     // The system this build runs on and what Huginn says it is, for
-    // `navigator` (70-window.js). The user agent and brands are the ones the
-    // network sends (huginn_net::ua), so script and headers agree.
+    // `navigator` (70-window.js). The user agent, brands and languages are
+    // the ones the network sends (huginn_net::ua), so script and headers
+    // agree.
     let os = if cfg!(target_os = "macos") {
         "macos"
     } else {
@@ -1165,6 +1166,7 @@ pub(super) fn install_ops(scope: &mut v8::PinScope<'_, '_>, obj: v8::Local<'_, v
         ("os", os),
         ("ua", huginn_net::ua::USER_AGENT),
         ("secChUa", huginn_net::ua::SEC_CH_UA),
+        ("acceptLanguage", huginn_net::ua::ACCEPT_LANGUAGE),
         ("huginnVersion", huginn_net::ua::HUGINN_FULL_VERSION),
     ] {
         if let (Some(key), Some(value)) =

@@ -241,15 +241,16 @@ const history = new History();
 
 // ------------------------------------------------------------- navigator --
 
-// N.os: the system this build runs on; N.ua, N.secChUa: the User-Agent and
-// Sec-CH-UA headers the network sends (`install_ops`), so script and headers
-// agree. Set at start, with the navigator values made from them.
+// N.os: the system this build runs on; N.ua, N.secChUa, N.acceptLanguage:
+// the User-Agent, Sec-CH-UA and Accept-Language headers the network sends
+// (`install_ops`), so script and headers agree. Set at start, with the
+// navigator values made from them.
 let OS, UA, BRANDS, FULL_VERSIONS, CHROME_FULL;
 class Navigator {}
 const navigatorProps = {
   userAgent: '', appVersion: '', appName: 'Netscape', appCodeName: 'Mozilla', product: 'Gecko',
-  productSub: '20030107', vendor: 'Google Inc.', vendorSub: '', platform: '', language: 'en-US',
-  languages: Object.freeze(['en-US', 'en']), cookieEnabled: true, onLine: true, hardwareConcurrency: 8,
+  productSub: '20030107', vendor: 'Google Inc.', vendorSub: '', platform: '', language: '',
+  languages: null, cookieEnabled: true, onLine: true, hardwareConcurrency: 8,
   deviceMemory: 8, maxTouchPoints: 0, webdriver: false, doNotTrack: null, pdfViewerEnabled: true,
   plugins: Object.freeze([]), mimeTypes: Object.freeze([]),
   userAgentData: {
@@ -281,7 +282,9 @@ onStart(() => {
   FULL_VERSIONS = Object.freeze(BRANDS.map(b => Object.freeze({
     brand: b.brand, version: b.brand === 'Huginn' ? N.huginnVersion : b.version + '.0.0.0' })));
   CHROME_FULL = FULL_VERSIONS.find(b => b.brand === 'Chromium').version;
-  for (const [k, v] of [['userAgent', UA], ['appVersion', UA.slice(8)], ['platform', OS.platform]]) {
+  const languages = Object.freeze(N.acceptLanguage.split(',').map(t => t.split(';')[0].trim()));
+  for (const [k, v] of [['userAgent', UA], ['appVersion', UA.slice(8)], ['platform', OS.platform],
+    ['language', languages[0]], ['languages', languages]]) {
     defProp(Navigator.prototype, k, { value: v });
   }
   Object.assign(navigatorProps.userAgentData, { brands: BRANDS, platform: OS.name });

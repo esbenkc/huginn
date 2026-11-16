@@ -1107,6 +1107,10 @@ impl Loader {
             if !req.headers.iter().any(|(n, _)| n == "accept") {
                 b = b.header("Accept", accept);
             }
+            // A script may choose its own (it is CORS-safelisted).
+            if !req.headers.iter().any(|(n, _)| n == "accept-language") {
+                b = b.header("Accept-Language", ua::ACCEPT_LANGUAGE);
+            }
             for (k, v) in ua::client_hint_headers(&url) {
                 b = b.header(*k, *v);
             }
@@ -1554,6 +1558,7 @@ impl Loader {
             .method("OPTIONS")
             .uri(url.as_str())
             .header("Accept", "*/*")
+            .header("Accept-Language", ua::ACCEPT_LANGUAGE)
             .header("Access-Control-Request-Method", method)
             .header("Origin", origin);
         if !unsafe_names.is_empty() {
@@ -2420,6 +2425,59 @@ mod tests {
             log[before].header("cookie"),
             None,
             "forbidden headers are dropped"
+        );
+    }
+
+    #[test]
+    fn every_request_says_which_languages_the_user_reads() {
+        let (port, seen) = serve(|r| {
+            match r.method.as_str() {
+            "OPTIONS" => "204 No Content\nAccess-Control-Allow-Origin: http://localhost:9\nAccess-Control-Allow-Methods: PUT".into(),
+            _ => "200 OK\nAccess-Control-Allow-Origin: http://localhost:9\n\nok".into(),
+        }
+        });
+        let at = |path: &str| Url::parse(&format!("http://127.0.0.1:{port}{path}")).unwrap();
+        let loader = Loader::new();
+        loader.navigate(&at("/doc"), None, None).unwrap();
+        loader.set_client(Some(Client::new(
+            Url::parse("http://localhost:9/").unwrap(),
+        )));
+        loader
+            .fetch_uncached(&at("/img"), ResourceKind::Image)
+            .unwrap();
+        let url = at("/api");
+        // A request with a preflight, then one whose script chose its own.
+        loader
+            .fetch_for_script(script(url.as_str(), "PUT", Credentials::Omit))
+            .unwrap();
+        let mut own = script(url.as_str(), "GET", Credentials::Omit);
+        own.headers = vec![("Accept-Language".into(), "da".into())];
+        loader.fetch_for_script(own).unwrap();
+
+        let log = seen.lock().unwrap().clone();
+        let langs: Vec<_> = log
+            .iter()
+            .map(|r| {
+                let all: Vec<_> = r
+                    .headers
+                    .iter()
+                    .filter(|(n, _)| n == "accept-language")
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                (r.method.as_str(), r.path.as_str(), all.join(" + "))
+            })
+            .collect();
+        let ours = "en-US,en;q=0.9";
+        assert_eq!(
+            langs,
+            [
+                ("GET", "/doc", ours),
+                ("GET", "/img", ours),
+                ("OPTIONS", "/api", ours),
+                ("PUT", "/api", ours),
+                ("GET", "/api", "da"),
+            ]
+            .map(|(m, p, l)| (m, p, l.to_owned()))
         );
     }
 

@@ -55,6 +55,13 @@ pub const SEC_CH_UA: &str = concat!(
     "\", \"Not_A Brand\";v=\"24\""
 );
 
+/// `Accept-Language`, sent on every request like Chrome does, and the
+/// source of `navigator.language` and `navigator.languages` (the tags
+/// without their weights). Chrome's form: the first tag, then each next
+/// one with a weight 0.1 lower. Without it, a request with browser fetch
+/// metadata reads as a bot to some filters.
+pub const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+
 const CLIENT_HINTS: [(&str, &str); 3] = [
     ("Sec-CH-UA", SEC_CH_UA),
     ("Sec-CH-UA-Mobile", "?0"),
