@@ -387,12 +387,15 @@ impl Builder<'_, '_> {
             .attr(&local_name!("type"))
             .unwrap_or("text")
             .to_ascii_lowercase();
-        let value = el.attr(&local_name!("value")).filter(|v| !v.is_empty());
+        let attr = el.attr(&local_name!("value"));
+        let value = attr.filter(|v| !v.is_empty());
         let (text, placeholder) = match &*ty {
             "hidden" | "checkbox" | "radio" | "image" | "file" | "range" | "color" => return,
-            "submit" => (value.unwrap_or("Submit").to_owned(), false),
-            "reset" => (value.unwrap_or("Reset").to_owned(), false),
-            "button" => (value.unwrap_or("").to_owned(), false),
+            // A button's label is its `value` attribute, even an empty one
+            // (an icon button); only without the attribute is it the default.
+            "submit" => (attr.unwrap_or("Submit").to_owned(), false),
+            "reset" => (attr.unwrap_or("Reset").to_owned(), false),
+            "button" => (attr.unwrap_or("").to_owned(), false),
             "password" if value.is_some() => {
                 ("•".repeat(value.unwrap_or("").chars().count()), false)
             }

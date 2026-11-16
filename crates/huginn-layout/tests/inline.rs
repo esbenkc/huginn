@@ -522,3 +522,20 @@ fn percentage_heights_of_atomic_inlines_resolve_against_a_definite_block_height(
         (40.0, 10.0)
     );
 }
+
+#[test]
+fn a_buttons_empty_value_is_an_empty_label() {
+    // Icon buttons such as DuckDuckGo's search button are
+    // `<input type=submit value="">` with a background image: no text.
+    // Only a button without the attribute gets the default label.
+    let labels = |html: &str| {
+        let (_, tree) = layout(&format!("<!DOCTYPE html>{html}"));
+        tree.runs.iter().filter(|r| !r.glyphs.is_empty()).count()
+    };
+    assert_eq!(labels("<input type=submit value=''>"), 0);
+    assert_eq!(labels("<input type=reset value=''>"), 0);
+    assert_eq!(labels("<input type=submit>"), 1, "the default label");
+    assert_eq!(labels("<input type=submit value=Go>"), 1);
+    // A text field with an empty value still shows its placeholder.
+    assert_eq!(labels("<input value='' placeholder=Search>"), 1);
+}
